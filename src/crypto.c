@@ -1,25 +1,9 @@
 #include <stdint.h>
 #include <string.h>
 #include <sodium.h>
+
 #include "types.h"
-
-static void store_u64_le(uint8_t out[8], uint64_t x) {
-    out[0] = (uint8_t)(x);
-    out[1] = (uint8_t)(x >> 8);
-    out[2] = (uint8_t)(x >> 16);
-    out[3] = (uint8_t)(x >> 24);
-    out[4] = (uint8_t)(x >> 32);
-    out[5] = (uint8_t)(x >> 40);
-    out[6] = (uint8_t)(x >> 48);
-    out[7] = (uint8_t)(x >> 56);
-}
-
-static void store_u32_le(uint8_t out[4], uint32_t x) {
-    out[0] = (uint8_t)(x);
-    out[1] = (uint8_t)(x >> 8);
-    out[2] = (uint8_t)(x >> 16);
-    out[3] = (uint8_t)(x >> 24);
-}
+#include "utils.h"
 
 /*
  * Hash canonico per firma (32 bytes) su tx.

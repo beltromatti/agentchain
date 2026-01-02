@@ -1,161 +1,322 @@
+#include <inttypes.h>
+#include <signal.h>
+#include <stdio.h>
 #include <stdlib.h>
-#include <stdint.h>
-#include <time.h>
 #include <string.h>
-#include "txpool.h"
-#include "types.h"
-#include "crypto.h"
+#include <unistd.h>
 
+#include "blockchain.h"
+#include "consensus.h"
+#include "control.h"
+#include "crypto.h"
+#include "log.h"
+#include "network.h"
+#include "tx_builder.h"
+#include "utils.h"
 
 #define USER_PRIVATE_KEY { 0x6a, 0x9f, 0x83, 0x1d, 0x2c, 0xe7, 0x54, 0x99, 0x48, 0x3b, 0xa1, 0xf0, 0x92, 0x61, 0x77, 0x3e, 0x54, 0x0f, 0x9b, 0x12, 0xd3, 0x5c, 0x89, 0x01, 0xa4, 0xe2, 0x6d, 0x7f, 0x18, 0x93, 0xbc, 0x55, 0x3c, 0x71, 0x1e, 0x0f, 0x5d, 0x6a, 0x2a, 0xb7, 0x1d, 0xa6, 0x98, 0x9f, 0x2e, 0x4f, 0x88, 0x93, 0x6b, 0xa2, 0x7c, 0x44, 0x18, 0x9d, 0xe3, 0x56, 0x8f, 0x71, 0x2b, 0x5c, 0x97, 0x41, 0x2e, 0x9a }
 #define USER_PUB_KEY { 0x3c, 0x71, 0x1e, 0x0f, 0x5d, 0x6a, 0x2a, 0xb7, 0x1d, 0xa6, 0x98, 0x9f, 0x2e, 0x4f, 0x88, 0x93, 0x6b, 0xa2, 0x7c, 0x44, 0x18, 0x9d, 0xe3, 0x56, 0x8f, 0x71, 0x2b, 0x5c, 0x97, 0x41, 0x2e, 0x9a }
 
-account USER = {
-    .pub_key = USER_PUB_KEY,
-    .priv_key = USER_PRIVATE_KEY,
-    .balance = 0
-};
+static volatile sig_atomic_t NODE_RUNNING = 1;
 
-long long get_account_balance(account* acc) {
-    if (!acc) return -1;
-    return 1000; // Example balance
+static const uint8_t DEFAULT_PRIV[crypto_sign_SECRETKEYBYTES] = USER_PRIVATE_KEY;
+static const uint8_t DEFAULT_PUB[crypto_sign_PUBLICKEYBYTES] = USER_PUB_KEY;
+
+static void handle_signal(int sig) {
+    (void)sig;
+    NODE_RUNNING = 0;
 }
 
-int create_tx (tx* transaction, uint8_t function_id, uint32_t accounts_num, account_list_node* accounts,  tx_data* data) {
-    transaction = malloc(sizeof(*transaction));
-    if (!transaction) return -1;
-    transaction->expire = (uint64_t)time(NULL) + 3600; // expires in 1 hour
-    transaction->signer = accounts->acc;
-    transaction->function_id = function_id;
-    transaction->accounts_num = accounts_num;
-    transaction->accounts = accounts;
-    transaction->data = data;
-    transaction->confirmed = 0;
+static int load_identity(account* out, int require_priv) {
+    if (!out) return -1;
+    const char* priv_hex = getenv("BC_PRIVKEY");
+    const char* pub_hex = getenv("BC_PUBKEY");
+
+    memset(out, 0, sizeof(*out));
+
+    if (priv_hex && *priv_hex) {
+        if (hex_to_bytes(priv_hex, out->priv_key, crypto_sign_SECRETKEYBYTES) < 0) return -2;
+        if (pub_hex && *pub_hex) {
+            if (hex_to_bytes(pub_hex, out->pub_key, crypto_sign_PUBLICKEYBYTES) < 0) return -3;
+        } else {
+            if (derive_pub_key(out->priv_key, out->pub_key) < 0) return -4;
+        }
+        return 0;
+    }
+
+    if (!require_priv && pub_hex && *pub_hex) {
+        if (hex_to_bytes(pub_hex, out->pub_key, crypto_sign_PUBLICKEYBYTES) < 0) return -5;
+        return 0;
+    }
+
+    memcpy(out->priv_key, DEFAULT_PRIV, crypto_sign_SECRETKEYBYTES);
+    memcpy(out->pub_key, DEFAULT_PUB, crypto_sign_PUBLICKEYBYTES);
     return 0;
 }
 
-int create_transfer_tx (tx* transaction, pub_key_t sender, pub_key_t receiver, uint64_t amount) {
-    //create accounts
-    long long balance = 0;
-    account* sender_acc = malloc(sizeof(account));
-    if (!sender_acc) return -1;
-    memcpy(sender_acc->pub_key, sender, crypto_sign_PUBLICKEYBYTES);
+static int parse_u64(const char* s, uint64_t* out) {
+    if (!s || !*s || !out) return -1;
+    char* endptr = NULL;
+    unsigned long long val = strtoull(s, &endptr, 10);
+    if (endptr == s || *endptr != '\0') return -2;
+    *out = (uint64_t)val;
+    return 0;
+}
 
-    account* receiver_acc = malloc(sizeof(account));
-    if (!receiver_acc) return -2;
-    memcpy(receiver_acc->pub_key, receiver, crypto_sign_PUBLICKEYBYTES);
+static void usage(const char* prog) {
+    fprintf(stderr,
+        "usage:\n"
+        "  %s node\n"
+        "  %s transfer <receiver_pub_hex> <amount>\n"
+        "  %s mint <receiver_pub_hex> <amount>\n"
+        "  %s balance [pub_hex]\n"
+        "  %s ping\n\n"
+        "env:\n"
+        "  BC_PRIVKEY / BC_PUBKEY   hex keys (priv required for transfer/mint/node)\n"
+        "  BC_PORT                  udp port for peer network (default 30303)\n"
+        "  BC_CTL_PORT              local control port (default 30304)\n"
+        "  BC_SEEDS                 comma list of ip:port seeds\n",
+        prog, prog, prog, prog, prog);
+}
 
-    // Create accounts list
-    account_list_node* accounts = malloc(2 * sizeof(account_list_node));
-    if (!accounts) {
-        free(sender_acc);
-        free(receiver_acc);
-        return -3;
-    }
-
-    accounts[0].acc = sender_acc;
-    accounts[0].next = &accounts[1];
-    accounts[1].acc = receiver_acc;
-    accounts[1].next = NULL;
-
-    // Create tx_data
-    tx_data* data = malloc(sizeof(tx_data));
-    if (!data) {
-        free(sender_acc);
-        free(receiver_acc);
-        free(accounts);
+static int encode_tx_to_wire(const tx* t, uint8_t** out_buf, size_t* out_len) {
+    if (!t || !out_buf || !out_len) return -1;
+    size_t len = 0;
+    if (encode_tx((tx*)t, NULL, &len) < 0) return -2;
+    uint8_t* buf = malloc(len);
+    if (!buf) return -3;
+    size_t cap = len;
+    if (encode_tx((tx*)t, buf, &cap) < 0) {
+        free(buf);
         return -4;
     }
-    data->data_len = sizeof(uint64_t);
-    memcpy(data->data, &amount, sizeof(uint64_t));
-
-    // Create transaction
-    if (create_tx(transaction, 1, 2, accounts, data) < 0) {
-        free(sender_acc);
-        free(receiver_acc);
-        free(accounts);
-        free(data);
-        return -5;
-    }
+    *out_buf = buf;
+    *out_len = cap;
     return 0;
 }
 
-int create_mint_tx (tx* transaction, pub_key_t receiver, uint64_t amount) {
-    //create account
-    account* receiver_acc = malloc(sizeof(account));
-    if (!receiver_acc) return -1;
-    memcpy(receiver_acc->pub_key, receiver, crypto_sign_PUBLICKEYBYTES);
-
-    // Create accounts list
-    account_list_node* accounts = malloc(sizeof(account_list_node));
-    if (!accounts) {
-        free(receiver_acc);
-        return -2;
+static int cmd_node(void) {
+    account local;
+    if (load_identity(&local, 1) < 0) {
+        fprintf(stderr, "invalid BC_PRIVKEY/BC_PUBKEY\n");
+        return 1;
     }
 
-    accounts->acc = receiver_acc;
-    accounts->next = NULL;
-
-    // Create tx_data
-    tx_data* data = malloc(sizeof(tx_data));
-    if (!data) {
-        free(receiver_acc);
-        free(accounts);
-        return -3;
+    if (blockchain_init(&CHAIN) < 0) {
+        log_error("blockchain init failed");
+        return 1;
     }
-    data->data_len = sizeof(uint64_t);
-    memcpy(data->data, &amount, sizeof(uint64_t));
-
-    // Create transaction
-    if (create_tx(transaction, 2, 1, accounts, data) < 0) {
-        free(receiver_acc);
-        free(accounts);
-        free(data);
-        return -4;
+    if (network_set_identity(local.pub_key, local.priv_key) < 0) {
+        log_error("network identity missing");
+        return 1;
     }
-    return 0;
-}
-
-int encode_tx (tx* transaction, uint8_t encoded_tx[], size_t* raw_tx_len) {
-    if (!transaction || !encoded_tx || !raw_tx_len) return -1;
-    // Placeholder for encoding logic
-    *raw_tx_len = 0;
-    return 0;
-}
-int decode_tx (tx* transaction, uint8_t encoded_tx[], size_t raw_tx_len) {
-    if (!transaction || !encoded_tx || raw_tx_len == 0) return -1;
-    // Placeholder for decoding logic
-    return 0;
-}
-
-int share_tx_with_peer (tx* transaction, pub_key_t peer_pub_key) {
-    if (!transaction) return -1;
-    //qua bisogna chiamare encode_tx per ottenere encoded_tx e raw_tx_len
-    // Placeholder for sharing logic
-    return 0;
-}
-
-int send_tx (tx* transaction) {
-    if (!transaction) return -1;
-    if (verify_tx(transaction) < 0) return -2;
-    tx_pool_push(transaction);
-    share_tx_with_peer(transaction, NULL);
-    return 0;
-}
-
-int handle_incoming_tx(uint8_t encoded_tx[], size_t raw_tx_len) {
-    tx* t = malloc(sizeof(tx));
-    if (!t) return -1;
-    if (decode_tx(t, encoded_tx, raw_tx_len) < 0) {
-        free(t);
-        return -2;
+    if (network_init() < 0) {
+        log_error("network init failed");
+        return 1;
     }
-    if (verify_tx(t) < 0) return -3;
-    tx_pool_push(t);
+
+    int boot = blockchain_bootstrap(&CHAIN, &local);
+    if (boot < 0) {
+        log_error("bootstrap failed (%d)", boot);
+        return 1;
+    }
+    if (boot > 0) {
+        log_info("bootstrap created chain_id=%llu", (unsigned long long)CHAIN.chain_id);
+    } else {
+        log_info("chain state loaded chain_id=%llu", (unsigned long long)CHAIN.chain_id);
+    }
+
+    if (consensus_set_validator(&local) < 0) {
+        log_error("validator setup failed");
+        return 1;
+    }
+    if (consensus_init(&CHAIN) < 0) {
+        log_error("consensus init failed");
+        return 1;
+    }
+    if (control_start(&CHAIN) < 0) {
+        log_error("control init failed");
+        return 1;
+    }
+
+    log_info("node running net_port=%u", network_listen_port());
+    signal(SIGINT, handle_signal);
+    signal(SIGTERM, handle_signal);
+
+    while (NODE_RUNNING) {
+        sleep(1);
+    }
+
+    log_info("shutting down");
+    control_stop();
+    consensus_shutdown();
+    network_shutdown();
     return 0;
 }
 
-int main () {
-    if (sodium_init() < 0) exit(1);
+static int cmd_transfer(int argc, char** argv) {
+    if (argc != 3) return -1;
 
+    account sender;
+    if (load_identity(&sender, 1) < 0) {
+        fprintf(stderr, "invalid BC_PRIVKEY/BC_PUBKEY\n");
+        return 1;
+    }
+
+    pub_key_t receiver;
+    if (hex_to_bytes(argv[1], receiver, crypto_sign_PUBLICKEYBYTES) < 0) {
+        fprintf(stderr, "invalid receiver pub key\n");
+        return 1;
+    }
+
+    uint64_t amount = 0;
+    if (parse_u64(argv[2], &amount) < 0) {
+        fprintf(stderr, "invalid amount\n");
+        return 1;
+    }
+
+    tx* t = NULL;
+    if (tx_build_transfer(&t, &sender, receiver, amount) < 0) {
+        fprintf(stderr, "failed to build transfer tx\n");
+        return 1;
+    }
+
+    uint8_t* buf = NULL;
+    size_t len = 0;
+    if (encode_tx_to_wire(t, &buf, &len) < 0) {
+        tx_free(t);
+        fprintf(stderr, "failed to encode tx\n");
+        return 1;
+    }
+
+    int rc = control_send_tx(buf, len);
+    free(buf);
+    tx_free(t);
+
+    if (rc < 0) {
+        fprintf(stderr, "node rejected tx (%d)\n", rc);
+        return 1;
+    }
+
+    printf("tx sent\n");
+    return 0;
+}
+
+static int cmd_mint(int argc, char** argv) {
+    if (argc != 3) return -1;
+
+    account minter;
+    if (load_identity(&minter, 1) < 0) {
+        fprintf(stderr, "invalid BC_PRIVKEY/BC_PUBKEY\n");
+        return 1;
+    }
+
+    pub_key_t receiver;
+    if (hex_to_bytes(argv[1], receiver, crypto_sign_PUBLICKEYBYTES) < 0) {
+        fprintf(stderr, "invalid receiver pub key\n");
+        return 1;
+    }
+
+    uint64_t amount = 0;
+    if (parse_u64(argv[2], &amount) < 0) {
+        fprintf(stderr, "invalid amount\n");
+        return 1;
+    }
+
+    tx* t = NULL;
+    if (tx_build_mint(&t, &minter, receiver, amount) < 0) {
+        fprintf(stderr, "failed to build mint tx\n");
+        return 1;
+    }
+
+    uint8_t* buf = NULL;
+    size_t len = 0;
+    if (encode_tx_to_wire(t, &buf, &len) < 0) {
+        tx_free(t);
+        fprintf(stderr, "failed to encode tx\n");
+        return 1;
+    }
+
+    int rc = control_send_tx(buf, len);
+    free(buf);
+    tx_free(t);
+
+    if (rc < 0) {
+        fprintf(stderr, "node rejected tx (%d)\n", rc);
+        return 1;
+    }
+
+    printf("tx sent\n");
+    return 0;
+}
+
+static int cmd_balance(int argc, char** argv) {
+    pub_key_t key;
+    if (argc >= 2) {
+        if (hex_to_bytes(argv[1], key, crypto_sign_PUBLICKEYBYTES) < 0) {
+            fprintf(stderr, "invalid pub key\n");
+            return 1;
+        }
+    } else {
+        account local;
+        if (load_identity(&local, 0) < 0) {
+            fprintf(stderr, "invalid BC_PUBKEY\n");
+            return 1;
+        }
+        memcpy(key, local.pub_key, crypto_sign_PUBLICKEYBYTES);
+    }
+
+    uint64_t balance = 0;
+    int rc = control_get_balance(key, &balance);
+    if (rc < 0) {
+        fprintf(stderr, "failed to read balance (%d)\n", rc);
+        return 1;
+    }
+
+    printf("%" PRIu64 "\n", balance);
+    return 0;
+}
+
+static int cmd_ping(void) {
+    int rc = control_ping();
+    if (rc < 0) {
+        fprintf(stderr, "node not responding (%d)\n", rc);
+        return 1;
+    }
+    printf("ok\n");
+    return 0;
+}
+
+int main(int argc, char** argv) {
+    if (sodium_init() < 0) return 1;
+    if (argc < 2) {
+        usage(argv[0]);
+        return 1;
+    }
+
+    const char* cmd = argv[1];
+    if (strcmp(cmd, "node") == 0) {
+        return cmd_node();
+    }
+    if (strcmp(cmd, "transfer") == 0) {
+        int rc = cmd_transfer(argc - 1, &argv[1]);
+        if (rc < 0) usage(argv[0]);
+        return rc < 0 ? 1 : rc;
+    }
+    if (strcmp(cmd, "mint") == 0) {
+        int rc = cmd_mint(argc - 1, &argv[1]);
+        if (rc < 0) usage(argv[0]);
+        return rc < 0 ? 1 : rc;
+    }
+    if (strcmp(cmd, "balance") == 0) {
+        int rc = cmd_balance(argc - 1, &argv[1]);
+        if (rc < 0) usage(argv[0]);
+        return rc < 0 ? 1 : rc;
+    }
+    if (strcmp(cmd, "ping") == 0) {
+        return cmd_ping();
+    }
+
+    usage(argv[0]);
+    return 1;
 }
