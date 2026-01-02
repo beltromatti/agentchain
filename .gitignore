@@ -167,5 +167,6 @@ Desktop.ini
 # Logs / temp
 ############################################
 *.log
+data/
 tmp/
 temp/
