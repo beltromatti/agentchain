@@ -1,0 +1,171 @@
+############################################
+# C / C++ build artifacts
+############################################
+*.o
+*.obj
+*.lo
+*.la
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.out
+*.app
+
+# Debug symbols / profiling
+*.dSYM/
+*.su
+*.prof
+*.gcda
+*.gcno
+*.gcov
+*.lcov
+*.gch
+*.pch
+
+# Dependency files (gcc/clang -MMD)
+*.d
+*.deps
+*.depend
+
+############################################
+# Common build directories
+############################################
+build/
+_build/
+out/
+bin/
+dist/
+Debug/
+Release/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+compile_commands.json
+
+# Ninja
+.ninja_deps
+.ninja_log
+build.ninja
+rules.ninja
+
+############################################
+# Autotools / GNU build system
+############################################
+autom4te.cache/
+aclocal.m4
+config.cache
+config.log
+config.status
+configure
+compile
+depcomp
+install-sh
+missing
+ltmain.sh
+m4/
+Makefile
+Makefile.in
+libtool
+stamp-h1
+*.in~
+*.m4~
+
+# Autoconf generated headers
+config.h
+config.h.in
+
+############################################
+# Meson
+############################################
+meson-private/
+meson-logs/
+meson-info/
+builddir/
+
+############################################
+# SCons
+############################################
+.sconsign.dblite
+
+############################################
+# Coverage / reports
+############################################
+coverage/
+coverage-report/
+*.info
+*.xml
+*.html
+
+############################################
+# Valgrind / sanitizers outputs
+############################################
+vgcore.*
+valgrind*.log
+asan.log*
+ubsan.log*
+tsan.log*
+
+############################################
+# Core dumps
+############################################
+core
+core.*
+*.core
+
+############################################
+# Editors / IDEs
+############################################
+# VS Code
+.vscode/
+*.code-workspace
+
+# CLion / JetBrains
+.idea/
+cmake-build-debug/
+cmake-build-release/
+
+# Xcode
+*.xcodeproj/
+*.xcworkspace/
+DerivedData/
+
+# Visual Studio
+.vs/
+*.sln
+*.vcxproj*
+*.user
+*.filters
+
+############################################
+# OS junk
+############################################
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Linux
+*~
+.*.swp
+.*.swo
+
+############################################
+# Logs / temp
+############################################
+*.log
+tmp/
+temp/
