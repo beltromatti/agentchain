@@ -11,6 +11,7 @@ Run a node:
 ./build/blockchain node
 ```
 If `data/chain.state` is missing, `node` tries to sync from peers; configure `BC_SEEDS` (e.g. `1.2.3.4:30303`) to join the existing chain.
+If `BC_SEEDS` is not set, `node` also tries `seeds.txt` (override path with `BC_SEEDS_FILE`).
 
 Generate a new keypair (overwrites `data/identity.key`) and start the node:
 ```
@@ -42,3 +43,4 @@ Environment:
 - `BC_PORT`: peer UDP port (default 30303)
 - `BC_CTL_PORT`: local control port (default 30304)
 - `BC_SEEDS`: comma-separated `ip:port` seeds
+- `BC_SEEDS_FILE`: path to a `seeds.txt`-style file (default `seeds.txt`, used when chain state is missing)

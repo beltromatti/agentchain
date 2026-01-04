@@ -75,7 +75,40 @@ static int sync_chain_from_peers(blockchain* bc) {
     uint64_t tip_id = 0;
     pub_key_t genesis_pub = { 0 };
 
-    log_info("no local chain state, syncing from peers (set BC_SEEDS if needed)");
+    const char* seeds_file = getenv("BC_SEEDS_FILE");
+    if (!seeds_file || !*seeds_file) seeds_file = "seeds.txt";
+
+    FILE* f = fopen(seeds_file, "r");
+    if (f) {
+        char line[256];
+        while (fgets(line, (int)sizeof(line), f)) {
+            char* comment = strchr(line, '#');
+            if (comment) *comment = '\0';
+
+            size_t n = strlen(line);
+            while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r' || line[n - 1] == ' ' || line[n - 1] == '\t')) {
+                line[n - 1] = '\0';
+                n--;
+            }
+            char* s = line;
+            while (*s == ' ' || *s == '\t') s++;
+            if (*s == '\0') continue;
+
+            char* sep = strrchr(s, ':');
+            uint16_t port = 30303;
+            if (sep) {
+                *sep = '\0';
+                uint64_t p = 0;
+                if (parse_u64(sep + 1, &p) == 0 && p > 0 && p <= 65535) {
+                    port = (uint16_t)p;
+                }
+            }
+            network_peer_add_addr(s, port);
+        }
+        fclose(f);
+    }
+
+    log_info("no local chain state, syncing from peers (BC_SEEDS / %s)", seeds_file);
 
     while (((uint64_t)time(NULL)) - start < 20) {
         network_request_chain_state();
