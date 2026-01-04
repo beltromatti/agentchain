@@ -9,49 +9,17 @@
 #include "consensus.h"
 #include "control.h"
 #include "crypto.h"
+#include "identity.h"
 #include "log.h"
 #include "network.h"
 #include "tx_builder.h"
 #include "utils.h"
 
-#define USER_PRIVATE_KEY { 0x6a, 0x9f, 0x83, 0x1d, 0x2c, 0xe7, 0x54, 0x99, 0x48, 0x3b, 0xa1, 0xf0, 0x92, 0x61, 0x77, 0x3e, 0x54, 0x0f, 0x9b, 0x12, 0xd3, 0x5c, 0x89, 0x01, 0xa4, 0xe2, 0x6d, 0x7f, 0x18, 0x93, 0xbc, 0x55, 0x3c, 0x71, 0x1e, 0x0f, 0x5d, 0x6a, 0x2a, 0xb7, 0x1d, 0xa6, 0x98, 0x9f, 0x2e, 0x4f, 0x88, 0x93, 0x6b, 0xa2, 0x7c, 0x44, 0x18, 0x9d, 0xe3, 0x56, 0x8f, 0x71, 0x2b, 0x5c, 0x97, 0x41, 0x2e, 0x9a }
-#define USER_PUB_KEY { 0x3c, 0x71, 0x1e, 0x0f, 0x5d, 0x6a, 0x2a, 0xb7, 0x1d, 0xa6, 0x98, 0x9f, 0x2e, 0x4f, 0x88, 0x93, 0x6b, 0xa2, 0x7c, 0x44, 0x18, 0x9d, 0xe3, 0x56, 0x8f, 0x71, 0x2b, 0x5c, 0x97, 0x41, 0x2e, 0x9a }
-
 static volatile sig_atomic_t NODE_RUNNING = 1;
-
-static const uint8_t DEFAULT_PRIV[crypto_sign_SECRETKEYBYTES] = USER_PRIVATE_KEY;
-static const uint8_t DEFAULT_PUB[crypto_sign_PUBLICKEYBYTES] = USER_PUB_KEY;
 
 static void handle_signal(int sig) {
     (void)sig;
     NODE_RUNNING = 0;
-}
-
-static int load_identity(account* out, int require_priv) {
-    if (!out) return -1;
-    const char* priv_hex = getenv("BC_PRIVKEY");
-    const char* pub_hex = getenv("BC_PUBKEY");
-
-    memset(out, 0, sizeof(*out));
-
-    if (priv_hex && *priv_hex) {
-        if (hex_to_bytes(priv_hex, out->priv_key, crypto_sign_SECRETKEYBYTES) < 0) return -2;
-        if (pub_hex && *pub_hex) {
-            if (hex_to_bytes(pub_hex, out->pub_key, crypto_sign_PUBLICKEYBYTES) < 0) return -3;
-        } else {
-            if (derive_pub_key(out->priv_key, out->pub_key) < 0) return -4;
-        }
-        return 0;
-    }
-
-    if (!require_priv && pub_hex && *pub_hex) {
-        if (hex_to_bytes(pub_hex, out->pub_key, crypto_sign_PUBLICKEYBYTES) < 0) return -5;
-        return 0;
-    }
-
-    memcpy(out->priv_key, DEFAULT_PRIV, crypto_sign_SECRETKEYBYTES);
-    memcpy(out->pub_key, DEFAULT_PUB, crypto_sign_PUBLICKEYBYTES);
-    return 0;
 }
 
 static int parse_u64(const char* s, uint64_t* out) {
@@ -67,16 +35,17 @@ static void usage(const char* prog) {
     fprintf(stderr,
         "usage:\n"
         "  %s node\n"
+        "  %s pubkey\n"
         "  %s transfer <receiver_pub_hex> <amount>\n"
         "  %s mint <receiver_pub_hex> <amount>\n"
         "  %s balance [pub_hex]\n"
         "  %s ping\n\n"
         "env:\n"
-        "  BC_PRIVKEY / BC_PUBKEY   hex keys (priv required for transfer/mint/node)\n"
+        "  BC_PRIVKEY / BC_PUBKEY   hex keys (BC_PRIVKEY can be 32B seed or 64B secret)\n"
         "  BC_PORT                  udp port for peer network (default 30303)\n"
         "  BC_CTL_PORT              local control port (default 30304)\n"
         "  BC_SEEDS                 comma list of ip:port seeds\n",
-        prog, prog, prog, prog, prog);
+        prog, prog, prog, prog, prog, prog);
 }
 
 static int encode_tx_to_wire(const tx* t, uint8_t** out_buf, size_t* out_len) {
@@ -97,8 +66,8 @@ static int encode_tx_to_wire(const tx* t, uint8_t** out_buf, size_t* out_len) {
 
 static int cmd_node(void) {
     account local;
-    if (load_identity(&local, 1) < 0) {
-        fprintf(stderr, "invalid BC_PRIVKEY/BC_PUBKEY\n");
+    if (identity_load(&local, 1) < 0) {
+        fprintf(stderr, "identity load failed\n");
         return 1;
     }
 
@@ -158,8 +127,8 @@ static int cmd_transfer(int argc, char** argv) {
     if (argc != 3) return -1;
 
     account sender;
-    if (load_identity(&sender, 1) < 0) {
-        fprintf(stderr, "invalid BC_PRIVKEY/BC_PUBKEY\n");
+    if (identity_load(&sender, 1) < 0) {
+        fprintf(stderr, "identity load failed\n");
         return 1;
     }
 
@@ -206,8 +175,8 @@ static int cmd_mint(int argc, char** argv) {
     if (argc != 3) return -1;
 
     account minter;
-    if (load_identity(&minter, 1) < 0) {
-        fprintf(stderr, "invalid BC_PRIVKEY/BC_PUBKEY\n");
+    if (identity_load(&minter, 1) < 0) {
+        fprintf(stderr, "identity load failed\n");
         return 1;
     }
 
@@ -259,8 +228,8 @@ static int cmd_balance(int argc, char** argv) {
         }
     } else {
         account local;
-        if (load_identity(&local, 0) < 0) {
-            fprintf(stderr, "invalid BC_PUBKEY\n");
+        if (identity_load(&local, 0) < 0) {
+            fprintf(stderr, "identity load failed\n");
             return 1;
         }
         memcpy(key, local.pub_key, crypto_sign_PUBLICKEYBYTES);
@@ -284,6 +253,21 @@ static int cmd_ping(void) {
         return 1;
     }
     printf("ok\n");
+    return 0;
+}
+
+static int cmd_pubkey(void) {
+    account local;
+    if (identity_load(&local, 1) < 0) {
+        fprintf(stderr, "identity load failed\n");
+        return 1;
+    }
+    char hex[crypto_sign_PUBLICKEYBYTES * 2 + 1];
+    if (bytes_to_hex(local.pub_key, crypto_sign_PUBLICKEYBYTES, hex, sizeof(hex)) < 0) {
+        fprintf(stderr, "failed to encode pubkey\n");
+        return 1;
+    }
+    printf("%s\n", hex);
     return 0;
 }
 
@@ -315,6 +299,9 @@ int main(int argc, char** argv) {
     }
     if (strcmp(cmd, "ping") == 0) {
         return cmd_ping();
+    }
+    if (strcmp(cmd, "pubkey") == 0) {
+        return cmd_pubkey();
     }
 
     usage(argv[0]);

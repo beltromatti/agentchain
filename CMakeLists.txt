@@ -15,6 +15,7 @@ add_executable(blockchain
     src/txpool.c
     src/utils.c
     src/crypto.c
+    src/identity.c
     src/blockchain.c
     src/network.c
     src/consensus.c

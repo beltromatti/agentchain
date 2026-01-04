@@ -369,6 +369,12 @@ static int validator_eligible(const pub_key_t pub_key, uint64_t balance,
     return h <= threshold;
 }
 
+static int is_bootstrap_genesis_locked(blockchain* bc, const pub_key_t pub_key) {
+    if (!bc || !pub_key) return 0;
+    if (bc->tip != NULL) return 0;
+    return memcmp(pub_key, bc->genesis_pub, crypto_sign_PUBLICKEYBYTES) == 0;
+}
+
 static uint64_t current_slot(void) {
     return network_time_now() / CONSENSUS_SLOT_SECS;
 }
@@ -854,9 +860,13 @@ static int consensus_accept_block(block* b) {
     uint64_t balance = 0;
     pthread_mutex_lock(&CONS_CHAIN->mtx);
     balance = bc_get_balance_locked(CONS_CHAIN, b->proposer);
+    int bootstrap_genesis = (b->prev_id == 0) ? is_bootstrap_genesis_locked(CONS_CHAIN, b->proposer) : 0;
     pthread_mutex_unlock(&CONS_CHAIN->mtx);
 
-    if (!validator_eligible(b->proposer, balance, b->slot, b->prev_id, b->chain_id)) return -6;
+    if (!bootstrap_genesis &&
+        !validator_eligible(b->proposer, balance, b->slot, b->prev_id, b->chain_id)) {
+        return -6;
+    }
 
     if (block_verify(b) < 0) return -7;
     if (validate_block_txs(CONS_CHAIN, b) < 0) return -8;
@@ -924,9 +934,13 @@ static void consensus_produce_block(void) {
     uint64_t prev_id = CONS_CHAIN->tip ? CONS_CHAIN->tip->id : 0;
     uint64_t chain_id = CONS_CHAIN->chain_id;
     uint64_t balance = bc_get_balance_locked(CONS_CHAIN, CONS_VALIDATOR.pub_key);
+    int bootstrap_genesis = (prev_id == 0) ? is_bootstrap_genesis_locked(CONS_CHAIN, CONS_VALIDATOR.pub_key) : 0;
     pthread_mutex_unlock(&CONS_CHAIN->mtx);
 
-    if (!validator_eligible(CONS_VALIDATOR.pub_key, balance, slot, prev_id, chain_id)) return;
+    if (!bootstrap_genesis &&
+        !validator_eligible(CONS_VALIDATOR.pub_key, balance, slot, prev_id, chain_id)) {
+        return;
+    }
 
     pthread_mutex_lock(&CONS_MTX);
     if (pending_find_slot_locked(slot)) {
