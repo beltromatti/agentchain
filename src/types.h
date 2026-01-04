@@ -70,6 +70,7 @@ typedef struct {
     block* tip;
     account_state_node* accounts;
     uint8_t synced;
+    uint64_t last_commit_time;
 } blockchain;
 
 typedef struct {

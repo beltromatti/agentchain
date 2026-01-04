@@ -30,7 +30,8 @@ blockchain CHAIN = {
     .genesis_pub = { 0 },
     .tip = NULL,
     .accounts = NULL,
-    .synced = 0
+    .synced = 0,
+    .last_commit_time = 0
 };
 
 int blockchain_init(blockchain* bc) {
@@ -41,6 +42,7 @@ int blockchain_init(blockchain* bc) {
     bc->chain_id = 0;
     memset(bc->genesis_pub, 0, sizeof(bc->genesis_pub));
     bc->synced = 0;
+    bc->last_commit_time = 0;
     return 0;
 }
 
@@ -309,7 +311,7 @@ int blockchain_encode_snapshot(blockchain* bc, uint8_t** out, size_t* out_len) {
         cur = cur->next;
     }
 
-    size_t total = 1 + 8 + crypto_sign_PUBLICKEYBYTES + 8 + 8 + 4 +
+    size_t total = 1 + 8 + crypto_sign_PUBLICKEYBYTES + 8 + 8 + 8 + 4 +
         (size_t)count * (crypto_sign_PUBLICKEYBYTES + 8);
 
     uint8_t* buf = malloc(total);
@@ -327,6 +329,8 @@ int blockchain_encode_snapshot(blockchain* bc, uint8_t** out, size_t* out_len) {
     store_u64_le(&buf[off], bc->height);
     off += 8;
     store_u64_le(&buf[off], bc->tip ? bc->tip->id : 0);
+    off += 8;
+    store_u64_le(&buf[off], bc->last_commit_time);
     off += 8;
     store_u32_le(&buf[off], count);
     off += 4;
@@ -348,7 +352,7 @@ int blockchain_encode_snapshot(blockchain* bc, uint8_t** out, size_t* out_len) {
 }
 
 int blockchain_apply_snapshot(blockchain* bc, const uint8_t* data, size_t len) {
-    if (!bc || !data || len < 1 + 8 + crypto_sign_PUBLICKEYBYTES + 8 + 8 + 4) return -1;
+    if (!bc || !data || len < 1 + 8 + crypto_sign_PUBLICKEYBYTES + 8 + 8 + 8 + 4) return -1;
     size_t off = 0;
     uint8_t ver = data[off++];
     if (ver != 1) return -2;
@@ -361,10 +365,12 @@ int blockchain_apply_snapshot(blockchain* bc, const uint8_t* data, size_t len) {
     off += 8;
     uint64_t tip_id = load_u64_le(&data[off]);
     off += 8;
+    uint64_t last_commit_time = load_u64_le(&data[off]);
+    off += 8;
     uint32_t count = load_u32_le(&data[off]);
     off += 4;
 
-    size_t needed = 1 + 8 + crypto_sign_PUBLICKEYBYTES + 8 + 8 + 4 +
+    size_t needed = 1 + 8 + crypto_sign_PUBLICKEYBYTES + 8 + 8 + 8 + 4 +
         (size_t)count * (crypto_sign_PUBLICKEYBYTES + 8);
     if (needed != len) return -3;
 
@@ -395,6 +401,7 @@ int blockchain_apply_snapshot(blockchain* bc, const uint8_t* data, size_t len) {
     }
 
     bc->height = height;
+    bc->last_commit_time = last_commit_time;
 
     if (!bc->tip) {
         bc->tip = calloc(1, sizeof(*bc->tip));

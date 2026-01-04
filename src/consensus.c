@@ -31,7 +31,6 @@ static pending_block* PENDING = NULL;
 static pthread_t CONS_THREAD;
 static volatile int CONS_RUNNING = 0;
 static uint64_t LAST_PRODUCED_SLOT = 0;
-static uint64_t LAST_COMMIT_TIME = 0;
 
 static void votes_free(vote_entry* v) {
     while (v) {
@@ -197,6 +196,15 @@ static void tx_pool_remove_expired_locked(uint64_t now) {
         TX_POOL.tx_num--;
         tx_destroy_pool_owned(t);
     }
+}
+
+static uint32_t tx_pool_count_ready(void) {
+    uint64_t now = network_time_now();
+    pthread_mutex_lock(&TX_POOL.mtx);
+    tx_pool_remove_expired_locked(now);
+    uint32_t n = TX_POOL.tx_num;
+    pthread_mutex_unlock(&TX_POOL.mtx);
+    return n;
 }
 
 static tx_list_node* tx_pool_detach_for_block(uint32_t max_txs, uint32_t* out_num) {
@@ -380,8 +388,18 @@ static uint64_t block_id_from_hash(const uint8_t hash[32]) {
 }
 
 static int validator_eligible(const pub_key_t pub_key, uint64_t balance,
-                              uint64_t slot, uint64_t prev_id, uint64_t chain_id) {
-    if (!pub_key || balance == 0) return 0;
+                              uint64_t slot, uint64_t prev_id, uint64_t chain_id,
+                              uint64_t last_commit_time) {
+    if (!pub_key) return 0;
+
+    uint64_t slot_time = slot * CONSENSUS_SLOT_SECS;
+    if (last_commit_time == 0 ||
+        (slot_time >= last_commit_time &&
+         (slot_time - last_commit_time) >= CONSENSUS_EMPTY_BLOCK_SECS)) {
+        return 1;
+    }
+
+    if (balance == 0) return 0;
     uint8_t buf[8 + 8 + 8 + crypto_sign_PUBLICKEYBYTES];
     size_t off = 0;
     store_u64_le(&buf[off], chain_id);
@@ -760,6 +778,11 @@ static int apply_block(blockchain* bc, block* b) {
         cur = cur->next;
     }
 
+    uint64_t slot_time = (b->slot > (UINT64_MAX / CONSENSUS_SLOT_SECS))
+        ? UINT64_MAX
+        : (b->slot * CONSENSUS_SLOT_SECS);
+    bc->last_commit_time = slot_time;
+
     pthread_mutex_unlock(&bc->mtx);
     return 0;
 }
@@ -917,7 +940,6 @@ static int consensus_try_commit(pending_block* pb) {
                  (unsigned long long)needed_stake);
     }
 
-    LAST_COMMIT_TIME = network_time_now();
     return 1;
 }
 
@@ -938,13 +960,15 @@ static int consensus_accept_block(block* b) {
     if (b->prev_id != prev_id) return -5;
 
     uint64_t balance = 0;
+    uint64_t last_commit_time = 0;
     pthread_mutex_lock(&CONS_CHAIN->mtx);
     balance = bc_get_balance_locked(CONS_CHAIN, b->proposer);
+    last_commit_time = CONS_CHAIN->last_commit_time;
     int bootstrap_genesis = (b->prev_id == 0) ? is_bootstrap_genesis_locked(CONS_CHAIN, b->proposer) : 0;
     pthread_mutex_unlock(&CONS_CHAIN->mtx);
 
     if (!bootstrap_genesis &&
-        !validator_eligible(b->proposer, balance, b->slot, b->prev_id, b->chain_id)) {
+        !validator_eligible(b->proposer, balance, b->slot, b->prev_id, b->chain_id, last_commit_time)) {
         return -6;
     }
 
@@ -1012,6 +1036,9 @@ static void consensus_produce_block(void) {
     pthread_mutex_unlock(&CONS_CHAIN->mtx);
     if (!chain_synced) return;
 
+    uint32_t pool_ready = tx_pool_count_ready();
+    if (pool_ready == 0) return;
+
     uint64_t slot = current_slot();
     if (LAST_PRODUCED_SLOT == slot) return;
 
@@ -1019,11 +1046,22 @@ static void consensus_produce_block(void) {
     uint64_t prev_id = CONS_CHAIN->tip ? CONS_CHAIN->tip->id : 0;
     uint64_t chain_id = CONS_CHAIN->chain_id;
     uint64_t balance = bc_get_balance_locked(CONS_CHAIN, CONS_VALIDATOR.pub_key);
+    uint64_t last_commit_time = CONS_CHAIN->last_commit_time;
     int bootstrap_genesis = (prev_id == 0) ? is_bootstrap_genesis_locked(CONS_CHAIN, CONS_VALIDATOR.pub_key) : 0;
     pthread_mutex_unlock(&CONS_CHAIN->mtx);
 
+    uint64_t now = network_time_now();
+    uint64_t elapsed = 0;
+    if (last_commit_time == 0) elapsed = UINT64_MAX;
+    else if (now > last_commit_time) elapsed = now - last_commit_time;
+    else elapsed = 0;
+
+    if (pool_ready < CONSENSUS_MAX_TX && elapsed < CONSENSUS_EMPTY_BLOCK_SECS) {
+        return;
+    }
+
     if (!bootstrap_genesis &&
-        !validator_eligible(CONS_VALIDATOR.pub_key, balance, slot, prev_id, chain_id)) {
+        !validator_eligible(CONS_VALIDATOR.pub_key, balance, slot, prev_id, chain_id, last_commit_time)) {
         return;
     }
 
@@ -1034,14 +1072,9 @@ static void consensus_produce_block(void) {
     }
     pthread_mutex_unlock(&CONS_MTX);
 
-    uint64_t now = network_time_now();
     uint32_t tx_num = 0;
     tx_list_node* txs = tx_pool_detach_for_block(CONSENSUS_MAX_TX, &tx_num);
-    if (!txs) {
-        if (LAST_COMMIT_TIME != 0 && (now - LAST_COMMIT_TIME) < CONSENSUS_EMPTY_BLOCK_SECS) {
-            return;
-        }
-    }
+    if (!txs || tx_num == 0) return;
 
     block* b = calloc(1, sizeof(*b));
     if (!b) {
@@ -1085,7 +1118,6 @@ static void* consensus_thread(void* arg) {
 int consensus_init(blockchain* bc) {
     if (!bc) return -1;
     CONS_CHAIN = bc;
-    LAST_COMMIT_TIME = network_time_now();
     CONS_RUNNING = 1;
     if (pthread_create(&CONS_THREAD, NULL, consensus_thread, NULL) != 0) {
         CONS_RUNNING = 0;
