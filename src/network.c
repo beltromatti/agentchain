@@ -598,11 +598,12 @@ static size_t process_hello_payload(peer_state* peer, const uint8_t* payload, ui
     uint32_t listen_port = load_u32_le(&payload[0]);
     uint32_t peer_count = load_u32_le(&payload[4]);
 
-    if (peer && listen_port > 0 && listen_port <= 65535) {
-        peer->port = (uint16_t)listen_port;
-        if (peer->ip_be == 0) peer->ip_be = src_ip_be;
-    } else if (peer && peer->port == 0) {
+    (void)listen_port;
+
+    if (peer) {
+        /* NAT-friendly: use observed UDP source port, not the advertised listen_port. */
         peer->port = src_port;
+        if (peer->ip_be == 0) peer->ip_be = src_ip_be;
     }
 
     size_t off = 8;
@@ -721,6 +722,19 @@ static void process_packet(const uint8_t* data, size_t len, uint32_t src_ip_be, 
         pthread_mutex_lock(&STATE_MTX);
         chain_view_set_state_locked(chain_id, genesis_pub, height, tip_id, now);
         pthread_mutex_unlock(&STATE_MTX);
+
+        pthread_mutex_lock(&CHAIN.mtx);
+        uint64_t local_chain_id = CHAIN.chain_id;
+        uint64_t local_height = CHAIN.height;
+        pthread_mutex_unlock(&CHAIN.mtx);
+
+        if (local_chain_id == 0) {
+            /* Chain not initialized yet: store state so main can adopt it. */
+            return;
+        }
+        if (local_chain_id == chain_id && height > local_height) {
+            network_request_snapshot();
+        }
         return;
     }
 
@@ -733,6 +747,32 @@ static void process_packet(const uint8_t* data, size_t len, uint32_t src_ip_be, 
         pthread_mutex_lock(&STATE_MTX);
         chain_view_set_snapshot_locked(payload, payload_len, now);
         pthread_mutex_unlock(&STATE_MTX);
+
+        /* Apply snapshot live (best-effort) to keep nodes synced. */
+        if (payload_len >= 1 + 8 + crypto_sign_PUBLICKEYBYTES + 8 + 8 + 4) {
+            uint64_t snap_chain_id = load_u64_le(&payload[1]);
+            const uint8_t* snap_genesis = &payload[1 + 8];
+
+            pthread_mutex_lock(&CHAIN.mtx);
+            uint64_t local_chain_id = CHAIN.chain_id;
+            pthread_mutex_unlock(&CHAIN.mtx);
+
+            if (local_chain_id == 0) {
+                blockchain_accept_remote_chain_state(&CHAIN, snap_chain_id, snap_genesis);
+            }
+            pthread_mutex_lock(&CHAIN.mtx);
+            uint64_t post_chain_id = CHAIN.chain_id;
+            pthread_mutex_unlock(&CHAIN.mtx);
+
+            if (post_chain_id == snap_chain_id) {
+                if (blockchain_apply_snapshot(&CHAIN, payload, payload_len) == 0) {
+                    pthread_mutex_lock(&CHAIN.mtx);
+                    uint64_t h = CHAIN.height;
+                    pthread_mutex_unlock(&CHAIN.mtx);
+                    log_info("snapshot synced height=%llu", (unsigned long long)h);
+                }
+            }
+        }
         return;
     }
 }
@@ -755,6 +795,7 @@ static void* network_thread(void* arg) {
     (void)arg;
 
     uint64_t last_hello = 0;
+    uint64_t last_state_req = 0;
 
     while (NET_RUNNING) {
         fd_set rfds;
@@ -784,6 +825,11 @@ static void* network_thread(void* arg) {
             send_hello_broadcast();
             send_hello_to_peers();
             last_hello = now;
+        }
+
+        if (last_state_req == 0 || now - last_state_req >= 3) {
+            network_request_chain_state();
+            last_state_req = now;
         }
 
         peer_prune_timeouts(now);

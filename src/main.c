@@ -110,29 +110,38 @@ static int sync_chain_from_peers(blockchain* bc) {
 
     log_info("no local chain state, syncing from peers (BC_SEEDS / %s)", seeds_file);
 
-    while (((uint64_t)time(NULL)) - start < 20) {
-        network_request_chain_state();
+    pthread_mutex_lock(&bc->mtx);
+    int has_chain = (bc->chain_id != 0);
+    pthread_mutex_unlock(&bc->mtx);
 
-        if (network_get_remote_chain_state(&chain_id, genesis_pub, &height, &tip_id) == 0) {
-            if (blockchain_accept_remote_chain_state(bc, chain_id, genesis_pub) < 0) {
-                sleep(1);
-                continue;
+    if (!has_chain) {
+        while (((uint64_t)time(NULL)) - start < 20) {
+            network_request_chain_state();
+
+            if (network_get_remote_chain_state(&chain_id, genesis_pub, &height, &tip_id) == 0) {
+                if (blockchain_accept_remote_chain_state(bc, chain_id, genesis_pub) < 0) {
+                    sleep(1);
+                    continue;
+                }
+                char gen_hex[crypto_sign_PUBLICKEYBYTES * 2 + 1];
+                if (bytes_to_hex(genesis_pub, crypto_sign_PUBLICKEYBYTES, gen_hex, sizeof(gen_hex)) == 0) {
+                    log_info("chain state synced chain_id=%llu genesis=%s height=%llu",
+                             (unsigned long long)chain_id, gen_hex, (unsigned long long)height);
+                } else {
+                    log_info("chain state synced chain_id=%llu height=%llu",
+                             (unsigned long long)chain_id, (unsigned long long)height);
+                }
+                break;
             }
-            char gen_hex[crypto_sign_PUBLICKEYBYTES * 2 + 1];
-            if (bytes_to_hex(genesis_pub, crypto_sign_PUBLICKEYBYTES, gen_hex, sizeof(gen_hex)) == 0) {
-                log_info("chain state synced chain_id=%llu genesis=%s height=%llu",
-                         (unsigned long long)chain_id, gen_hex, (unsigned long long)height);
-            } else {
-                log_info("chain state synced chain_id=%llu height=%llu",
-                         (unsigned long long)chain_id, (unsigned long long)height);
-            }
-            break;
+
+            sleep(1);
         }
 
-        sleep(1);
+        pthread_mutex_lock(&bc->mtx);
+        has_chain = (bc->chain_id != 0);
+        pthread_mutex_unlock(&bc->mtx);
+        if (!has_chain) return -1;
     }
-
-    if (bc->chain_id == 0) return -1;
 
     log_info("requesting chain snapshot");
     start = (uint64_t)time(NULL);
@@ -200,6 +209,16 @@ static int cmd_node(int allow_bootstrap, int rotate_keys) {
     } else {
         if (sync_chain_from_peers(&CHAIN) < 0) {
             log_error("sync failed (run `bootstrap` to create a dev chain)");
+            return 1;
+        }
+    }
+
+    pthread_mutex_lock(&CHAIN.mtx);
+    int synced = CHAIN.synced;
+    pthread_mutex_unlock(&CHAIN.mtx);
+    if (!synced && !allow_bootstrap) {
+        if (sync_chain_from_peers(&CHAIN) < 0) {
+            log_error("sync failed (need peers to fetch snapshot)");
             return 1;
         }
     }
@@ -272,7 +291,11 @@ static int cmd_transfer(int argc, char** argv) {
     tx_free(t);
 
     if (rc < 0) {
-        fprintf(stderr, "node rejected tx (%d)\n", rc);
+        if (rc == -11) {
+            fprintf(stderr, "node not synced yet\n");
+        } else {
+            fprintf(stderr, "node rejected tx (%d)\n", rc);
+        }
         return 1;
     }
 
@@ -320,7 +343,11 @@ static int cmd_mint(int argc, char** argv) {
     tx_free(t);
 
     if (rc < 0) {
-        fprintf(stderr, "node rejected tx (%d)\n", rc);
+        if (rc == -11) {
+            fprintf(stderr, "node not synced yet\n");
+        } else {
+            fprintf(stderr, "node rejected tx (%d)\n", rc);
+        }
         return 1;
     }
 
@@ -347,7 +374,11 @@ static int cmd_balance(int argc, char** argv) {
     uint64_t balance = 0;
     int rc = control_get_balance(key, &balance);
     if (rc < 0) {
-        fprintf(stderr, "failed to read balance (%d)\n", rc);
+        if (rc == -11) {
+            fprintf(stderr, "node not synced yet\n");
+        } else {
+            fprintf(stderr, "failed to read balance (%d)\n", rc);
+        }
         return 1;
     }
 

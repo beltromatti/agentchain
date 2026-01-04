@@ -21,6 +21,7 @@
 #define CONSENSUS_PROB_DENOM 1000000ULL
 #define CONSENSUS_MAX_FUTURE_SLOTS 1
 #define CONSENSUS_MAX_PAST_SLOTS 8
+#define CONSENSUS_EMPTY_BLOCK_SECS 30
 
 static pthread_mutex_t CONS_MTX = PTHREAD_MUTEX_INITIALIZER;
 static blockchain* CONS_CHAIN = NULL;
@@ -30,6 +31,7 @@ static pending_block* PENDING = NULL;
 static pthread_t CONS_THREAD;
 static volatile int CONS_RUNNING = 0;
 static uint64_t LAST_PRODUCED_SLOT = 0;
+static uint64_t LAST_COMMIT_TIME = 0;
 
 static void votes_free(vote_entry* v) {
     while (v) {
@@ -915,6 +917,7 @@ static int consensus_try_commit(pending_block* pb) {
                  (unsigned long long)needed_stake);
     }
 
+    LAST_COMMIT_TIME = network_time_now();
     return 1;
 }
 
@@ -1004,6 +1007,11 @@ static void consensus_handle_pending_block(block* b) {
 static void consensus_produce_block(void) {
     if (!HAS_VALIDATOR || !CONS_CHAIN) return;
 
+    pthread_mutex_lock(&CONS_CHAIN->mtx);
+    int chain_synced = CONS_CHAIN->synced;
+    pthread_mutex_unlock(&CONS_CHAIN->mtx);
+    if (!chain_synced) return;
+
     uint64_t slot = current_slot();
     if (LAST_PRODUCED_SLOT == slot) return;
 
@@ -1026,13 +1034,18 @@ static void consensus_produce_block(void) {
     }
     pthread_mutex_unlock(&CONS_MTX);
 
+    uint64_t now = network_time_now();
     uint32_t tx_num = 0;
     tx_list_node* txs = tx_pool_detach_for_block(CONSENSUS_MAX_TX, &tx_num);
-    if (!txs) return;
+    if (!txs) {
+        if (LAST_COMMIT_TIME != 0 && (now - LAST_COMMIT_TIME) < CONSENSUS_EMPTY_BLOCK_SECS) {
+            return;
+        }
+    }
 
     block* b = calloc(1, sizeof(*b));
     if (!b) {
-        tx_list_destroy(txs);
+        if (txs) tx_list_destroy(txs);
         return;
     }
 
@@ -1072,6 +1085,7 @@ static void* consensus_thread(void* arg) {
 int consensus_init(blockchain* bc) {
     if (!bc) return -1;
     CONS_CHAIN = bc;
+    LAST_COMMIT_TIME = network_time_now();
     CONS_RUNNING = 1;
     if (pthread_create(&CONS_THREAD, NULL, consensus_thread, NULL) != 0) {
         CONS_RUNNING = 0;

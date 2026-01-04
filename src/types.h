@@ -69,6 +69,7 @@ typedef struct {
     pub_key_t genesis_pub;
     block* tip;
     account_state_node* accounts;
+    uint8_t synced;
 } blockchain;
 
 typedef struct {

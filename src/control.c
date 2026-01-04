@@ -109,9 +109,17 @@ static void handle_request(const uint8_t* buf, size_t len,
         if (!payload || payload_len == 0) {
             status = -1;
         } else {
+            int ready = 0;
+            pthread_mutex_lock(&CTL_CHAIN->mtx);
+            ready = (CTL_CHAIN->chain_id != 0 && CTL_CHAIN->synced);
+            pthread_mutex_unlock(&CTL_CHAIN->mtx);
+            if (!ready) {
+                status = -11; /* not synced */
+            } else {
             status = handle_incoming_tx((uint8_t*)payload, payload_len);
             if (status == 0) {
                 log_info("tx received (size=%u)", payload_len);
+            }
             }
         }
         resp_len = 4;
@@ -122,11 +130,21 @@ static void handle_request(const uint8_t* buf, size_t len,
             resp_len = 4;
             store_u32_le(resp, (uint32_t)status);
         } else {
+            int ready = 0;
+            pthread_mutex_lock(&CTL_CHAIN->mtx);
+            ready = (CTL_CHAIN->chain_id != 0 && CTL_CHAIN->synced);
+            pthread_mutex_unlock(&CTL_CHAIN->mtx);
+            if (!ready) {
+                status = -11;
+                resp_len = 4;
+                store_u32_le(resp, (uint32_t)status);
+            } else {
             account* acc = blockchain_get_account(CTL_CHAIN, payload);
             uint64_t balance = acc ? acc->balance : 0;
             resp_len = 12;
             store_u32_le(resp, (uint32_t)status);
             store_u64_le(resp + 4, balance);
+            }
         }
     } else {
         status = -2;

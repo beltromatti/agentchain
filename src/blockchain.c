@@ -29,7 +29,8 @@ blockchain CHAIN = {
     .chain_id = 0,
     .genesis_pub = { 0 },
     .tip = NULL,
-    .accounts = NULL
+    .accounts = NULL,
+    .synced = 0
 };
 
 int blockchain_init(blockchain* bc) {
@@ -39,6 +40,7 @@ int blockchain_init(blockchain* bc) {
     bc->accounts = NULL;
     bc->chain_id = 0;
     memset(bc->genesis_pub, 0, sizeof(bc->genesis_pub));
+    bc->synced = 0;
     return 0;
 }
 
@@ -92,8 +94,11 @@ int blockchain_load_chain_state(blockchain* bc) {
     int rc = load_chain_state(&state);
     if (rc < 0) return rc;
 
+    pthread_mutex_lock(&bc->mtx);
     bc->chain_id = state.chain_id;
     memcpy(bc->genesis_pub, state.genesis_pub, crypto_sign_PUBLICKEYBYTES);
+    bc->synced = 0;
+    pthread_mutex_unlock(&bc->mtx);
     return 0;
 }
 
@@ -113,8 +118,11 @@ int blockchain_create_chain_state(blockchain* bc, const account* genesis) {
         return -2;
     }
 
+    pthread_mutex_lock(&bc->mtx);
     bc->chain_id = state.chain_id;
     memcpy(bc->genesis_pub, state.genesis_pub, crypto_sign_PUBLICKEYBYTES);
+    bc->synced = 1;
+    pthread_mutex_unlock(&bc->mtx);
     return 0;
 }
 
@@ -136,13 +144,19 @@ int blockchain_accept_remote_chain_state(blockchain* bc, uint64_t chain_id, cons
             memcmp(loaded.genesis_pub, genesis_pub, crypto_sign_PUBLICKEYBYTES) != 0) {
             return -3;
         }
+        pthread_mutex_lock(&bc->mtx);
         bc->chain_id = loaded.chain_id;
         memcpy(bc->genesis_pub, loaded.genesis_pub, crypto_sign_PUBLICKEYBYTES);
+        bc->synced = 0;
+        pthread_mutex_unlock(&bc->mtx);
         return 0;
     }
 
+    pthread_mutex_lock(&bc->mtx);
     bc->chain_id = state.chain_id;
     memcpy(bc->genesis_pub, state.genesis_pub, crypto_sign_PUBLICKEYBYTES);
+    bc->synced = 0;
+    pthread_mutex_unlock(&bc->mtx);
     return 0;
 }
 
@@ -188,6 +202,7 @@ int blockchain_bootstrap(blockchain* bc, const account* genesis) {
     created = 1;
     rc = blockchain_register_account(bc, genesis);
     if (rc < 0) return rc;
+    bc->synced = 1;
     return created;
 }
 
@@ -399,6 +414,7 @@ int blockchain_apply_snapshot(blockchain* bc, const uint8_t* data, size_t len) {
     bc->tip->txs = NULL;
     bc->tip->prev_block = NULL;
 
+    bc->synced = 1;
     pthread_mutex_unlock(&bc->mtx);
     return 0;
 }
