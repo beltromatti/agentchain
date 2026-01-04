@@ -9,6 +9,7 @@ extern "C" {
 #include "types.h"
 
 int identity_load(account* out, int require_priv);
+int identity_rotate(account* out);
 
 #ifdef __cplusplus
 }

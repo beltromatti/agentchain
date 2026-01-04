@@ -132,14 +132,6 @@ static int vote_add_locked(pending_block* pb, const pub_key_t voter) {
     return 1;
 }
 
-static size_t consensus_required_votes(void) {
-    size_t peers = network_peer_count_online();
-    size_t total = peers + 1;
-    size_t needed = (total / 2) + 1;
-    if (needed < 1) needed = 1;
-    return needed;
-}
-
 static void tx_free_account_nodes(account_list_node* head) {
     while (head) {
         account_list_node* next = head->next;
@@ -293,19 +285,59 @@ static void tx_pool_remove_by_sig(const signature_t sig) {
     pthread_mutex_unlock(&TX_POOL.mtx);
 }
 
-static int tx_wire_hash(const tx* t, uint8_t out[32]) {
+static int tx_block_wire_hash(const tx* t, uint8_t out[32]) {
     if (!t || !out) return -1;
-    size_t len = 0;
-    if (encode_tx((tx*)t, NULL, &len) < 0) return -2;
-    uint8_t* buf = malloc(len);
-    if (!buf) return -3;
-    size_t cap = len;
-    if (encode_tx((tx*)t, buf, &cap) < 0) {
-        free(buf);
-        return -4;
+    if (!t->accounts || t->accounts_num == 0) return -2;
+
+    crypto_generichash_state st;
+    if (crypto_generichash_init(&st, NULL, 0, 32) != 0) return -3;
+
+    const uint8_t version = 1;
+    crypto_generichash_update(&st, &version, 1);
+    crypto_generichash_update(&st, t->signature, crypto_sign_BYTES);
+
+    uint8_t b8[8];
+    store_u64_le(b8, t->expire);
+    crypto_generichash_update(&st, b8, sizeof b8);
+
+    crypto_generichash_update(&st, &t->function_id, 1);
+
+    uint8_t b4[4];
+    store_u32_le(b4, t->accounts_num);
+    crypto_generichash_update(&st, b4, sizeof b4);
+
+    account_list_node* cur = t->accounts;
+    uint32_t count = 0;
+    while (cur && count < t->accounts_num) {
+        if (!cur->acc) {
+            sodium_memzero(&st, sizeof st);
+            return -4;
+        }
+        crypto_generichash_update(&st, cur->acc->pub_key, crypto_sign_PUBLICKEYBYTES);
+        cur = cur->next;
+        count++;
     }
-    crypto_generichash(out, 32, buf, cap, NULL, 0);
-    free(buf);
+    if (count != t->accounts_num || cur != NULL) {
+        sodium_memzero(&st, sizeof st);
+        return -5;
+    }
+
+    uint32_t data_len = 0;
+    if (t->data) {
+        if (t->data->data_len > TX_DATA_MAX_SIZE) {
+            sodium_memzero(&st, sizeof st);
+            return -6;
+        }
+        data_len = t->data->data_len;
+    }
+    store_u32_le(b4, data_len);
+    crypto_generichash_update(&st, b4, sizeof b4);
+    if (data_len > 0) {
+        crypto_generichash_update(&st, t->data->data, data_len);
+    }
+
+    crypto_generichash_final(&st, out, 32);
+    sodium_memzero(&st, sizeof st);
     return 0;
 }
 
@@ -327,7 +359,7 @@ static int block_hash(const block* b, uint8_t out[32]) {
     tx_list_node* cur = b->txs;
     while (cur) {
         uint8_t h[32];
-        if (!cur->transaction || tx_wire_hash(cur->transaction, h) < 0) {
+        if (!cur->transaction || tx_block_wire_hash(cur->transaction, h) < 0) {
             sodium_memzero(&st, sizeof st);
             return -3;
         }
@@ -371,7 +403,8 @@ static int validator_eligible(const pub_key_t pub_key, uint64_t balance,
 
 static int is_bootstrap_genesis_locked(blockchain* bc, const pub_key_t pub_key) {
     if (!bc || !pub_key) return 0;
-    if (bc->tip != NULL) return 0;
+    if (bc->height != 0) return 0;
+    if (bc->tip && bc->tip->id != 0) return 0;
     return memcmp(pub_key, bc->genesis_pub, crypto_sign_PUBLICKEYBYTES) == 0;
 }
 
@@ -811,10 +844,52 @@ static int consensus_broadcast_vote(const block* b) {
     return rc;
 }
 
+static uint64_t consensus_total_online_stake(void) {
+    if (!CONS_CHAIN) return 0;
+    pub_key_t* peers = NULL;
+    size_t peer_count = network_peer_snapshot_pubkeys(&peers);
+
+    uint64_t total = 0;
+    pthread_mutex_lock(&CONS_CHAIN->mtx);
+    if (HAS_VALIDATOR) {
+        total += bc_get_balance_locked(CONS_CHAIN, CONS_VALIDATOR.pub_key);
+    }
+    for (size_t i = 0; i < peer_count; i++) {
+        if (HAS_VALIDATOR &&
+            memcmp(peers[i], CONS_VALIDATOR.pub_key, crypto_sign_PUBLICKEYBYTES) == 0) {
+            continue;
+        }
+        total += bc_get_balance_locked(CONS_CHAIN, peers[i]);
+    }
+    pthread_mutex_unlock(&CONS_CHAIN->mtx);
+
+    free(peers);
+    return total;
+}
+
+static uint64_t consensus_votes_stake(const pending_block* pb) {
+    if (!pb || !CONS_CHAIN) return 0;
+    uint64_t sum = 0;
+
+    pthread_mutex_lock(&CONS_CHAIN->mtx);
+    vote_entry* cur = pb->votes;
+    while (cur) {
+        sum += bc_get_balance_locked(CONS_CHAIN, cur->voter);
+        cur = cur->next;
+    }
+    pthread_mutex_unlock(&CONS_CHAIN->mtx);
+
+    return sum;
+}
+
 static int consensus_try_commit(pending_block* pb) {
     if (!pb || !pb->blk) return -1;
-    size_t needed = consensus_required_votes();
-    if (pb->vote_count < needed) return 0;
+    if (pb->vote_count == 0) return 0;
+
+    uint64_t total_stake = consensus_total_online_stake();
+    uint64_t vote_stake = consensus_votes_stake(pb);
+    uint64_t needed_stake = (total_stake == 0) ? 0 : (total_stake / 2) + 1;
+    if (vote_stake < needed_stake) return 0;
 
     if (validate_block_txs(CONS_CHAIN, pb->blk) < 0) return -2;
     if (apply_block(CONS_CHAIN, pb->blk) < 0) return -3;
@@ -832,10 +907,12 @@ static int consensus_try_commit(pending_block* pb) {
         pthread_mutex_lock(&CONS_CHAIN->mtx);
         height = CONS_CHAIN->height;
         pthread_mutex_unlock(&CONS_CHAIN->mtx);
-        log_info("block committed id=%llu height=%llu txs=%u",
+        log_info("block committed id=%llu height=%llu txs=%u stake=%llu/%llu",
                  (unsigned long long)pb->blk->id,
                  (unsigned long long)height,
-                 pb->blk->tx_num);
+                 pb->blk->tx_num,
+                 (unsigned long long)vote_stake,
+                 (unsigned long long)needed_stake);
     }
 
     return 1;
@@ -1028,7 +1105,13 @@ int consensus_handle_block(const uint8_t* data, size_t len) {
     b->id = block_id_from_hash(hash);
     sodium_memzero(hash, sizeof hash);
 
-    if (consensus_accept_block(b) < 0) {
+    int rc = consensus_accept_block(b);
+    if (rc < 0) {
+        log_warn("block rejected rc=%d id=%llu prev_id=%llu slot=%llu",
+                 rc,
+                 (unsigned long long)b->id,
+                 (unsigned long long)b->prev_id,
+                 (unsigned long long)b->slot);
         block_destroy(b);
         return -3;
     }
@@ -1060,11 +1143,6 @@ int consensus_handle_vote(const uint8_t* data, size_t len) {
     if (crypto_sign_verify_detached(sig, data, sign_len, voter) != 0) return -4;
 
     if (!CONS_CHAIN || chain_id != CONS_CHAIN->chain_id) return -5;
-
-    pthread_mutex_lock(&CONS_CHAIN->mtx);
-    uint64_t voter_balance = bc_get_balance_locked(CONS_CHAIN, voter);
-    pthread_mutex_unlock(&CONS_CHAIN->mtx);
-    if (voter_balance == 0) return -6;
 
     pthread_mutex_lock(&CONS_MTX);
     pending_block* pb = pending_find_locked(block_id);

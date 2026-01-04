@@ -58,6 +58,22 @@ static int identity_file_write(const identity_file* in) {
     return 0;
 }
 
+static int identity_file_overwrite(const identity_file* in) {
+    if (!in) return -1;
+    if (ensure_identity_dir() < 0) return -2;
+
+    int fd = open(IDENTITY_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return -3;
+    ssize_t n = write(fd, in, sizeof(*in));
+    if (n != (ssize_t)sizeof(*in)) {
+        close(fd);
+        return -4;
+    }
+    fsync(fd);
+    close(fd);
+    return 0;
+}
+
 static int identity_validate_keypair(const pub_key_t pub, const priv_key_t priv) {
     if (!pub || !priv) return -1;
     pub_key_t derived;
@@ -166,3 +182,20 @@ int identity_load(account* out, int require_priv) {
     return 0;
 }
 
+int identity_rotate(account* out) {
+    if (!out) return -1;
+
+    identity_file f;
+    memset(&f, 0, sizeof(f));
+    f.magic = IDENTITY_MAGIC;
+    f.version = IDENTITY_VERSION;
+    if (crypto_sign_keypair(f.pub, f.priv) != 0) return -2;
+    if (identity_validate_keypair(f.pub, f.priv) < 0) return -3;
+
+    if (identity_file_overwrite(&f) < 0) return -4;
+
+    memcpy(out->pub_key, f.pub, crypto_sign_PUBLICKEYBYTES);
+    memcpy(out->priv_key, f.priv, crypto_sign_SECRETKEYBYTES);
+    out->balance = 0;
+    return 0;
+}

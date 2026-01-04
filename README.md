@@ -10,6 +10,17 @@ Run a node:
 ```
 ./build/blockchain node
 ```
+If `data/chain.state` is missing, `node` tries to sync from peers; configure `BC_SEEDS` (e.g. `1.2.3.4:30303`) to join the existing chain.
+
+Generate a new keypair (overwrites `data/identity.key`) and start the node:
+```
+./build/blockchain node --new-keys
+```
+
+Create a new dev chain (genesis) on this machine:
+```
+./build/blockchain bootstrap
+```
 
 Print local node public key:
 ```

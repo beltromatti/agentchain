@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "blockchain.h"
@@ -35,17 +36,20 @@ static void usage(const char* prog) {
     fprintf(stderr,
         "usage:\n"
         "  %s node\n"
+        "  %s bootstrap\n"
         "  %s pubkey\n"
         "  %s transfer <receiver_pub_hex> <amount>\n"
         "  %s mint <receiver_pub_hex> <amount>\n"
         "  %s balance [pub_hex]\n"
         "  %s ping\n\n"
+        "node flags:\n"
+        "  --new-keys               generate a new keypair and overwrite data/identity.key\n\n"
         "env:\n"
         "  BC_PRIVKEY / BC_PUBKEY   hex keys (BC_PRIVKEY can be 32B seed or 64B secret)\n"
         "  BC_PORT                  udp port for peer network (default 30303)\n"
         "  BC_CTL_PORT              local control port (default 30304)\n"
         "  BC_SEEDS                 comma list of ip:port seeds\n",
-        prog, prog, prog, prog, prog, prog);
+        prog, prog, prog, prog, prog, prog, prog);
 }
 
 static int encode_tx_to_wire(const tx* t, uint8_t** out_buf, size_t* out_len) {
@@ -64,9 +68,76 @@ static int encode_tx_to_wire(const tx* t, uint8_t** out_buf, size_t* out_len) {
     return 0;
 }
 
-static int cmd_node(void) {
+static int sync_chain_from_peers(blockchain* bc) {
+    uint64_t start = (uint64_t)time(NULL);
+    uint64_t chain_id = 0;
+    uint64_t height = 0;
+    uint64_t tip_id = 0;
+    pub_key_t genesis_pub = { 0 };
+
+    log_info("no local chain state, syncing from peers (set BC_SEEDS if needed)");
+
+    while (((uint64_t)time(NULL)) - start < 20) {
+        network_request_chain_state();
+
+        if (network_get_remote_chain_state(&chain_id, genesis_pub, &height, &tip_id) == 0) {
+            if (blockchain_accept_remote_chain_state(bc, chain_id, genesis_pub) < 0) {
+                sleep(1);
+                continue;
+            }
+            char gen_hex[crypto_sign_PUBLICKEYBYTES * 2 + 1];
+            if (bytes_to_hex(genesis_pub, crypto_sign_PUBLICKEYBYTES, gen_hex, sizeof(gen_hex)) == 0) {
+                log_info("chain state synced chain_id=%llu genesis=%s height=%llu",
+                         (unsigned long long)chain_id, gen_hex, (unsigned long long)height);
+            } else {
+                log_info("chain state synced chain_id=%llu height=%llu",
+                         (unsigned long long)chain_id, (unsigned long long)height);
+            }
+            break;
+        }
+
+        sleep(1);
+    }
+
+    if (bc->chain_id == 0) return -1;
+
+    log_info("requesting chain snapshot");
+    start = (uint64_t)time(NULL);
+    while (((uint64_t)time(NULL)) - start < 20) {
+        network_request_snapshot();
+
+        size_t snap_len = 0;
+        if (network_get_remote_snapshot(NULL, &snap_len) == 0 && snap_len > 0) {
+            uint8_t* buf = malloc(snap_len);
+            if (!buf) return -2;
+            size_t cap = snap_len;
+            if (network_get_remote_snapshot(buf, &cap) == 0) {
+                int rc = blockchain_apply_snapshot(bc, buf, cap);
+                free(buf);
+                if (rc == 0) {
+                    log_info("snapshot applied");
+                    return 0;
+                }
+            } else {
+                free(buf);
+            }
+        }
+
+        sleep(1);
+    }
+
+    return -3;
+}
+
+static int cmd_node(int allow_bootstrap, int rotate_keys) {
     account local;
-    if (identity_load(&local, 1) < 0) {
+    if (rotate_keys) {
+        if (identity_rotate(&local) < 0) {
+            fprintf(stderr, "identity rotate failed\n");
+            return 1;
+        }
+        log_info("generated new identity");
+    } else if (identity_load(&local, 1) < 0) {
         fprintf(stderr, "identity load failed\n");
         return 1;
     }
@@ -84,15 +155,20 @@ static int cmd_node(void) {
         return 1;
     }
 
-    int boot = blockchain_bootstrap(&CHAIN, &local);
-    if (boot < 0) {
-        log_error("bootstrap failed (%d)", boot);
-        return 1;
-    }
-    if (boot > 0) {
+    int rc = blockchain_load_chain_state(&CHAIN);
+    if (rc == 0) {
+        log_info("chain state loaded chain_id=%llu", (unsigned long long)CHAIN.chain_id);
+    } else if (allow_bootstrap) {
+        if (blockchain_create_chain_state(&CHAIN, &local) < 0) {
+            log_error("bootstrap failed (chain already exists?)");
+            return 1;
+        }
         log_info("bootstrap created chain_id=%llu", (unsigned long long)CHAIN.chain_id);
     } else {
-        log_info("chain state loaded chain_id=%llu", (unsigned long long)CHAIN.chain_id);
+        if (sync_chain_from_peers(&CHAIN) < 0) {
+            log_error("sync failed (run `bootstrap` to create a dev chain)");
+            return 1;
+        }
     }
 
     if (consensus_set_validator(&local) < 0) {
@@ -280,7 +356,28 @@ int main(int argc, char** argv) {
 
     const char* cmd = argv[1];
     if (strcmp(cmd, "node") == 0) {
-        return cmd_node();
+        int rotate_keys = 0;
+        for (int i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "--new-keys") == 0) {
+                rotate_keys = 1;
+            } else {
+                usage(argv[0]);
+                return 1;
+            }
+        }
+        return cmd_node(0, rotate_keys);
+    }
+    if (strcmp(cmd, "bootstrap") == 0) {
+        int rotate_keys = 0;
+        for (int i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "--new-keys") == 0) {
+                rotate_keys = 1;
+            } else {
+                usage(argv[0]);
+                return 1;
+            }
+        }
+        return cmd_node(1, rotate_keys);
     }
     if (strcmp(cmd, "transfer") == 0) {
         int rc = cmd_transfer(argc - 1, &argv[1]);

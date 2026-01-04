@@ -8,6 +8,7 @@
 #include <time.h>
 
 #include "blockchain.h"
+#include "utils.h"
 
 #define CHAIN_STATE_DIR "data"
 #define CHAIN_STATE_PATH "data/chain.state"
@@ -82,6 +83,66 @@ static int write_chain_state(const chain_state_file* state) {
     }
     fsync(fd);
     close(fd);
+    return 0;
+}
+
+int blockchain_load_chain_state(blockchain* bc) {
+    if (!bc) return -1;
+    chain_state_file state;
+    int rc = load_chain_state(&state);
+    if (rc < 0) return rc;
+
+    bc->chain_id = state.chain_id;
+    memcpy(bc->genesis_pub, state.genesis_pub, crypto_sign_PUBLICKEYBYTES);
+    return 0;
+}
+
+int blockchain_create_chain_state(blockchain* bc, const account* genesis) {
+    if (!bc || !genesis) return -1;
+
+    chain_state_file state;
+    memset(&state, 0, sizeof(state));
+    state.magic = CHAIN_STATE_MAGIC;
+    state.version = CHAIN_STATE_VERSION;
+    randombytes_buf(&state.chain_id, sizeof(state.chain_id));
+    if (state.chain_id == 0) state.chain_id = 1;
+    memcpy(state.genesis_pub, genesis->pub_key, crypto_sign_PUBLICKEYBYTES);
+    state.created_at = (uint64_t)time(NULL);
+
+    if (write_chain_state(&state) < 0) {
+        return -2;
+    }
+
+    bc->chain_id = state.chain_id;
+    memcpy(bc->genesis_pub, state.genesis_pub, crypto_sign_PUBLICKEYBYTES);
+    return 0;
+}
+
+int blockchain_accept_remote_chain_state(blockchain* bc, uint64_t chain_id, const pub_key_t genesis_pub) {
+    if (!bc || chain_id == 0 || !genesis_pub) return -1;
+
+    chain_state_file state;
+    memset(&state, 0, sizeof(state));
+    state.magic = CHAIN_STATE_MAGIC;
+    state.version = CHAIN_STATE_VERSION;
+    state.chain_id = chain_id;
+    memcpy(state.genesis_pub, genesis_pub, crypto_sign_PUBLICKEYBYTES);
+    state.created_at = (uint64_t)time(NULL);
+
+    if (write_chain_state(&state) < 0) {
+        chain_state_file loaded;
+        if (load_chain_state(&loaded) < 0) return -2;
+        if (loaded.chain_id != chain_id ||
+            memcmp(loaded.genesis_pub, genesis_pub, crypto_sign_PUBLICKEYBYTES) != 0) {
+            return -3;
+        }
+        bc->chain_id = loaded.chain_id;
+        memcpy(bc->genesis_pub, loaded.genesis_pub, crypto_sign_PUBLICKEYBYTES);
+        return 0;
+    }
+
+    bc->chain_id = state.chain_id;
+    memcpy(bc->genesis_pub, state.genesis_pub, crypto_sign_PUBLICKEYBYTES);
     return 0;
 }
 
@@ -203,4 +264,141 @@ long long get_account_balance(account* acc) {
     account* stored = blockchain_get_account(&CHAIN, acc->pub_key);
     if (!stored) return 0;
     return (long long)stored->balance;
+}
+
+static void free_accounts(blockchain* bc) {
+    if (!bc) return;
+    account_state_node* cur = bc->accounts;
+    while (cur) {
+        account_state_node* next = cur->next;
+        cur->next = NULL;
+        free(cur);
+        cur = next;
+    }
+    bc->accounts = NULL;
+}
+
+int blockchain_encode_snapshot(blockchain* bc, uint8_t** out, size_t* out_len) {
+    if (!bc || !out || !out_len) return -1;
+
+    pthread_mutex_lock(&bc->mtx);
+    if (bc->chain_id == 0) {
+        pthread_mutex_unlock(&bc->mtx);
+        return -2;
+    }
+
+    uint32_t count = 0;
+    account_state_node* cur = bc->accounts;
+    while (cur) {
+        count++;
+        cur = cur->next;
+    }
+
+    size_t total = 1 + 8 + crypto_sign_PUBLICKEYBYTES + 8 + 8 + 4 +
+        (size_t)count * (crypto_sign_PUBLICKEYBYTES + 8);
+
+    uint8_t* buf = malloc(total);
+    if (!buf) {
+        pthread_mutex_unlock(&bc->mtx);
+        return -3;
+    }
+
+    size_t off = 0;
+    buf[off++] = 1; /* version */
+    store_u64_le(&buf[off], bc->chain_id);
+    off += 8;
+    memcpy(&buf[off], bc->genesis_pub, crypto_sign_PUBLICKEYBYTES);
+    off += crypto_sign_PUBLICKEYBYTES;
+    store_u64_le(&buf[off], bc->height);
+    off += 8;
+    store_u64_le(&buf[off], bc->tip ? bc->tip->id : 0);
+    off += 8;
+    store_u32_le(&buf[off], count);
+    off += 4;
+
+    cur = bc->accounts;
+    while (cur) {
+        memcpy(&buf[off], cur->acc.pub_key, crypto_sign_PUBLICKEYBYTES);
+        off += crypto_sign_PUBLICKEYBYTES;
+        store_u64_le(&buf[off], cur->acc.balance);
+        off += 8;
+        cur = cur->next;
+    }
+
+    pthread_mutex_unlock(&bc->mtx);
+
+    *out = buf;
+    *out_len = off;
+    return 0;
+}
+
+int blockchain_apply_snapshot(blockchain* bc, const uint8_t* data, size_t len) {
+    if (!bc || !data || len < 1 + 8 + crypto_sign_PUBLICKEYBYTES + 8 + 8 + 4) return -1;
+    size_t off = 0;
+    uint8_t ver = data[off++];
+    if (ver != 1) return -2;
+
+    uint64_t chain_id = load_u64_le(&data[off]);
+    off += 8;
+    const uint8_t* genesis_pub = &data[off];
+    off += crypto_sign_PUBLICKEYBYTES;
+    uint64_t height = load_u64_le(&data[off]);
+    off += 8;
+    uint64_t tip_id = load_u64_le(&data[off]);
+    off += 8;
+    uint32_t count = load_u32_le(&data[off]);
+    off += 4;
+
+    size_t needed = 1 + 8 + crypto_sign_PUBLICKEYBYTES + 8 + 8 + 4 +
+        (size_t)count * (crypto_sign_PUBLICKEYBYTES + 8);
+    if (needed != len) return -3;
+
+    pthread_mutex_lock(&bc->mtx);
+    if (bc->chain_id == 0 || bc->chain_id != chain_id ||
+        memcmp(bc->genesis_pub, genesis_pub, crypto_sign_PUBLICKEYBYTES) != 0) {
+        pthread_mutex_unlock(&bc->mtx);
+        return -4;
+    }
+
+    free_accounts(bc);
+
+    for (uint32_t i = 0; i < count; i++) {
+        const uint8_t* pub = &data[off];
+        off += crypto_sign_PUBLICKEYBYTES;
+        uint64_t bal = load_u64_le(&data[off]);
+        off += 8;
+
+        account_state_node* node = calloc(1, sizeof(*node));
+        if (!node) {
+            pthread_mutex_unlock(&bc->mtx);
+            return -5;
+        }
+        memcpy(node->acc.pub_key, pub, crypto_sign_PUBLICKEYBYTES);
+        node->acc.balance = bal;
+        node->next = bc->accounts;
+        bc->accounts = node;
+    }
+
+    bc->height = height;
+
+    if (!bc->tip) {
+        bc->tip = calloc(1, sizeof(*bc->tip));
+        if (!bc->tip) {
+            pthread_mutex_unlock(&bc->mtx);
+            return -6;
+        }
+    } else {
+        memset(bc->tip, 0, sizeof(*bc->tip));
+    }
+
+    bc->tip->id = (tip_id == 0) ? 0 : tip_id;
+    bc->tip->chain_id = bc->chain_id;
+    bc->tip->prev_id = 0;
+    bc->tip->slot = 0;
+    bc->tip->tx_num = 0;
+    bc->tip->txs = NULL;
+    bc->tip->prev_block = NULL;
+
+    pthread_mutex_unlock(&bc->mtx);
+    return 0;
 }

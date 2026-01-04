@@ -26,6 +26,10 @@
 #define NET_MSG_TX 2
 #define NET_MSG_BLOCK 3
 #define NET_MSG_VOTE 4
+#define NET_MSG_STATE_REQ 5
+#define NET_MSG_STATE 6
+#define NET_MSG_SNAPSHOT_REQ 7
+#define NET_MSG_SNAPSHOT 8
 
 #define NET_DEFAULT_PORT 30303
 #define NET_DISCOVERY_INTERVAL 5
@@ -57,6 +61,41 @@ static priv_key_t LOCAL_PRIV_KEY = { 0 };
 static int HAS_LOCAL_PUB = 0;
 static int HAS_LOCAL_PRIV = 0;
 
+typedef struct {
+    uint64_t chain_id;
+    pub_key_t genesis_pub;
+    uint64_t height;
+    uint64_t tip_id;
+    uint64_t last_seen;
+    int has_state;
+    uint8_t snapshot[NET_MAX_MSG];
+    uint32_t snapshot_len;
+    uint64_t snapshot_last_seen;
+} chain_state_view;
+
+static pthread_mutex_t STATE_MTX = PTHREAD_MUTEX_INITIALIZER;
+static chain_state_view CHAIN_VIEW;
+
+static void chain_view_reset_locked(void) {
+    memset(&CHAIN_VIEW, 0, sizeof(CHAIN_VIEW));
+}
+
+static void chain_view_set_state_locked(uint64_t chain_id, const uint8_t* genesis_pub,
+                                       uint64_t height, uint64_t tip_id, uint64_t now) {
+    CHAIN_VIEW.chain_id = chain_id;
+    if (genesis_pub) memcpy(CHAIN_VIEW.genesis_pub, genesis_pub, crypto_sign_PUBLICKEYBYTES);
+    CHAIN_VIEW.height = height;
+    CHAIN_VIEW.tip_id = tip_id;
+    CHAIN_VIEW.last_seen = now;
+    CHAIN_VIEW.has_state = 1;
+}
+
+static void chain_view_set_snapshot_locked(const uint8_t* data, uint32_t len, uint64_t now) {
+    if (!data || len == 0 || len > NET_MAX_MSG) return;
+    memcpy(CHAIN_VIEW.snapshot, data, len);
+    CHAIN_VIEW.snapshot_len = len;
+    CHAIN_VIEW.snapshot_last_seen = now;
+}
 
 static void tx_free_account_nodes(account_list_node* head) {
     while (head) {
@@ -269,6 +308,45 @@ size_t network_peer_count_online(void) {
     return count;
 }
 
+size_t network_peer_snapshot_pubkeys(pub_key_t** out_pub_keys) {
+    if (!out_pub_keys) return 0;
+
+    pthread_mutex_lock(&PEERS_MTX);
+    size_t count = 0;
+    peer_state* cur = PEERS;
+    while (cur) {
+        if (cur->online && !pubkey_is_zero(cur->pub_key)) count++;
+        cur = cur->next;
+    }
+
+    if (count == 0) {
+        pthread_mutex_unlock(&PEERS_MTX);
+        *out_pub_keys = NULL;
+        return 0;
+    }
+
+    pub_key_t* keys = calloc(count, sizeof(*keys));
+    if (!keys) {
+        pthread_mutex_unlock(&PEERS_MTX);
+        *out_pub_keys = NULL;
+        return 0;
+    }
+
+    size_t idx = 0;
+    cur = PEERS;
+    while (cur && idx < count) {
+        if (cur->online && !pubkey_is_zero(cur->pub_key)) {
+            memcpy(keys[idx], cur->pub_key, crypto_sign_PUBLICKEYBYTES);
+            idx++;
+        }
+        cur = cur->next;
+    }
+    pthread_mutex_unlock(&PEERS_MTX);
+
+    *out_pub_keys = keys;
+    return idx;
+}
+
 static int udp_send_raw(uint32_t ip_be, uint16_t port, const uint8_t* data, size_t len) {
     if (NET_SOCK < 0 || ip_be == 0 || port == 0 || !data || len == 0) return -1;
 
@@ -390,6 +468,66 @@ static void send_hello_to_peers(void) {
     }
 
     free(targets);
+}
+
+static size_t build_state_payload(uint8_t* out, size_t out_cap) {
+    if (!out || out_cap < 1 + 8 + crypto_sign_PUBLICKEYBYTES + 8 + 8) return 0;
+
+    pthread_mutex_lock(&CHAIN.mtx);
+    uint64_t chain_id = CHAIN.chain_id;
+    uint64_t height = CHAIN.height;
+    uint64_t tip_id = CHAIN.tip ? CHAIN.tip->id : 0;
+    pub_key_t genesis_pub;
+    memcpy(genesis_pub, CHAIN.genesis_pub, crypto_sign_PUBLICKEYBYTES);
+    pthread_mutex_unlock(&CHAIN.mtx);
+
+    if (chain_id == 0) return 0;
+
+    size_t off = 0;
+    out[off++] = 1; /* version */
+    store_u64_le(&out[off], chain_id);
+    off += 8;
+    memcpy(&out[off], genesis_pub, crypto_sign_PUBLICKEYBYTES);
+    off += crypto_sign_PUBLICKEYBYTES;
+    store_u64_le(&out[off], height);
+    off += 8;
+    store_u64_le(&out[off], tip_id);
+    off += 8;
+    return off;
+}
+
+static int send_state_to(uint32_t ip_be, uint16_t port) {
+    uint8_t payload[1 + 8 + crypto_sign_PUBLICKEYBYTES + 8 + 8];
+    size_t payload_len = build_state_payload(payload, sizeof(payload));
+    if (payload_len == 0) return -1;
+
+    uint8_t packet[NET_MAX_MSG];
+    size_t packet_len = net_build_packet(NET_MSG_STATE, payload, (uint32_t)payload_len,
+                                         packet, sizeof(packet));
+    if (packet_len == 0) return -2;
+
+    return udp_send_raw(ip_be, port, packet, packet_len);
+}
+
+static int send_snapshot_to(uint32_t ip_be, uint16_t port) {
+    uint8_t* snapshot = NULL;
+    size_t snapshot_len = 0;
+    if (blockchain_encode_snapshot(&CHAIN, &snapshot, &snapshot_len) < 0) return -1;
+
+    size_t max_payload = NET_MAX_MSG - NET_HDR_SIZE;
+    if (snapshot_len > max_payload) {
+        log_warn("snapshot too large (%zu), not sending", snapshot_len);
+        free(snapshot);
+        return -2;
+    }
+
+    uint8_t packet[NET_MAX_MSG];
+    size_t packet_len = net_build_packet(NET_MSG_SNAPSHOT, snapshot, (uint32_t)snapshot_len,
+                                         packet, sizeof(packet));
+    free(snapshot);
+    if (packet_len == 0) return -3;
+
+    return udp_send_raw(ip_be, port, packet, packet_len);
 }
 
 static void peer_apply_time_locked(peer_state* peer, uint64_t peer_time_unix, uint64_t now) {
@@ -558,6 +696,45 @@ static void process_packet(const uint8_t* data, size_t len, uint32_t src_ip_be, 
         consensus_handle_vote(payload, payload_len);
         return;
     }
+
+    if (type == NET_MSG_STATE_REQ) {
+        send_state_to(src_ip_be, src_port);
+        return;
+    }
+
+    if (type == NET_MSG_STATE) {
+        if (payload_len < 1 + 8 + crypto_sign_PUBLICKEYBYTES + 8 + 8) return;
+        size_t off = 0;
+        uint8_t ver = payload[off++];
+        if (ver != 1) return;
+        uint64_t chain_id = load_u64_le(&payload[off]);
+        off += 8;
+        const uint8_t* genesis_pub = &payload[off];
+        off += crypto_sign_PUBLICKEYBYTES;
+        uint64_t height = load_u64_le(&payload[off]);
+        off += 8;
+        uint64_t tip_id = load_u64_le(&payload[off]);
+        off += 8;
+        if (off != payload_len) return;
+        if (chain_id == 0) return;
+
+        pthread_mutex_lock(&STATE_MTX);
+        chain_view_set_state_locked(chain_id, genesis_pub, height, tip_id, now);
+        pthread_mutex_unlock(&STATE_MTX);
+        return;
+    }
+
+    if (type == NET_MSG_SNAPSHOT_REQ) {
+        send_snapshot_to(src_ip_be, src_port);
+        return;
+    }
+
+    if (type == NET_MSG_SNAPSHOT) {
+        pthread_mutex_lock(&STATE_MTX);
+        chain_view_set_snapshot_locked(payload, payload_len, now);
+        pthread_mutex_unlock(&STATE_MTX);
+        return;
+    }
 }
 
 static void peer_prune_timeouts(uint64_t now) {
@@ -653,6 +830,16 @@ int network_broadcast_vote(const uint8_t* data, size_t len) {
     return network_broadcast_payload(NET_MSG_VOTE, data, len);
 }
 
+int network_request_chain_state(void) {
+    uint8_t payload[1] = { 1 };
+    return network_broadcast_payload(NET_MSG_STATE_REQ, payload, sizeof(payload));
+}
+
+int network_request_snapshot(void) {
+    uint8_t payload[1] = { 1 };
+    return network_broadcast_payload(NET_MSG_SNAPSHOT_REQ, payload, sizeof(payload));
+}
+
 int network_init(void) {
     ensure_local_identity();
     int has_priv = 0;
@@ -700,6 +887,10 @@ int network_init(void) {
     pthread_mutex_lock(&PEERS_MTX);
     NET_TIME_OFFSET = 0;
     pthread_mutex_unlock(&PEERS_MTX);
+
+    pthread_mutex_lock(&STATE_MTX);
+    chain_view_reset_locked();
+    pthread_mutex_unlock(&STATE_MTX);
 
     NET_RUNNING = 1;
     if (pthread_create(&NET_THREAD, NULL, network_thread, NULL) != 0) {
@@ -759,6 +950,10 @@ void network_shutdown(void) {
     }
     PEERS = NULL;
     pthread_mutex_unlock(&PEERS_MTX);
+
+    pthread_mutex_lock(&STATE_MTX);
+    chain_view_reset_locked();
+    pthread_mutex_unlock(&STATE_MTX);
 }
 
 int network_set_identity(const pub_key_t pub_key, const priv_key_t priv_key) {
@@ -909,6 +1104,45 @@ uint64_t network_time_now(void) {
     int64_t adjusted = now + offset;
     if (adjusted < 0) adjusted = 0;
     return (uint64_t)adjusted;
+}
+
+int network_get_remote_chain_state(uint64_t* out_chain_id, pub_key_t out_genesis_pub,
+                                  uint64_t* out_height, uint64_t* out_tip_id) {
+    pthread_mutex_lock(&STATE_MTX);
+    if (!CHAIN_VIEW.has_state) {
+        pthread_mutex_unlock(&STATE_MTX);
+        return -1;
+    }
+    if (out_chain_id) *out_chain_id = CHAIN_VIEW.chain_id;
+    if (out_genesis_pub) memcpy(out_genesis_pub, CHAIN_VIEW.genesis_pub, crypto_sign_PUBLICKEYBYTES);
+    if (out_height) *out_height = CHAIN_VIEW.height;
+    if (out_tip_id) *out_tip_id = CHAIN_VIEW.tip_id;
+    pthread_mutex_unlock(&STATE_MTX);
+    return 0;
+}
+
+int network_get_remote_snapshot(uint8_t* out, size_t* inout_len) {
+    if (!inout_len) return -1;
+
+    pthread_mutex_lock(&STATE_MTX);
+    if (CHAIN_VIEW.snapshot_len == 0) {
+        pthread_mutex_unlock(&STATE_MTX);
+        return -2;
+    }
+    if (!out) {
+        *inout_len = CHAIN_VIEW.snapshot_len;
+        pthread_mutex_unlock(&STATE_MTX);
+        return 0;
+    }
+    if (*inout_len < CHAIN_VIEW.snapshot_len) {
+        *inout_len = CHAIN_VIEW.snapshot_len;
+        pthread_mutex_unlock(&STATE_MTX);
+        return -3;
+    }
+    memcpy(out, CHAIN_VIEW.snapshot, CHAIN_VIEW.snapshot_len);
+    *inout_len = CHAIN_VIEW.snapshot_len;
+    pthread_mutex_unlock(&STATE_MTX);
+    return 0;
 }
 
 int encode_tx (tx* transaction, uint8_t encoded_tx[], size_t* raw_tx_len) {
