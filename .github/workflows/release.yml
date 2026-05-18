@@ -19,12 +19,15 @@ jobs:
           - target: linux-x86_64
             runner: ubuntu-22.04
             artifact_suffix: linux-x86_64
-          - target: macos-x86_64
-            runner: macos-13
-            artifact_suffix: macos-x86_64
+            mac_arch: ""
           - target: macos-arm64
             runner: macos-14
             artifact_suffix: macos-arm64
+            mac_arch: arm64
+          - target: macos-x86_64
+            runner: macos-14
+            artifact_suffix: macos-x86_64
+            mac_arch: x86_64
     steps:
       - uses: actions/checkout@v4
         with:
@@ -42,6 +45,7 @@ jobs:
           brew install cmake autoconf automake libtool pkg-config
 
       - name: Build static libsodium
+        shell: bash
         run: |
           set -euo pipefail
           mkdir -p third_party
@@ -49,32 +53,58 @@ jobs:
           curl -fsSL https://download.libsodium.org/libsodium/releases/libsodium-1.0.20.tar.gz -o libsodium.tar.gz
           tar xzf libsodium.tar.gz
           cd libsodium-1.0.20
-          ./configure --prefix="$PWD/_install" --disable-shared --enable-static --with-pic
+
+          OPTS="--prefix=$PWD/_install --disable-shared --enable-static --with-pic"
+          if [ "${{ matrix.mac_arch }}" = "x86_64" ]; then
+            # Cross-compile from Apple Silicon to Intel.
+            export CC="clang -arch x86_64"
+            export CFLAGS="-arch x86_64"
+            export LDFLAGS="-arch x86_64"
+            OPTS="$OPTS --host=x86_64-apple-darwin"
+          elif [ "${{ matrix.mac_arch }}" = "arm64" ]; then
+            export CC="clang -arch arm64"
+            export CFLAGS="-arch arm64"
+            export LDFLAGS="-arch arm64"
+          fi
+
+          ./configure $OPTS
           make -j
           make install
           echo "SODIUM_STATIC=$PWD/_install" >> "$GITHUB_ENV"
 
       - name: Configure AgentChain (static sodium)
+        shell: bash
         run: |
-          cmake -S . -B build \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DSODIUM_INCLUDE_DIRS="$SODIUM_STATIC/include" \
-            -DSODIUM_LIBRARIES="$SODIUM_STATIC/lib/libsodium.a"
+          set -euo pipefail
+          OPTS="-DCMAKE_BUILD_TYPE=Release \
+                -DSODIUM_INCLUDE_DIRS=$SODIUM_STATIC/include \
+                -DSODIUM_LIBRARIES=$SODIUM_STATIC/lib/libsodium.a \
+                -DAGENTCHAIN_BUILD_TESTS=OFF"
+          if [ "${{ matrix.mac_arch }}" = "x86_64" ]; then
+            OPTS="$OPTS -DCMAKE_OSX_ARCHITECTURES=x86_64"
+          elif [ "${{ matrix.mac_arch }}" = "arm64" ]; then
+            OPTS="$OPTS -DCMAKE_OSX_ARCHITECTURES=arm64"
+          fi
+          cmake -S . -B build $OPTS
 
       - name: Build
         run: cmake --build build -j
 
-      - name: Smoke test
+      - name: Smoke test (native or via Rosetta on macOS)
+        shell: bash
         run: |
-          ./build/agentchain version
-          ./build/agentchain --help
+          set -euo pipefail
+          file build/agentchain
+          if [ "${{ matrix.mac_arch }}" = "x86_64" ] && [ "$(uname -m)" = "arm64" ]; then
+            arch -x86_64 ./build/agentchain version
+            arch -x86_64 ./build/agentchain --help
+          else
+            ./build/agentchain version
+            ./build/agentchain --help
+          fi
 
-      - name: Strip binary (Linux)
-        if: runner.os == 'Linux'
-        run: strip build/agentchain
-
-      - name: Strip binary (macOS)
-        if: runner.os == 'macOS'
+      - name: Strip binary
+        shell: bash
         run: strip build/agentchain
 
       - name: Determine version
@@ -82,18 +112,19 @@ jobs:
         run: echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
 
       - name: Stage artefact
+        shell: bash
         run: |
-          mkdir -p dist/agentchain-${{ steps.ver.outputs.version }}-${{ matrix.artifact_suffix }}
-          cp build/agentchain               dist/agentchain-${{ steps.ver.outputs.version }}-${{ matrix.artifact_suffix }}/
-          cp PROTOCOL.md README.md          dist/agentchain-${{ steps.ver.outputs.version }}-${{ matrix.artifact_suffix }}/
-          cp TECHNICAL-IMPLEMENTATION.md    dist/agentchain-${{ steps.ver.outputs.version }}-${{ matrix.artifact_suffix }}/
-          cp LICENSE                        dist/agentchain-${{ steps.ver.outputs.version }}-${{ matrix.artifact_suffix }}/
-          cp -r deploy                      dist/agentchain-${{ steps.ver.outputs.version }}-${{ matrix.artifact_suffix }}/
+          set -euo pipefail
+          DEST="agentchain-${{ steps.ver.outputs.version }}-${{ matrix.artifact_suffix }}"
+          mkdir -p "dist/$DEST"
+          cp build/agentchain               "dist/$DEST/"
+          cp PROTOCOL.md README.md          "dist/$DEST/"
+          cp TECHNICAL-IMPLEMENTATION.md    "dist/$DEST/"
+          cp LICENSE                        "dist/$DEST/"
+          cp -r deploy                      "dist/$DEST/"
           cd dist
-          tar czf agentchain-${{ steps.ver.outputs.version }}-${{ matrix.artifact_suffix }}.tar.gz \
-              agentchain-${{ steps.ver.outputs.version }}-${{ matrix.artifact_suffix }}
-          shasum -a 256 agentchain-${{ steps.ver.outputs.version }}-${{ matrix.artifact_suffix }}.tar.gz \
-              > agentchain-${{ steps.ver.outputs.version }}-${{ matrix.artifact_suffix }}.tar.gz.sha256
+          tar czf "${DEST}.tar.gz" "$DEST"
+          shasum -a 256 "${DEST}.tar.gz" > "${DEST}.tar.gz.sha256"
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2
