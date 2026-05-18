@@ -330,6 +330,24 @@ static void *reader_loop(void *arg) {
         peer_close_fd(p);
         return NULL;
     }
+    /* Reject a duplicate peer_id. The first connection wins; redundant ones
+     * are dropped before they can multiply broadcast write fanout. */
+    pthread_mutex_lock(&n->peers_mu);
+    bool dup_pid = false;
+    for (size_t i = 0; i < AC_MAX_PEERS; ++i) {
+        peer_t *other = &n->peers[i];
+        if (other == p || !other->in_use || !other->peer_id_known) continue;
+        if (memcmp(other->peer_id.b, their_id.b, AC_PUBKEY_SIZE) == 0) {
+            dup_pid = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&n->peers_mu);
+    if (dup_pid) {
+        LOG_D("net", "duplicate peer_id, dropping new connection");
+        peer_close_fd(p);
+        return NULL;
+    }
     p->peer_id = their_id;
     p->peer_id_known = true;
     if (their_host[0]) snprintf(p->host, sizeof(p->host), "%s", their_host);
@@ -430,6 +448,19 @@ static void *listen_loop(void *arg) {
 /* Outbound connector.                                                        */
 /* -------------------------------------------------------------------------- */
 
+/* Returns true iff we already have an outbound peer slot for this host:port. */
+static bool already_dialed(ac_net_t *n, const char *host, uint16_t port) {
+    bool found = false;
+    pthread_mutex_lock(&n->peers_mu);
+    for (size_t i = 0; i < AC_MAX_PEERS; ++i) {
+        peer_t *p = &n->peers[i];
+        if (!p->in_use || p->inbound) continue;
+        if (p->port == port && strcmp(p->host, host) == 0) { found = true; break; }
+    }
+    pthread_mutex_unlock(&n->peers_mu);
+    return found;
+}
+
 static int dial_peer(ac_net_t *n, const char *hp) {
     char host[128];
     int  port = 0;
@@ -447,6 +478,13 @@ static int dial_peer(ac_net_t *n, const char *hp) {
         memmove(host, host + 1, hl - 2);
         host[hl - 2] = '\0';
     }
+
+    /* Cheap dedup: don't open a second TCP connection to a host:port we
+     * already have. Without this, a small seed list combined with
+     * target_outbound=8 fans out into 8 redundant connections to the same
+     * peer, multiplying every broadcast 8x and unnecessarily stressing
+     * the remote write buffer. */
+    if (already_dialed(n, host, (uint16_t)port)) return 0;
 
     struct addrinfo hints, *res = NULL;
     memset(&hints, 0, sizeof(hints));

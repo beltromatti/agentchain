@@ -1,15 +1,9 @@
-# AgentChain mainnet seed peers — `host:port` per line.
+# AgentChain mainnet seed peers — one `host:port` per line.
 #
-# These addresses are populated when Noesis AI brings the bootstrap fleet
-# online. Until then this file is intentionally empty and node operators
-# should run their own private testnets via testnet/run.sh.
-#
-# When the mainnet is live, the canonical seed list will be:
-#
-#   seed1.agentchain.noesis.ai:30303
-#   seed2.agentchain.noesis.ai:30303
-#   seed3.agentchain.noesis.ai:30303
-#
-# Validators that wish to join the network should also subscribe to the
-# release feed at https://github.com/beltromatti/agentchain/releases
-# so they pick up new genesis distributions when the chain rotates.
+# Operated by Noesis AI; see the README for the project's stance on
+# operator decentralisation and how to add your own seed to this list.
+
+seed-iowa.agentchain.beltromatti.dev:30303  34.61.207.49:30303
+
+# Plain IPv4 fallback for clients that cannot resolve the hostname.
+34.61.207.49:30303
