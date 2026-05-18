@@ -1,0 +1,5 @@
+# AgentChain genesis configuration
+chain_id     = 1
+timestamp_ms = 1779121001000
+
+account 4bfe9fb5ea49f00bf3c78fb9e979223ee5fa630743befc5c1f5686ac923bf79a 39999999800000000 200000000

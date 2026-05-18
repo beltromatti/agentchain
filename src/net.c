@@ -364,6 +364,21 @@ static int set_socket_options(int fd) {
 #ifdef TCP_NODELAY
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof(one));
 #endif
+    /* Hard cap on per-write blocking time. Without this, a slow peer can stall
+     * the consensus thread (which writes blocks synchronously via gossip) for
+     * the full TCP retransmit window — minutes. With the timeout, a stuck
+     * write fails and the broadcast loop moves on; the reader thread detects
+     * EOF and reaps the peer slot. */
+#ifdef _WIN32
+    DWORD tv = 5000; /* ms */
+    setsockopt((SOCKET)fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tv, sizeof(tv));
+    setsockopt((SOCKET)fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
+#else
+    struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tv, sizeof(tv));
+    /* RCV timeout is unbounded by design: peer readers block on incoming data
+     * until EOF; we don't want to spuriously drop healthy idle peers. */
+#endif
     return 0;
 }
 
@@ -608,8 +623,14 @@ void ac_net_broadcast(ac_net_t *n, uint8_t msg_type,
         if (!p->in_use || !p->peer_id_known || p->fd < 0) continue;
         if (exclude_peer_id && ac_addr_eq(&p->peer_id, exclude_peer_id)) continue;
         pthread_mutex_lock(&p->write_mu);
-        frame_send(p->fd, msg_type, payload, len);
+        int wr = frame_send(p->fd, msg_type, payload, len);
         pthread_mutex_unlock(&p->write_mu);
+        if (wr < 0 && p->fd >= 0) {
+            /* Wedged peer: shutdown so the reader thread exits and the slot
+             * is reaped. The consensus thread cannot be stalled by a slow or
+             * dead peer beyond a single SO_SNDTIMEO interval. */
+            ac_sock_shutdown(p->fd, SHUT_RDWR);
+        }
     }
     pthread_mutex_unlock(&n->peers_mu);
 }
@@ -625,6 +646,7 @@ int ac_net_send_to(ac_net_t *n, const ac_addr_t *peer_id,
         pthread_mutex_lock(&p->write_mu);
         rc = frame_send(p->fd, msg_type, payload, len);
         pthread_mutex_unlock(&p->write_mu);
+        if (rc < 0 && p->fd >= 0) ac_sock_shutdown(p->fd, SHUT_RDWR);
         break;
     }
     pthread_mutex_unlock(&n->peers_mu);
