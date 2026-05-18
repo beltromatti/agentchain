@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 360" width="1280" height="360" role="img" aria-label="AgentChain — Layer-1 blockchain for home validators and AI agents">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%"   stop-color="#0b0f17"/>
+      <stop offset="100%" stop-color="#161c2a"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%"   stop-color="#f5b754"/>
+      <stop offset="100%" stop-color="#ed7a4d"/>
+    </linearGradient>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#1d2538" stroke-width="0.5"/>
+    </pattern>
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="6" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1280" height="360" fill="url(#bg)"/>
+  <rect width="1280" height="360" fill="url(#grid)" opacity="0.6"/>
+
+  <!-- Decorative blocks: stacked chain motif on the right -->
+  <g transform="translate(960,90)" opacity="0.85">
+    <rect x="0"  y="0"   width="60" height="44" rx="4" fill="#1f2a3f" stroke="#324a78" stroke-width="1"/>
+    <rect x="70" y="0"   width="60" height="44" rx="4" fill="#1f2a3f" stroke="#324a78" stroke-width="1"/>
+    <rect x="140" y="0"  width="60" height="44" rx="4" fill="#1f2a3f" stroke="#324a78" stroke-width="1"/>
+    <rect x="210" y="0"  width="60" height="44" rx="4" fill="url(#accent)" stroke="#ed7a4d" stroke-width="1" filter="url(#glow)"/>
+    <line x1="60" y1="22" x2="70" y2="22" stroke="#324a78" stroke-width="2"/>
+    <line x1="130" y1="22" x2="140" y2="22" stroke="#324a78" stroke-width="2"/>
+    <line x1="200" y1="22" x2="210" y2="22" stroke="#ed7a4d" stroke-width="2"/>
+    <text x="135" y="80" text-anchor="middle" fill="#5e6b88" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13">h-3   h-2   h-1   tip</text>
+  </g>
+
+  <!-- Wordmark -->
+  <g transform="translate(80,150)">
+    <text x="0" y="0" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="64" font-weight="700" fill="#f5f7fb" letter-spacing="-1">
+      Agent<tspan fill="url(#accent)">Chain</tspan>
+    </text>
+    <text x="3" y="44" font-family="-apple-system, system-ui, Segoe UI, sans-serif" font-size="22" fill="#9aa6c2" font-weight="400">
+      Layer-1 in pure C · Proof of Sustained Availability · ~4 s finality
+    </text>
+    <text x="3" y="92" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" fill="#5e6b88" letter-spacing="2" font-weight="600">
+      VRF SORTITION · √STAKE WEIGHTING · NO DOWNTIME SLASHING · ONE BINARY
+    </text>
+  </g>
+
+  <!-- Footer subtle -->
+  <g transform="translate(80,310)">
+    <text x="0" y="0" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" fill="#4b5675">
+      noesis.ai — Milano · v1
+    </text>
+  </g>
+</svg>

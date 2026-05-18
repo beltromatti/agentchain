@@ -1,6 +1,6 @@
 <div align="center">
 
-# AgentChain
+<img src="docs/assets/banner.svg" alt="AgentChain — Layer-1 in pure C" width="100%"/>
 
 **A Layer-1 blockchain for home validators and autonomous agents — written in pure C.**
 

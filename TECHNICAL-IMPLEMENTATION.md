@@ -9,15 +9,14 @@ This document describes how **AgentChain Engine v1.0.0**, the reference C client
 ```
 PROTOCOL.md                    # normative protocol specification
 TECHNICAL-IMPLEMENTATION.md    # this file
-README.md                      # project overview, marketing-light, install guide
+README.md                      # project overview, install guide
 LICENSE                        # Apache 2.0
 CMakeLists.txt                 # single-binary build
 .github/workflows/             # CI: build + multi-OS release on v* tags
 deploy/                        # systemd unit, Dockerfile, docker-compose
-docs/                          # supplemental notes
-scripts/                       # dev helpers
 testnet/run.sh                 # local multi-node testnet harness
-src/                           # everything below
+tests/                         # unit tests run via ctest
+src/                           # the engine, eleven modules + main
     common.{h,c}               # logging, hex, files, time, byte buffers
     crypto.{h,c}               # libsodium wrappers; Ed25519-VRF
     codec.{h,c}                # canonical Tx/Block serialisation
