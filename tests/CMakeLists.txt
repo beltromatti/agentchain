@@ -1,13 +1,17 @@
 # Unit tests for AgentChain Engine.
+#
+# Tests use assert() for checks; we explicitly disable NDEBUG so Release
+# builds (CI default) still evaluate the assertions.
 
-add_executable(test_crypto test_crypto.c)
-target_link_libraries(test_crypto PRIVATE agentchain_engine)
-add_test(NAME crypto COMMAND test_crypto)
+set(AGENTCHAIN_TEST_DEFS UNDEF_NDEBUG)
 
-add_executable(test_codec test_codec.c)
-target_link_libraries(test_codec PRIVATE agentchain_engine)
-add_test(NAME codec COMMAND test_codec)
+function(agentchain_add_test name)
+    add_executable(${name} ${name}.c)
+    target_link_libraries(${name} PRIVATE agentchain_engine)
+    target_compile_options(${name} PRIVATE -UNDEBUG -Wno-error=unused-variable)
+    add_test(NAME ${name} COMMAND ${name})
+endfunction()
 
-add_executable(test_state test_state.c)
-target_link_libraries(test_state PRIVATE agentchain_engine)
-add_test(NAME state COMMAND test_state)
+agentchain_add_test(test_crypto)
+agentchain_add_test(test_codec)
+agentchain_add_test(test_state)

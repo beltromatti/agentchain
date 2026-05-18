@@ -6,13 +6,15 @@
 #include <string.h>
 
 static void test_keypair_roundtrip(void) {
-    ac_keypair_t a, b;
+    ac_keypair_t a;
+    ac_keypair_t b;
     assert(ac_keypair_random(&a) == 0);
     /* Re-derive from seed produces same pubkey. */
     uint8_t seed[AC_SEED_SIZE];
     ac_keypair_seed(seed, &a);
     assert(ac_keypair_from_seed(&b, seed) == 0);
     assert(memcmp(a.pk, b.pk, AC_PUBKEY_SIZE) == 0);
+    (void)b;
 }
 
 static void test_sign_verify(void) {
@@ -32,7 +34,8 @@ static void test_vrf_roundtrip(void) {
     assert(ac_keypair_random(&kp) == 0);
     const uint8_t alpha[] = "AGCH:LEADER" "\x00\x00\x00\x00\x00\x00\x00\x05";
     ac_vrf_proof_t proof;
-    ac_vrf_out_t   beta1, beta2;
+    ac_vrf_out_t   beta1;
+    ac_vrf_out_t   beta2;
     ac_vrf_prove (&proof, &beta1, alpha, sizeof(alpha) - 1, &kp);
     assert(ac_vrf_verify(&beta2, &proof, alpha, sizeof(alpha) - 1, kp.pk) == 1);
     assert(memcmp(beta1.b, beta2.b, AC_VRF_OUT_SIZE) == 0);
