@@ -206,7 +206,7 @@ static void on_headers_req_cb(uint64_t from_height, uint32_t count,
                               const ac_addr_t *peer_id, void *ctx) {
     ac_node_t *n = (ac_node_t *)ctx;
     if (count == 0) return;
-    if (count > 64) count = 64;
+    if (count > 256) count = 256;
     ac_chain_lock(n->chain);
     uint64_t tip = ac_chain_height(n->chain);
     ac_chain_unlock(n->chain);

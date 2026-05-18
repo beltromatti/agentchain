@@ -39,7 +39,16 @@ struct ac_consensus_s {
     bool                  running;
 
     pending_t             pending[AC_PENDING_MAX];
+
+    /* Rate-limit HEADERS_REQ so we do not spam the seed with 30 requests
+     * per minute (one per incoming gossip BLOCK_ANN). With each request
+     * pulling 64 blocks back, that fills the seed's send buffer faster
+     * than the receiver can drain. */
+    uint64_t              last_hdrs_req_ms;
+    uint64_t              last_hdrs_req_target;
 };
+
+#define AC_HDRS_REQ_MIN_INTERVAL_MS 4000
 
 static void pending_init(pending_t *p) {
     if (p->occupied) ac_block_free(&p->block);
@@ -335,16 +344,26 @@ void ac_consensus_handle_block(ac_consensus_t *cs, const uint8_t *buf, size_t le
     ac_chain_lock(cs->chain);
     uint64_t our_height = ac_chain_height(cs->chain);
     if (b.header.height > our_height + 1) {
-        /* Future block: we're lagging. Request the gap. */
+        /* Future block: we're lagging. Request the gap, but rate-limit so
+         * gossip-driven floods (one BLOCK_ANN per slot) do not fan out
+         * into one HEADERS_REQ per slot. */
         uint64_t target = b.header.height;
         ac_chain_unlock(cs->chain);
         ac_block_free(&b);
+        uint64_t now = ac_now_ms();
+        bool stale = (now - cs->last_hdrs_req_ms) >= AC_HDRS_REQ_MIN_INTERVAL_MS;
+        bool gap_grew = target > cs->last_hdrs_req_target + 64;
+        bool send_req = (cs->bcast != NULL) && (stale || gap_grew);
+        if (send_req) {
+            cs->last_hdrs_req_ms     = now;
+            cs->last_hdrs_req_target = target;
+        }
         pthread_mutex_unlock(&cs->mu);
-        if (cs->bcast) {
+        if (send_req) {
             uint8_t req[12];
             ac_be64(req, our_height + 1);
             uint32_t count = (uint32_t)(target - our_height);
-            if (count > 64) count = 64;
+            if (count > 256) count = 256;
             ac_be32(req + 8, count);
             cs->bcast(AC_MSG_HEADERS_REQ, req, sizeof(req), cs->bcast_ctx);
         }

@@ -26,7 +26,24 @@ Image is built from Alpine + libsodium and weighs under 20 MB. Persistent state 
 
 ## Mainnet bootstrap
 
-Once the mainnet bootstrap nodes are online, their public addresses are recorded in [`mainnet-seeds.txt`](mainnet-seeds.txt). Validators joining the mainnet should use those seeds and the official mainnet `genesis.txt` distributed with the corresponding release.
+AgentChain mainnet is **live** as of `2026-05-18T16:16:41Z`.
+
+- **chain_id:** `1`
+- **Seed:** `34.61.207.49:30303` (GCP us-central1-a, Iowa — Noesis AI)
+- **RPC:** `http://34.61.207.49:30304`
+- **Genesis file:** [`mainnet-genesis.txt`](mainnet-genesis.txt) — canonical, bit-for-bit reproducible
+
+Join with any of the prebuilt binaries:
+
+```sh
+agentchain node \
+    --data-dir   ~/agentchain-data \
+    --genesis    deploy/mainnet-genesis.txt \
+    --seeds      34.61.207.49:30303 \
+    --validator
+```
+
+Bring up your own seed by running the same command on a public-IP host of your choice, and PR an entry to [`mainnet-seeds.txt`](mainnet-seeds.txt) for community discoverability.
 
 ## Joining a testnet
 
