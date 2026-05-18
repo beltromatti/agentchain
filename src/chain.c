@@ -626,7 +626,7 @@ ac_accept_t ac_chain_accept_block(ac_chain_t *c, const ac_block_t *b) {
      * genesis has none. We accept any value ≥ MIN_BASE_FEE for the very first
      * non-genesis block, and validate the EIP-1559 step thereafter. */
     if (c->height >= 1) {
-        ac_block_header_t prev;
+        ac_block_header_t prev = {0};
         if (ac_chain_get_header_by_height(c, c->height, &prev) == 0) {
             expected_base_fee = ac_chain_next_base_fee(prev.base_fee, prev.gas_used,
                                                        prev.gas_limit);
@@ -751,9 +751,12 @@ int ac_chain_build_block(ac_chain_t *c,
     if (c->height == 0) {
         base_fee = AC_MIN_BASE_FEE;
     } else {
-        ac_block_header_t prev;
-        ac_chain_get_header_by_height(c, c->height, &prev);
-        base_fee = ac_chain_next_base_fee(prev.base_fee, prev.gas_used, prev.gas_limit);
+        ac_block_header_t prev = {0};
+        if (ac_chain_get_header_by_height(c, c->height, &prev) < 0) {
+            base_fee = AC_MIN_BASE_FEE;
+        } else {
+            base_fee = ac_chain_next_base_fee(prev.base_fee, prev.gas_used, prev.gas_limit);
+        }
     }
 
     /* Snapshot state, apply txs, compute state_root. */
