@@ -2,14 +2,15 @@
 
 <img src="docs/assets/banner.svg" alt="AgentChain — Layer-1 in pure C" width="100%"/>
 
-**A Layer-1 blockchain for home validators and autonomous agents — written in pure C.**
+**Agent-native Layer-1 blockchain — written in pure C, live on the public internet.**
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![CI](https://github.com/beltromatti/agentchain/actions/workflows/build.yml/badge.svg)](https://github.com/beltromatti/agentchain/actions/workflows/build.yml)
 [![Release](https://img.shields.io/github/v/release/beltromatti/agentchain?include_prereleases&sort=semver)](https://github.com/beltromatti/agentchain/releases)
 [![Protocol](https://img.shields.io/badge/protocol-v1-informational)](PROTOCOL.md)
+[![Mainnet](https://img.shields.io/badge/mainnet-live-brightgreen)](#mainnet-status)
 
-[Protocol](PROTOCOL.md) · [Implementation notes](TECHNICAL-IMPLEMENTATION.md) · [Releases](https://github.com/beltromatti/agentchain/releases)
+[Protocol](PROTOCOL.md) · [Implementation notes](TECHNICAL-IMPLEMENTATION.md) · [Security audit](SECURITY-AUDIT.md) · [Releases](https://github.com/beltromatti/agentchain/releases)
 
 </div>
 
@@ -31,11 +32,80 @@ AgentChain is a single design that addresses both. It is a Layer-1 with:
 
 The native asset is **Credit (CRD)**. The smallest unit is the micro-Credit (`µCRD = 10⁻⁶ CRD`). All on-chain arithmetic is integer.
 
-## What is shipping in v1.0.0
+## Mainnet status
 
-A reference client — **AgentChain Engine** — that implements the protocol end-to-end. Transfers, validator bonding, name registration, equivocation slashing, EIP-1559-style fee burn, deterministic 2-second slots, ~4-second finality, JSON-RPC over HTTP, gossip over TCP, atomic on-disk state. Cross-platform releases for Linux and macOS, x86_64 and arm64.
+**AgentChain mainnet is live.**
 
-There is no smart-contract VM in v1, on purpose. The strategy is to ship a small, audited foundation now and add deterministic, agent-friendly execution on top later — not the other way around.
+- **`chain_id`** : `1`
+- **First block timestamp:** `2026-05-18T16:16:41Z`
+- **Public bootstrap seed:** `34.61.207.49:30303` (Iowa, US — operated by Noesis AI)
+- **Public read-only RPC:** `http://34.61.207.49:30304`
+- **Genesis file** (canonical, bit-for-bit reproducible): [`deploy/mainnet-genesis.txt`](deploy/mainnet-genesis.txt)
+- **Block time:** 2 s · **2-block finality:** ~4 s
+
+The first seed is operated by Noesis AI on a Google Cloud Always-Free `e2-micro` instance. We are honest about what this means: until other independent validators bond stake and bring up their own nodes, Noesis AI is the dominant operator. The protocol is designed to make that transition trivial — see [Run your own node](#run-your-own-node) below. The chain accepts new validators the moment they bond `STAKE_BOND`; no central coordination is required.
+
+Live status from your terminal:
+
+```sh
+curl -s -X POST -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"chain_info"}' \
+  http://34.61.207.49:30304/
+```
+
+## Try it in 60 seconds
+
+Download the pre-built binary for your OS — Linux x86_64/arm64, macOS x86_64/arm64, Windows x86_64 — from the [latest release](https://github.com/beltromatti/agentchain/releases/latest):
+
+```sh
+# macOS arm64 example
+curl -L https://github.com/beltromatti/agentchain/releases/latest/download/agentchain-v1.0.3-macos-arm64.tar.gz | tar xz
+cd agentchain-v1.0.3-*
+./agentchain version
+./agentchain info --rpc 34.61.207.49:30304
+```
+
+Send a transaction (you'll need a balance — see "Get test Credits" below):
+
+```sh
+./agentchain keygen --out my.key
+./agentchain pubkey --key my.key                                   # your address
+./agentchain send  --rpc 34.61.207.49:30304 \
+                   --from-key my.key \
+                   --to     <recipient_hex_pubkey> \
+                   --amount 1000000 --tip 1
+```
+
+## Run your own node
+
+A full node — or a validator — joins mainnet by pointing at the same genesis file and the same seed.
+
+```sh
+# 1) Get the binary (see above).
+# 2) Pick a data directory. The first run generates a node key.
+mkdir -p ~/agentchain-data
+
+# 3) Run as a syncing node (read-only):
+./agentchain node \
+    --data-dir ~/agentchain-data \
+    --genesis  deploy/mainnet-genesis.txt \
+    --seeds    34.61.207.49:30303
+
+# 4) Or run as a validator (adds --validator):
+./agentchain node \
+    --data-dir ~/agentchain-data \
+    --genesis  deploy/mainnet-genesis.txt \
+    --seeds    34.61.207.49:30303 \
+    --validator
+```
+
+To actually produce blocks you need bonded stake (`≥ 100 CRD`). The path is:
+
+1. Run the node to generate your `node.key` and get your address (`agentchain pubkey`).
+2. Receive `CRD` from the founder allocation (`info@noesis.ai`) or any community member.
+3. Submit `STAKE_BOND` with that address — you become eligible for sortition immediately.
+
+The protocol is forgiving about uptime — being offline costs you potential block rewards but nothing else. Only cryptographically-provable double-signing is slashable. See [`PROTOCOL.md`](PROTOCOL.md) § 6.6.
 
 ## How the consensus works (in 60 seconds)
 
@@ -49,38 +119,18 @@ The mechanism is a faithful synthesis of well-understood building blocks: VRF so
 
 The mechanism has a name: **Proof of Sustained Availability**. The full design is in [PROTOCOL.md](PROTOCOL.md).
 
-## Try it in 60 seconds
-
-**Pre-built binaries (Linux x86_64, macOS arm64/x86_64) are on the [releases page](https://github.com/beltromatti/agentchain/releases/latest).** Download, verify the SHA-256, extract, and you have a node:
+## Build from source
 
 ```sh
-curl -L https://github.com/beltromatti/agentchain/releases/latest/download/agentchain-v1.0.0-macos-arm64.tar.gz | tar xz
-cd agentchain-v1.0.0-*
-./agentchain version
-```
-
-The binary is statically linked against libsodium, under 300 KB stripped, runs on `tier-2` hardware (Raspberry Pi 4, M1 MacBook Air, any Linux laptop).
-
-## Try it locally
-
-A four-node testnet runs on a single host in under 30 seconds.
-
-```sh
-# Prerequisites
 sudo apt-get install -y cmake build-essential libsodium-dev   # Debian/Ubuntu
 brew install cmake libsodium                                  # macOS
 
-# Build
 git clone https://github.com/beltromatti/agentchain
 cd agentchain
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
-
-# Run a 4-node testnet for 30 seconds, send a transfer, watch it commit
-N=4 RUN_S=30 testnet/run.sh
+N=4 RUN_S=30 testnet/run.sh    # 4-node local testnet smoke
 ```
-
-You should see each node's height progress in lockstep, and the recipient's balance go up by 100 µCRD plus accumulated block rewards. The harness tears every process down cleanly on exit.
 
 ## CLI quick reference
 
@@ -93,13 +143,11 @@ agentchain pubkey     --data-dir DIR
 agentchain genesis    --chain-id N --out genesis.txt
                        --account HEX:BAL:STAKE [--account …]
 
-agentchain send       --rpc 127.0.0.1:30304 --from-key node.key
+agentchain send       --rpc URL --from-key node.key
                        --to HEX --amount UCRD [--tip N] [--memo TEXT]
-agentchain balance    --rpc 127.0.0.1:30304 --address HEX
-agentchain info       --rpc 127.0.0.1:30304
+agentchain balance    --rpc URL --address HEX
+agentchain info       --rpc URL
 ```
-
-Every command is idempotent in the obvious way; data lives under one directory; keys are stored at mode 0600.
 
 ## Architecture, in one diagram
 
@@ -126,18 +174,24 @@ Every command is idempotent in the obvious way; data lives under one directory; 
 
 All eleven files compile into a single binary. The whole codebase is under 6,000 lines of C, by design.
 
+## Security
+
+A first-party security audit by Noesis AI is published at [`SECURITY-AUDIT.md`](SECURITY-AUDIT.md). It enumerates the cryptographic primitives used, the protocol invariants enforced, the code-level hazards reviewed, every implementation finding with status, and the known open items. Every claim is annotated with its evidence — a libsodium audit, an IETF RFC, or a reproducible test in this repository.
+
+If you find a vulnerability, please open a private security advisory on GitHub or reach out at [info@noesis.ai](mailto:info@noesis.ai).
+
 ## Where to go from here
 
-- Read **[PROTOCOL.md](PROTOCOL.md)** if you want the normative specification: state model, consensus rules, fee market, security model, wire formats.
-- Read **[TECHNICAL-IMPLEMENTATION.md](TECHNICAL-IMPLEMENTATION.md)** if you want to know how the reference client realises the protocol, where v1.0.0 deviates and why, the threading model, and the performance envelope.
-- See **`deploy/`** for the systemd unit, Dockerfile, and the operator-side notes for running a validator.
-- File issues, send PRs. The protocol is small enough to read end-to-end in 45 minutes. Auditing is welcome.
+- **[PROTOCOL.md](PROTOCOL.md)** — the normative specification.
+- **[TECHNICAL-IMPLEMENTATION.md](TECHNICAL-IMPLEMENTATION.md)** — how the reference client realises the protocol, the threading model, the v1.0 deviations and their rationale.
+- **[SECURITY-AUDIT.md](SECURITY-AUDIT.md)** — first-party audit, evidence-based.
+- **[`deploy/`](deploy/)** — systemd unit, Dockerfile, mainnet-seeds list, the canonical mainnet-genesis file.
 
 ## Who is building this
 
-**[Noesis AI](https://github.com/noesis-ai)** — an open-source organisation operating out of Milan, Italy. AgentChain is the first project under the Noesis AI umbrella. The protocol design and the reference client are by **[Mattia Beltrami](https://github.com/beltromatti)**, an undergraduate at Politecnico di Milano. The work is independent and unfunded; contributions are welcome.
+**[Noesis AI](https://github.com/beltromatti)** — an open-source effort operating out of Milan, Italy. AgentChain is the first project under the Noesis AI umbrella. The protocol design and the reference client are by **[Mattia Beltrami](https://github.com/beltromatti)**, an undergraduate at Politecnico di Milano. The work is independent and unfunded; contributions are welcome.
 
-Reach out: [agentchain@noesis.ai](mailto:agentchain@noesis.ai) (issues are the preferred channel for substantive discussion).
+Reach out: [info@noesis.ai](mailto:info@noesis.ai). Issues are the preferred channel for substantive discussion.
 
 ## License
 

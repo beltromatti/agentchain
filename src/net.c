@@ -163,7 +163,8 @@ static size_t outbound_count(ac_net_t *n) {
     size_t c = 0;
     pthread_mutex_lock(&n->peers_mu);
     for (size_t i = 0; i < AC_MAX_PEERS; ++i) {
-        if (n->peers[i].in_use && !n->peers[i].inbound) c++;
+        peer_t *p = &n->peers[i];
+        if (p->in_use && !p->inbound && p->fd >= 0) c++;
     }
     pthread_mutex_unlock(&n->peers_mu);
     return c;
@@ -448,13 +449,15 @@ static void *listen_loop(void *arg) {
 /* Outbound connector.                                                        */
 /* -------------------------------------------------------------------------- */
 
-/* Returns true iff we already have an outbound peer slot for this host:port. */
+/* Returns true iff we already have a *live* outbound peer slot for this
+ * host:port. Dead slots (fd closed but thread not yet joined) do not count,
+ * so the connector can re-establish lost links promptly. */
 static bool already_dialed(ac_net_t *n, const char *host, uint16_t port) {
     bool found = false;
     pthread_mutex_lock(&n->peers_mu);
     for (size_t i = 0; i < AC_MAX_PEERS; ++i) {
         peer_t *p = &n->peers[i];
-        if (!p->in_use || p->inbound) continue;
+        if (!p->in_use || p->inbound || p->fd < 0) continue;
         if (p->port == port && strcmp(p->host, host) == 0) { found = true; break; }
     }
     pthread_mutex_unlock(&n->peers_mu);
@@ -517,20 +520,54 @@ static int dial_peer(ac_net_t *n, const char *hp) {
     return 0;
 }
 
+/* Reap peer slots whose reader thread has exited. Without this, every
+ * disconnect leaks a slot (in_use=true, fd<0) and after AC_MAX_PEERS
+ * disconnects the connector can no longer create new peer slots. */
+static void reap_dead_peers(ac_net_t *n) {
+    for (size_t i = 0; i < AC_MAX_PEERS; ++i) {
+        peer_t *p;
+        pthread_t th;
+        bool need_join = false;
+        pthread_mutex_lock(&n->peers_mu);
+        p = &n->peers[i];
+        if (p->in_use && p->fd < 0 && p->thread_started) {
+            th = p->thread;
+            need_join = true;
+        }
+        pthread_mutex_unlock(&n->peers_mu);
+        if (need_join) {
+            pthread_join(th, NULL); /* fast: reader_loop already returned */
+            pthread_mutex_lock(&n->peers_mu);
+            if (p->in_use && p->fd < 0) {
+                p->thread_started = false;
+                pthread_mutex_destroy(&p->write_mu);
+                p->in_use = false;
+            }
+            pthread_mutex_unlock(&n->peers_mu);
+        }
+    }
+}
+
 static void *connector_loop(void *arg) {
     ac_net_t *n = (ac_net_t *)arg;
     int target = n->cfg.target_outbound > 0 ? n->cfg.target_outbound : 8;
+    /* Don't try to over-dial: if the seed list is smaller than the target,
+     * one outbound per seed is the right amount. Otherwise we'd open
+     * redundant TCP connections to the same peer. */
+    if ((int)n->cfg.seed_n > 0 && (int)n->cfg.seed_n < target) {
+        target = (int)n->cfg.seed_n;
+    }
 
-    /* Initial seed dial. */
     while (n->running) {
+        reap_dead_peers(n);
+
         size_t now_out = outbound_count(n);
         if (now_out < (size_t)target && n->cfg.seed_n > 0) {
-            size_t pick = ac_random_u64() % n->cfg.seed_n;
-            const char *peer = n->cfg.seed_peers[pick];
-            if (peer && peer[0]) {
-                if (dial_peer(n, peer) == 0) {
-                    LOG_D("net", "dialed seed %s", peer);
-                }
+            /* Try each seed in order so a single offline seed doesn't starve
+             * the rest. */
+            for (size_t i = 0; i < n->cfg.seed_n && n->running; ++i) {
+                const char *peer = n->cfg.seed_peers[i];
+                if (peer && peer[0]) dial_peer(n, peer);
             }
         }
         ac_sleep_ms(AC_RECONNECT_BASE_MS);
