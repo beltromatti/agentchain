@@ -42,12 +42,12 @@ AgentChain v1 is not a smart contract platform. It does not execute Turing-compl
 
 ### 2.2 Why pure C
 
-The reference client, **AgentChain Engine**, is written in C99 against POSIX. The reasons are operational, not stylistic:
+The reference client, **AgentChain Engine**, is written in C11 against POSIX. The reasons are operational, not stylistic:
 
 - Static linkage produces a single artifact with predictable behaviour across distributions.
 - The runtime surface is small enough to audit end-to-end.
 - Memory and CPU footprint are deterministic; no garbage collector pauses interfere with consensus.
-- Dependencies are limited to audited, standards-track libraries (`libsodium` for cryptography, `SQLite` for state, the POSIX sockets API for networking).
+- Dependencies are limited to audited, standards-track libraries — `libsodium` for cryptography and the POSIX sockets API for networking. State is persisted as plain files with atomic rename; no database engine is linked.
 
 The implementation is described in `TECHNICAL-IMPLEMENTATION.md`.
 

@@ -26,7 +26,7 @@ The second is the next generation of software — AI agents that act on behalf o
 AgentChain is a single design that addresses both. It is a Layer-1 with:
 
 - **A consensus tuned for participation, not capital.** Validator influence is `sqrt(stake)`, not `stake`. Doubling your bond does not double your vote. There is no slashing for going offline — only for cryptographically-provable double-signing.
-- **A single-binary client under 1 MB.** Built in C99, depends only on `libsodium`, runs comfortably in 16 MB of RAM. Designed to sit on the same laptop someone is using for everything else.
+- **A single-binary client under 1 MB.** Built in C11, depends only on `libsodium`, runs comfortably in 16 MB of RAM. Designed to sit on the same laptop someone is using for everything else.
 - **A protocol that ships in one document.** [PROTOCOL.md](PROTOCOL.md) is the entire surface. There is no virtual machine in v1. There are no precompiles. Every byte on the wire is documented; every state transition fits on a page.
 
 The native asset is **Credit (CRD)**. The smallest unit is the micro-Credit (`µCRD = 10⁻⁶ CRD`). All on-chain arithmetic is integer.
@@ -49,9 +49,21 @@ The mechanism is a faithful synthesis of well-understood building blocks: VRF so
 
 The mechanism has a name: **Proof of Sustained Availability**. The full design is in [PROTOCOL.md](PROTOCOL.md).
 
+## Try it in 60 seconds
+
+**Pre-built binaries (Linux x86_64, macOS arm64/x86_64) are on the [releases page](https://github.com/beltromatti/agentchain/releases/latest).** Download, verify the SHA-256, extract, and you have a node:
+
+```sh
+curl -L https://github.com/beltromatti/agentchain/releases/latest/download/agentchain-v1.0.0-macos-arm64.tar.gz | tar xz
+cd agentchain-v1.0.0-*
+./agentchain version
+```
+
+The binary is statically linked against libsodium, under 300 KB stripped, runs on `tier-2` hardware (Raspberry Pi 4, M1 MacBook Air, any Linux laptop).
+
 ## Try it locally
 
-A four-node testnet runs on a single laptop in under 30 seconds.
+A four-node testnet runs on a single host in under 30 seconds.
 
 ```sh
 # Prerequisites
