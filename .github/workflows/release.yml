@@ -205,11 +205,9 @@ jobs:
           cp LICENSE                         "dist/$DEST/"
           cp -r deploy                       "dist/$DEST/"
           cd dist
-          # Ship a zip on Windows; tar.gz too for parity.
-          /usr/bin/zip -r "${DEST}.zip" "$DEST"
+          # Windows 10+ ships native tar; tar.gz is universally extractable.
           tar czf "${DEST}.tar.gz" "$DEST"
-          sha256sum "${DEST}.zip"     > "${DEST}.zip.sha256"
-          sha256sum "${DEST}.tar.gz"  > "${DEST}.tar.gz.sha256"
+          sha256sum "${DEST}.tar.gz" > "${DEST}.tar.gz.sha256"
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2
@@ -222,5 +220,3 @@ jobs:
           files: |
             dist/agentchain-${{ steps.ver.outputs.version }}-${{ matrix.artifact_suffix }}.tar.gz
             dist/agentchain-${{ steps.ver.outputs.version }}-${{ matrix.artifact_suffix }}.tar.gz.sha256
-            dist/agentchain-${{ steps.ver.outputs.version }}-${{ matrix.artifact_suffix }}.zip
-            dist/agentchain-${{ steps.ver.outputs.version }}-${{ matrix.artifact_suffix }}.zip.sha256
