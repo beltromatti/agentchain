@@ -1,14 +1,8 @@
 #include "common.h"
+#include "portable.h"
 
 #include <errno.h>
-#include <fcntl.h>
-#include <pthread.h>
 #include <stdlib.h>
-#include <sys/stat.h>
-#include <sys/time.h>
-#include <sys/types.h>
-#include <time.h>
-#include <unistd.h>
 
 /* -------------------------------------------------------------------------- */
 /* Hex.                                                                       */
@@ -55,12 +49,7 @@ uint64_t ac_now_ms(void) {
     return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)(ts.tv_nsec / 1000000);
 }
 
-void ac_sleep_ms(uint64_t ms) {
-    struct timespec req;
-    req.tv_sec  = (time_t)(ms / 1000);
-    req.tv_nsec = (long)((ms % 1000) * 1000000);
-    nanosleep(&req, NULL);
-}
+void ac_sleep_ms(uint64_t ms) { ac_os_sleep_ms(ms); }
 
 /* -------------------------------------------------------------------------- */
 /* Logging.                                                                   */
@@ -88,12 +77,12 @@ void ac_log(ac_log_level_t lvl, const char *module, const char *fmt, ...) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     struct tm tm;
-    localtime_r(&ts.tv_sec, &tm);
+    ac_localtime_r(&ts.tv_sec, &tm);
 
     char tbuf[32];
     strftime(tbuf, sizeof(tbuf), "%Y-%m-%dT%H:%M:%S", &tm);
 
-    bool color = isatty(fileno(stderr));
+    bool color = ac_os_isatty(fileno(stderr));
     if (color) fputs(LEVEL_COLOR[lvl], stderr);
     fprintf(stderr, "%s.%03ld %s ", tbuf, ts.tv_nsec / 1000000, LEVEL_NAME[lvl]);
     if (color) fputs("\x1b[0m", stderr);
@@ -155,26 +144,31 @@ int ac_file_write_atomic(const char *path, const uint8_t *buf, size_t len, int m
         ssize_t w = write(fd, buf + written, len - written);
         if (w < 0) {
             if (errno == EINTR) continue;
-            close(fd); unlink(tmp); return -1;
+            close(fd); ac_os_unlink(tmp); return -1;
         }
         written += (size_t)w;
     }
 
-    if (fsync(fd) != 0) { close(fd); unlink(tmp); return -1; }
+    if (ac_os_fsync(fd) != 0) { close(fd); ac_os_unlink(tmp); return -1; }
     close(fd);
 
-    if (rename(tmp, path) != 0) { unlink(tmp); return -1; }
+#ifdef _WIN32
+    /* Windows refuses rename-over-existing. Remove first; tolerate ENOENT. */
+    ac_os_unlink(path);
+#endif
+    if (rename(tmp, path) != 0) { ac_os_unlink(tmp); return -1; }
 
-    /* Best-effort fsync of containing directory. */
+    /* Best-effort directory fsync (POSIX only). */
+#ifndef _WIN32
     char dir[1024];
     snprintf(dir, sizeof(dir), "%s", path);
     char *slash = strrchr(dir, '/');
     if (slash) {
         *slash = '\0';
         int dfd = open(dir, O_RDONLY);
-        if (dfd >= 0) { fsync(dfd); close(dfd); }
+        if (dfd >= 0) { ac_os_fsync(dfd); close(dfd); }
     }
-
+#endif
     return 0;
 }
 
@@ -182,15 +176,17 @@ int ac_mkdir_p(const char *path) {
     char buf[1024];
     if ((size_t)snprintf(buf, sizeof(buf), "%s", path) >= sizeof(buf)) return -1;
 
-    /* Walk forward, creating intermediates. */
+    /* Walk forward, creating intermediates. Treat both '/' and '\\' as
+     * separators so Windows paths work too. */
     for (char *p = buf + 1; *p; ++p) {
-        if (*p == '/') {
+        if (*p == '/' || *p == '\\') {
+            char saved = *p;
             *p = '\0';
-            if (mkdir(buf, 0700) != 0 && errno != EEXIST) return -1;
-            *p = '/';
+            if (ac_os_mkdir(buf) != 0 && errno != EEXIST) return -1;
+            *p = saved;
         }
     }
-    if (mkdir(buf, 0700) != 0 && errno != EEXIST) return -1;
+    if (ac_os_mkdir(buf) != 0 && errno != EEXIST) return -1;
     return 0;
 }
 

@@ -1,18 +1,9 @@
 #include "net.h"
+#include "portable.h"
 
-#include <arpa/inet.h>
 #include <errno.h>
-#include <fcntl.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <pthread.h>
-#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <unistd.h>
 
 #define AC_MAX_PEERS         64
 #define AC_DEDUP_CAP         256
@@ -27,7 +18,7 @@ static int read_full(int fd, void *buf, size_t len) {
     uint8_t *p = (uint8_t *)buf;
     size_t got = 0;
     while (got < len) {
-        ssize_t n = read(fd, p + got, len - got);
+        ssize_t n = ac_sock_recv(fd, p + got, len - got);
         if (n == 0) return -1;
         if (n < 0) {
             if (errno == EINTR) continue;
@@ -41,7 +32,7 @@ static int write_full(int fd, const void *buf, size_t len) {
     const uint8_t *p = (const uint8_t *)buf;
     size_t sent = 0;
     while (sent < len) {
-        ssize_t n = write(fd, p + sent, len - sent);
+        ssize_t n = ac_sock_send(fd, p + sent, len - sent);
         if (n < 0) {
             if (errno == EINTR) continue;
             return -1;
@@ -94,7 +85,7 @@ typedef struct {
     ac_addr_t   peer_id;
     bool        peer_id_known;
     bool        inbound;
-    char        host[64];
+    char        host[128];
     uint16_t    port;
     uint64_t    last_seen_ms;
     ac_net_t   *net;
@@ -165,7 +156,7 @@ static peer_t *peer_alloc(ac_net_t *n) {
  * here — that happens during teardown to avoid races with ac_net_broadcast
  * iterating the peer list. */
 static void peer_close_fd(peer_t *p) {
-    if (p->fd >= 0) { close(p->fd); p->fd = -1; }
+    if (p->fd >= 0) { ac_sock_close(p->fd); p->fd = -1; }
 }
 
 static size_t outbound_count(ac_net_t *n) {
@@ -393,7 +384,7 @@ static void *listen_loop(void *arg) {
         set_socket_options(fd);
 
         peer_t *p = peer_alloc(n);
-        if (!p) { close(fd); continue; }
+        if (!p) { ac_sock_close(fd); continue; }
         p->fd = fd;
         p->inbound = true;
 
@@ -454,14 +445,14 @@ static int dial_peer(ac_net_t *n, const char *hp) {
         fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
         if (fd < 0) continue;
         if (connect(fd, p->ai_addr, p->ai_addrlen) == 0) break;
-        close(fd); fd = -1;
+        ac_sock_close(fd); fd = -1;
     }
     freeaddrinfo(res);
     if (fd < 0) return -1;
     set_socket_options(fd);
 
     peer_t *peer = peer_alloc(n);
-    if (!peer) { close(fd); return -1; }
+    if (!peer) { ac_sock_close(fd); return -1; }
     peer->fd = fd;
     peer->inbound = false;
     snprintf(peer->host, sizeof(peer->host), "%s", host);
@@ -547,25 +538,27 @@ int ac_net_start(ac_net_t *n) {
     }
     if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
         LOG_E("net", "bind %u: %s", n->cfg.listen_port, strerror(errno));
-        close(fd);
+        ac_sock_close(fd);
         return -1;
     }
     if (listen(fd, 32) < 0) {
-        close(fd);
+        ac_sock_close(fd);
         return -1;
     }
     n->listen_fd = fd;
     n->running = true;
+#if AC_HAS_SIGPIPE
     signal(SIGPIPE, SIG_IGN);
+#endif
 
     if (pthread_create(&n->listen_thread, NULL, listen_loop, n) != 0) {
         n->running = false;
-        close(fd);
+        ac_sock_close(fd);
         return -1;
     }
     if (pthread_create(&n->connector_thread, NULL, connector_loop, n) != 0) {
         n->running = false;
-        close(fd);
+        ac_sock_close(fd);
         pthread_join(n->listen_thread, NULL);
         return -1;
     }
@@ -578,8 +571,8 @@ int ac_net_start(ac_net_t *n) {
 void ac_net_stop(ac_net_t *n) {
     n->running = false;
     if (n->listen_fd >= 0) {
-        shutdown(n->listen_fd, SHUT_RDWR);
-        close(n->listen_fd);
+        ac_sock_shutdown(n->listen_fd, SHUT_RDWR);
+        ac_sock_close(n->listen_fd);
         n->listen_fd = -1;
     }
     pthread_join(n->listen_thread, NULL);
@@ -588,7 +581,7 @@ void ac_net_stop(ac_net_t *n) {
     pthread_mutex_lock(&n->peers_mu);
     for (size_t i = 0; i < AC_MAX_PEERS; ++i) {
         if (n->peers[i].in_use && n->peers[i].fd >= 0) {
-            shutdown(n->peers[i].fd, SHUT_RDWR);
+            ac_sock_shutdown(n->peers[i].fd, SHUT_RDWR);
         }
     }
     pthread_mutex_unlock(&n->peers_mu);
@@ -600,7 +593,7 @@ void ac_net_stop(ac_net_t *n) {
         }
         if (n->peers[i].in_use) {
             pthread_mutex_destroy(&n->peers[i].write_mu);
-            if (n->peers[i].fd >= 0) { close(n->peers[i].fd); n->peers[i].fd = -1; }
+            if (n->peers[i].fd >= 0) { ac_sock_close(n->peers[i].fd); n->peers[i].fd = -1; }
             n->peers[i].in_use = false;
         }
     }

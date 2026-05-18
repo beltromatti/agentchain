@@ -5,19 +5,15 @@
 #include "common.h"
 #include "crypto.h"
 #include "node.h"
+#include "portable.h"
 #include "version.h"
 
-#include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
 #include <inttypes.h>
-#include <netdb.h>
-#include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <unistd.h>
 
 /* -------------------------------------------------------------------------- */
 /* Usage banner.                                                              */
@@ -184,28 +180,28 @@ static int http_post_json(const char *host, uint16_t port,
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
     char pstr[8]; snprintf(pstr, sizeof(pstr), "%u", port);
-    if (getaddrinfo(host, pstr, &hints, &res) != 0) { close(fd); return -1; }
+    if (getaddrinfo(host, pstr, &hints, &res) != 0) { ac_sock_close(fd); return -1; }
     int rc = connect(fd, res->ai_addr, res->ai_addrlen);
     freeaddrinfo(res);
-    if (rc < 0) { close(fd); return -1; }
+    if (rc < 0) { ac_sock_close(fd); return -1; }
 
     char header[256];
     int hn = snprintf(header, sizeof(header),
         "POST / HTTP/1.1\r\nHost: %s\r\nContent-Type: application/json\r\n"
         "Content-Length: %zu\r\nConnection: close\r\n\r\n",
         host, strlen(body));
-    if (write(fd, header, (size_t)hn) < 0) { close(fd); return -1; }
-    if (write(fd, body, strlen(body)) < 0) { close(fd); return -1; }
+    if (ac_sock_send(fd, header, (size_t)hn) < 0) { ac_sock_close(fd); return -1; }
+    if (ac_sock_send(fd, body, strlen(body)) < 0) { ac_sock_close(fd); return -1; }
 
     /* Read response. */
     size_t total = 0;
     while (total + 1 < resp_cap) {
-        ssize_t n = read(fd, resp + total, resp_cap - 1 - total);
+        ssize_t n = ac_sock_recv(fd, resp + total, resp_cap - 1 - total);
         if (n <= 0) break;
         total += (size_t)n;
     }
     resp[total] = '\0';
-    close(fd);
+    ac_sock_close(fd);
     return (int)total;
 }
 
@@ -482,19 +478,25 @@ int main(int argc, char **argv) {
     if (argc < 2) { print_usage(argv[0]); return 2; }
     const char *cmd = argv[1];
 
-    if (strcmp(cmd, "version") == 0 || strcmp(cmd, "--version") == 0)
-        return cmd_version();
-    if (strcmp(cmd, "node") == 0)    return cmd_node(argc - 1, argv + 1);
-    if (strcmp(cmd, "keygen") == 0)  return cmd_keygen(argc - 1, argv + 1);
-    if (strcmp(cmd, "pubkey") == 0)  return cmd_pubkey(argc - 1, argv + 1);
-    if (strcmp(cmd, "genesis") == 0) return cmd_genesis(argc - 1, argv + 1);
-    if (strcmp(cmd, "send") == 0)    return cmd_send(argc - 1, argv + 1);
-    if (strcmp(cmd, "balance") == 0) return cmd_balance(argc - 1, argv + 1);
-    if (strcmp(cmd, "info") == 0)    return cmd_info(argc - 1, argv + 1);
-    if (strcmp(cmd, "--help") == 0 || strcmp(cmd, "-h") == 0) {
-        print_usage(argv[0]); return 0;
+    /* Winsock needs to be initialised before any socket call; on POSIX this
+     * is a no-op. `node` re-initialises but that is safe. */
+    ac_net_init();
+
+    int rc = 2;
+    if      (strcmp(cmd, "version") == 0 || strcmp(cmd, "--version") == 0) rc = cmd_version();
+    else if (strcmp(cmd, "node") == 0)    rc = cmd_node(argc - 1, argv + 1);
+    else if (strcmp(cmd, "keygen") == 0)  rc = cmd_keygen(argc - 1, argv + 1);
+    else if (strcmp(cmd, "pubkey") == 0)  rc = cmd_pubkey(argc - 1, argv + 1);
+    else if (strcmp(cmd, "genesis") == 0) rc = cmd_genesis(argc - 1, argv + 1);
+    else if (strcmp(cmd, "send") == 0)    rc = cmd_send(argc - 1, argv + 1);
+    else if (strcmp(cmd, "balance") == 0) rc = cmd_balance(argc - 1, argv + 1);
+    else if (strcmp(cmd, "info") == 0)    rc = cmd_info(argc - 1, argv + 1);
+    else if (strcmp(cmd, "--help") == 0 || strcmp(cmd, "-h") == 0) {
+        print_usage(argv[0]); rc = 0;
+    } else {
+        fprintf(stderr, "Unknown command: %s\n", cmd);
+        print_usage(argv[0]);
     }
-    fprintf(stderr, "Unknown command: %s\n", cmd);
-    print_usage(argv[0]);
-    return 2;
+    ac_net_cleanup();
+    return rc;
 }

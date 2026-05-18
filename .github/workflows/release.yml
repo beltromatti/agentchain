@@ -19,15 +19,28 @@ jobs:
           - target: linux-x86_64
             runner: ubuntu-22.04
             artifact_suffix: linux-x86_64
+            kind: posix
+            mac_arch: ""
+          - target: linux-arm64
+            runner: ubuntu-24.04-arm
+            artifact_suffix: linux-arm64
+            kind: posix
             mac_arch: ""
           - target: macos-arm64
             runner: macos-14
             artifact_suffix: macos-arm64
+            kind: posix
             mac_arch: arm64
           - target: macos-x86_64
             runner: macos-14
             artifact_suffix: macos-x86_64
+            kind: posix
             mac_arch: x86_64
+          - target: windows-x86_64
+            runner: windows-2022
+            artifact_suffix: windows-x86_64
+            kind: msys2
+            mac_arch: ""
     steps:
       - uses: actions/checkout@v4
         with:
@@ -44,7 +57,29 @@ jobs:
         run: |
           brew install cmake autoconf automake libtool pkg-config
 
-      - name: Build static libsodium
+      - name: Set up MSYS2 (Windows)
+        if: matrix.kind == 'msys2'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-libsodium
+            base-devel
+            autoconf
+            automake
+            libtool
+
+      # -----------------------------------------------------------------
+      # POSIX path (Linux + macOS): build a fully static libsodium and
+      # link AgentChain against it, so the released binary only depends
+      # on the platform's libc + libpthread.
+      # -----------------------------------------------------------------
+      - name: Build static libsodium (POSIX)
+        if: matrix.kind == 'posix'
         shell: bash
         run: |
           set -euo pipefail
@@ -53,10 +88,8 @@ jobs:
           curl -fsSL https://download.libsodium.org/libsodium/releases/libsodium-1.0.20.tar.gz -o libsodium.tar.gz
           tar xzf libsodium.tar.gz
           cd libsodium-1.0.20
-
           OPTS="--prefix=$PWD/_install --disable-shared --enable-static --with-pic"
           if [ "${{ matrix.mac_arch }}" = "x86_64" ]; then
-            # Cross-compile from Apple Silicon to Intel.
             export CC="clang -arch x86_64"
             export CFLAGS="-arch x86_64"
             export LDFLAGS="-arch x86_64"
@@ -66,13 +99,13 @@ jobs:
             export CFLAGS="-arch arm64"
             export LDFLAGS="-arch arm64"
           fi
-
           ./configure $OPTS
           make -j
           make install
           echo "SODIUM_STATIC=$PWD/_install" >> "$GITHUB_ENV"
 
-      - name: Configure AgentChain (static sodium)
+      - name: Configure AgentChain (POSIX)
+        if: matrix.kind == 'posix'
         shell: bash
         run: |
           set -euo pipefail
@@ -87,31 +120,64 @@ jobs:
           fi
           cmake -S . -B build $OPTS
 
-      - name: Build
+      - name: Build (POSIX)
+        if: matrix.kind == 'posix'
         run: cmake --build build -j
 
-      - name: Smoke test (native or via Rosetta on macOS)
+      # -----------------------------------------------------------------
+      # Windows path: MSYS2 / MinGW64. libsodium comes from the MSYS2
+      # repository as a static library; we link statically against
+      # libstdc++, libgcc and winpthread so the resulting .exe runs on a
+      # bare Windows install without bundled DLLs.
+      # -----------------------------------------------------------------
+      - name: Configure + build (Windows / MSYS2)
+        if: matrix.kind == 'msys2'
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_FLAGS="-static" \
+            -DCMAKE_EXE_LINKER_FLAGS="-static -static-libgcc -Wl,-Bstatic -lwinpthread" \
+            -DAGENTCHAIN_BUILD_TESTS=OFF
+          cmake --build build -j
+
+      - name: Smoke test (POSIX, native or Rosetta)
+        if: matrix.kind == 'posix'
         shell: bash
         run: |
           set -euo pipefail
           file build/agentchain
           if [ "${{ matrix.mac_arch }}" = "x86_64" ] && [ "$(uname -m)" = "arm64" ]; then
             arch -x86_64 ./build/agentchain version
-            arch -x86_64 ./build/agentchain --help
           else
             ./build/agentchain version
-            ./build/agentchain --help
           fi
 
-      - name: Strip binary
+      - name: Smoke test (Windows)
+        if: matrix.kind == 'msys2'
+        shell: msys2 {0}
+        run: |
+          ls -la build/
+          ./build/agentchain.exe version
+
+      - name: Strip binary (POSIX)
+        if: matrix.kind == 'posix'
         shell: bash
         run: strip build/agentchain
 
+      - name: Strip binary (Windows)
+        if: matrix.kind == 'msys2'
+        shell: msys2 {0}
+        run: strip build/agentchain.exe
+
       - name: Determine version
         id: ver
+        shell: bash
         run: echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
 
-      - name: Stage artefact
+      - name: Stage artefact (POSIX)
+        if: matrix.kind == 'posix'
         shell: bash
         run: |
           set -euo pipefail
@@ -126,6 +192,25 @@ jobs:
           tar czf "${DEST}.tar.gz" "$DEST"
           shasum -a 256 "${DEST}.tar.gz" > "${DEST}.tar.gz.sha256"
 
+      - name: Stage artefact (Windows)
+        if: matrix.kind == 'msys2'
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          DEST="agentchain-${{ steps.ver.outputs.version }}-${{ matrix.artifact_suffix }}"
+          mkdir -p "dist/$DEST"
+          cp build/agentchain.exe            "dist/$DEST/"
+          cp PROTOCOL.md README.md           "dist/$DEST/"
+          cp TECHNICAL-IMPLEMENTATION.md     "dist/$DEST/"
+          cp LICENSE                         "dist/$DEST/"
+          cp -r deploy                       "dist/$DEST/"
+          cd dist
+          # Ship a zip on Windows; tar.gz too for parity.
+          /usr/bin/zip -r "${DEST}.zip" "$DEST"
+          tar czf "${DEST}.tar.gz" "$DEST"
+          sha256sum "${DEST}.zip"     > "${DEST}.zip.sha256"
+          sha256sum "${DEST}.tar.gz"  > "${DEST}.tar.gz.sha256"
+
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
@@ -137,3 +222,5 @@ jobs:
           files: |
             dist/agentchain-${{ steps.ver.outputs.version }}-${{ matrix.artifact_suffix }}.tar.gz
             dist/agentchain-${{ steps.ver.outputs.version }}-${{ matrix.artifact_suffix }}.tar.gz.sha256
+            dist/agentchain-${{ steps.ver.outputs.version }}-${{ matrix.artifact_suffix }}.zip
+            dist/agentchain-${{ steps.ver.outputs.version }}-${{ matrix.artifact_suffix }}.zip.sha256

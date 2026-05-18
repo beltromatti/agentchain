@@ -13,7 +13,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-13, macos-14]
+        include:
+          - os: ubuntu-22.04
+            kind: posix
+          - os: ubuntu-24.04-arm
+            kind: posix
+          - os: macos-14
+            kind: posix
+          - os: windows-2022
+            kind: msys2
     steps:
       - uses: actions/checkout@v4
 
@@ -28,26 +36,61 @@ jobs:
         run: |
           brew install libsodium cmake
 
-      - name: Configure
+      - name: Set up MSYS2 (Windows)
+        if: matrix.kind == 'msys2'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-libsodium
+
+      - name: Configure (POSIX)
+        if: matrix.kind == 'posix'
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DAGENTCHAIN_WARNINGS_AS_ERRORS=ON
 
-      - name: Build
+      - name: Build (POSIX)
+        if: matrix.kind == 'posix'
         run: cmake --build build -j
 
-      - name: Unit tests (ctest)
+      - name: Configure + build (MSYS2)
+        if: matrix.kind == 'msys2'
+        shell: msys2 {0}
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j
+
+      - name: Unit tests (ctest, POSIX)
+        if: matrix.kind == 'posix'
         run: ctest --test-dir build --output-on-failure
 
-      - name: Smoke test — binary runs
+      - name: Unit tests (ctest, MSYS2)
+        if: matrix.kind == 'msys2'
+        shell: msys2 {0}
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Smoke test (POSIX)
+        if: matrix.kind == 'posix'
         run: |
           ./build/agentchain version
           ./build/agentchain --help
 
-      - name: 4-node local testnet (20s)
+      - name: Smoke test (MSYS2)
+        if: matrix.kind == 'msys2'
+        shell: msys2 {0}
         run: |
-          N=4 RUN_S=20 testnet/run.sh
+          ./build/agentchain.exe version
+          ./build/agentchain.exe --help
+
+      - name: 4-node local testnet (POSIX, 20s)
+        if: matrix.kind == 'posix'
+        run: N=4 RUN_S=20 testnet/run.sh
 
       - name: Upload testnet logs on failure
-        if: failure()
+        if: failure() && matrix.kind == 'posix'
         uses: actions/upload-artifact@v4
         with:
           name: testnet-logs-${{ matrix.os }}

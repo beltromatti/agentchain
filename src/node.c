@@ -1,14 +1,12 @@
 #include "node.h"
+#include "portable.h"
 
 #include <ctype.h>
 #include <errno.h>
 #include <inttypes.h>
-#include <pthread.h>
-#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 struct ac_node_s {
     ac_node_config_t cfg;
@@ -24,17 +22,22 @@ struct ac_node_s {
 /* Signals.                                                                   */
 /* -------------------------------------------------------------------------- */
 
-static volatile sig_atomic_t SHUTDOWN = 0;
-static void on_sigterm(int sig) { (void)sig; SHUTDOWN = 1; }
+static volatile int SHUTDOWN = 0;
+static void on_signal(int sig) { (void)sig; SHUTDOWN = 1; }
 
 void ac_node_wait_for_signal(ac_node_t *n) {
     (void)n;
+#ifdef _WIN32
+    /* Windows: install a handler for SIGINT/SIGTERM via the C runtime. */
+    signal(SIGINT,  on_signal);
+    signal(SIGTERM, on_signal);
+#else
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = on_sigterm;
+    sa.sa_handler = on_signal;
     sigaction(SIGINT,  &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
-
+#endif
     while (!SHUTDOWN) ac_sleep_ms(200);
 }
 
@@ -257,6 +260,11 @@ int ac_node_start(ac_node_t *n) {
         LOG_E("node", "crypto init failed");
         return -1;
     }
+    /* Init networking (Winsock on Windows; no-op on POSIX). */
+    if (ac_net_init() != 0) {
+        LOG_E("node", "network init failed");
+        return -1;
+    }
 
     if (ac_mkdir_p(n->cfg.data_dir) != 0) {
         LOG_E("node", "mkdir %s failed", n->cfg.data_dir);
@@ -368,4 +376,5 @@ void ac_node_stop(ac_node_t *n) {
     /* Now safe to free state-holding modules. */
     if (n->mempool) { ac_mempool_free(n->mempool);                         n->mempool = NULL; }
     if (n->chain)   { ac_chain_close(n->chain);                            n->chain = NULL; }
+    ac_net_cleanup();
 }

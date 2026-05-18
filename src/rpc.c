@@ -1,17 +1,12 @@
 #include "rpc.h"
+#include "portable.h"
 
-#include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
 #include <inttypes.h>
-#include <netinet/in.h>
-#include <pthread.h>
-#include <signal.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <unistd.h>
 
 struct ac_rpc_s {
     ac_rpc_config_t cfg;
@@ -64,7 +59,7 @@ static int write_all(int fd, const void *buf, size_t len) {
     const uint8_t *p = (const uint8_t *)buf;
     size_t sent = 0;
     while (sent < len) {
-        ssize_t n = write(fd, p + sent, len - sent);
+        ssize_t n = ac_sock_send(fd, p + sent, len - sent);
         if (n < 0) {
             if (errno == EINTR) continue;
             return -1;
@@ -264,7 +259,7 @@ static void handle_client(ac_rpc_t *r, int fd) {
     /* Read until end-of-headers, then content-length-determined body. */
     size_t header_end = SIZE_MAX;
     while (total < sizeof(buf) - 1) {
-        ssize_t n = read(fd, buf + total, sizeof(buf) - 1 - total);
+        ssize_t n = ac_sock_recv(fd, buf + total, sizeof(buf) - 1 - total);
         if (n <= 0) break;
         total += (size_t)n;
         buf[total] = '\0';
@@ -298,7 +293,7 @@ static void handle_client(ac_rpc_t *r, int fd) {
         p = eol + 2;
     }
     while (total < header_end + content_length && total < sizeof(buf) - 1) {
-        ssize_t n = read(fd, buf + total, sizeof(buf) - 1 - total);
+        ssize_t n = ac_sock_recv(fd, buf + total, sizeof(buf) - 1 - total);
         if (n <= 0) break;
         total += (size_t)n;
     }
@@ -362,7 +357,7 @@ static void *rpc_accept_loop(void *arg) {
             continue;
         }
         handle_client(r, fd);
-        close(fd);
+        ac_sock_close(fd);
     }
     return NULL;
 }
@@ -398,15 +393,17 @@ int ac_rpc_start(ac_rpc_t *r) {
     else                sa.sin_addr.s_addr = htonl(0x7f000001u); /* 127.0.0.1 */
     if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
         LOG_E("rpc", "bind %u: %s", r->cfg.port, strerror(errno));
-        close(fd); return -1;
+        ac_sock_close(fd); return -1;
     }
-    if (listen(fd, 16) < 0) { close(fd); return -1; }
+    if (listen(fd, 16) < 0) { ac_sock_close(fd); return -1; }
     r->fd = fd;
     r->running = true;
+#if AC_HAS_SIGPIPE
     signal(SIGPIPE, SIG_IGN);
+#endif
     if (pthread_create(&r->thread, NULL, rpc_accept_loop, r) != 0) {
         r->running = false;
-        close(fd);
+        ac_sock_close(fd);
         return -1;
     }
     LOG_I("rpc", "listening on %s:%u",
@@ -417,8 +414,8 @@ int ac_rpc_start(ac_rpc_t *r) {
 void ac_rpc_stop(ac_rpc_t *r) {
     r->running = false;
     if (r->fd >= 0) {
-        shutdown(r->fd, SHUT_RDWR);
-        close(r->fd);
+        ac_sock_shutdown(r->fd, SHUT_RDWR);
+        ac_sock_close(r->fd);
         r->fd = -1;
     }
     pthread_join(r->thread, NULL);
