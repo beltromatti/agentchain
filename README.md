@@ -37,11 +37,11 @@ The native asset is **Credit (CRD)**. The smallest unit is the micro-Credit (`µ
 **AgentChain mainnet is live.**
 
 - **`chain_id`** : `1`
-- **First block timestamp:** `2026-05-18T16:16:41Z`
 - **Public bootstrap seed:** `34.61.207.49:30303` (Iowa, US — operated by Noesis AI)
 - **Public read-only RPC:** `http://34.61.207.49:30304`
 - **Genesis file** (canonical, bit-for-bit reproducible): [`deploy/mainnet-genesis.txt`](deploy/mainnet-genesis.txt)
 - **Block time:** 2 s · **2-block finality:** ~4 s
+- **Engine release:** [`v1.0.5`](https://github.com/beltromatti/agentchain/releases/tag/v1.0.5)
 
 The first seed is operated by Noesis AI on a Google Cloud Always-Free `e2-micro` instance. We are honest about what this means: until other independent validators bond stake and bring up their own nodes, Noesis AI is the dominant operator. The protocol is designed to make that transition trivial — see [Run your own node](#run-your-own-node) below. The chain accepts new validators the moment they bond `STAKE_BOND`; no central coordination is required.
 

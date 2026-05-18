@@ -1,9 +1,9 @@
-# AgentChain Security Audit — v1.0.1
+# AgentChain Security Audit — v1.0.5
 
-**Audited release:** AgentChain Engine v1.0.1 (`commit 48ecb0d`)
-**Audit date:** 2026-05-18
+**Audited release:** AgentChain Engine v1.0.5 (`commit 208e45d`)
+**Audit date:** 2026-05-19
 **Auditor:** Noesis AI — internal review
-**Scope:** Reference C client + AgentChain Protocol v1
+**Scope:** Reference C client + AgentChain Protocol v1, including the live mainnet (`chain_id=1`) bootstrap operated by Noesis AI on Google Cloud.
 **Status:** Completed — findings and mitigations recorded below
 
 > **Disclaimer.** This is a first-party audit. We make no claim that it substitutes for an independent third-party review. Every statement below is backed by either a cryptographic guarantee from an audited dependency, an external standards document, or a reproducible test in this repository. Where we have not been able to confirm a property we say so explicitly.
@@ -95,7 +95,10 @@ The codebase is ~5,200 lines of C11 against POSIX. We audited every `malloc`/`fr
 | F-4 | Commit-certificate decoder loops over `nsigners` | Low | **Resolved.** `nsigners` is capped at `AC_COMMITTEE_MAX (256)` before allocation. |
 | F-5 | `read()`/`write()` short-result handling on sockets | Low | **Resolved.** `read_full`/`write_full` loop until N bytes transferred, handle EINTR, propagate errors. |
 | F-6 | Format-truncation warning in `peer->host` snprintf | Low | **Resolved (v1.0.0).** `peer_t.host` buffer enlarged to 128 bytes to match advertised-host source. |
-| F-7 | Consensus thread can block indefinitely on a slow peer | Medium | **Resolved (v1.0.1).** `SO_SNDTIMEO=5s` on every socket; failed writes trigger immediate peer `shutdown()`. |
+| F-7 | Consensus thread can block indefinitely on a slow peer | Medium | **Resolved (v1.0.1, refined v1.0.2).** `SO_SNDTIMEO=30s` on every socket; failed writes trigger immediate peer `shutdown()`. |
+| F-8 | Connector opens N redundant connections to the same seed (broadcast amplification) | Medium | **Resolved (v1.0.3).** `dial_peer` deduplicates by `host:port`; `reader_loop` drops duplicate `peer_id` at the HELLO stage. Outbound target capped at `min(target_outbound, seed_count)`. |
+| F-9 | Peer slot leak after disconnect (`in_use=true, fd=-1` permanent) | Medium | **Resolved (v1.0.4).** `connector_loop` calls `reap_dead_peers` each tick, joining the reader thread of any slot whose fd has been closed and releasing the slot. |
+| F-10 | `HEADERS_REQ` storm from a gossip-lagging peer | Medium | **Resolved (v1.0.5).** Local rate-limits `HEADERS_REQ` to at most one per 4 s (or when the tip gap grows by >64); per-request batch raised from 64 to 256 blocks. |
 
 **Tools applied:** GCC and Clang at `-Wall -Wextra -Wpedantic -Wshadow -Wstrict-prototypes -Wmissing-prototypes -Wpointer-arith -Wcast-align -Wwrite-strings -Wunreachable-code -Wformat=2 -Wformat-security -Wundef`, treated as errors in CI on the `build.yml` workflow. The current `main` builds with `-Werror` clean across Ubuntu 22.04 (GCC 11), Ubuntu 24.04 ARM (GCC 13), macOS 14 (Apple Clang), and Windows 2022 (MinGW64 GCC 14). *[evidence: `.github/workflows/build.yml`]*
 
@@ -200,6 +203,7 @@ Honestly enumerated; tracked for v1.1:
 - O-5. **Instant unbonding.** `STAKE_UNBOND` releases funds immediately rather than after the 24-hour cooldown specified in the protocol. Cooldown queue is on the v1.1 roadmap.
 - O-6. **No real-time equivocation watcher.** The protocol defines a slashable `SLASH_EVIDENCE` transaction; the engine verifies submitted evidence but does not yet proactively scan for double-signing.
 - O-7. **State-format rewriter for SMT.** v1 rewrites the full state file every block, which is fine at current scale but does not scale linearly with account count. v1.1 plans a sparse-Merkle-tree state with incremental writes.
+- O-8. **Gossip-driven steady-state sync is not yet robust under high WAN latency.** Live testing of v1.0.5 on the Iowa↔Italy link reproducibly synchronises ~50–65 blocks then stalls; the underlying cause is the synchronous broadcast path holding the per-peer write mutex, which under residential RTT can starve subsequent writes for the SO_SNDTIMEO window. Initial bulk sync via `HEADERS_REQ` works correctly. The workaround for v1.0.x peers that fall behind is to restart the client; that triggers a fresh `HEADERS_REQ` burst which catches up the next 256 blocks. v1.1 will replace the synchronous broadcast path with a per-peer non-blocking write queue.
 
 ---
 
@@ -227,5 +231,5 @@ AgentChain Engine v1.0.1 is judged **safe for alpha-mainnet operation** subject 
 We will publish a fresh revision of this document on every release that touches cryptography, consensus, or networking.
 
 —
-**Noesis AI** — Milano, 2026-05-18
+**Noesis AI** — Milano, 2026-05-19
 *Lead reviewer: Mattia Beltrami*

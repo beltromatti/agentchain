@@ -340,6 +340,10 @@ These deviations are deliberate and documented. Each is annotated with the proto
 
 **Protocol § 6.6** specifies that double-signing is slashable. v1.0.0 implements the `SLASH_EVIDENCE` transaction, verifies the two signatures, and burns the validator's stake. What v1.0.0 does **not** do automatically is detect equivocations in real time — a slasher must construct and submit the evidence transaction. A built-in equivocation watcher is on the v1.1 roadmap.
 
+### 9.6 Steady-state sync over high-latency WAN
+
+The reference client's gossip path writes to every peer synchronously inside the broadcast loop. Live testing of v1.0.5 against the public mainnet seed in Iowa from a residential link in Italy reproducibly shows that a fresh peer catches up via `HEADERS_REQ` for the first 50–65 blocks and then falls out of step with live gossip. The TCP connection stays `ESTABLISHED` but no further block announcements are delivered. The underlying cause is the synchronous broadcast path: when the per-peer send buffer fills, the consensus thread stalls until either the buffer drains or `SO_SNDTIMEO` (30 s) elapses, during which fresh block announcements are not produced. The v1.0.5 mitigations (per-peer dedup, peer-slot reap, rate-limited `HEADERS_REQ`, larger batch) make the failure mode benign — the peer no longer destabilises the seed — but they do not eliminate it for the WAN case. **Operational workaround for v1.0.x:** restart the client periodically; the next start issues a fresh `HEADERS_REQ` and catches the next 256-block segment. Tx submission via RPC and validator block production are unaffected. The v1.1 plan is to replace the synchronous broadcast with a per-peer non-blocking write queue + a heartbeat ping that lets dead links be detected within a slot rather than after the full SO_SNDTIMEO window.
+
 ---
 
 ## 10. Performance Envelope (v1.0.0)
