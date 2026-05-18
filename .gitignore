@@ -20,6 +20,7 @@ Makefile
 
 # Local node data
 data/
+testnet/run/
 testnet/data/
 testnet/logs/
 testnet/*.pid
