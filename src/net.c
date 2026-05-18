@@ -370,11 +370,10 @@ static int set_socket_options(int fd) {
      * write fails and the broadcast loop moves on; the reader thread detects
      * EOF and reaps the peer slot. */
 #ifdef _WIN32
-    DWORD tv = 5000; /* ms */
+    DWORD tv = 30000; /* ms */
     setsockopt((SOCKET)fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tv, sizeof(tv));
-    setsockopt((SOCKET)fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
 #else
-    struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+    struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tv, sizeof(tv));
     /* RCV timeout is unbounded by design: peer readers block on incoming data
      * until EOF; we don't want to spuriously drop healthy idle peers. */
