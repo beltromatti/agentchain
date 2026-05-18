@@ -1,142 +1,163 @@
-#include <stdint.h>
-#include <string.h>
+#include "crypto.h"
+
 #include <sodium.h>
+#include <string.h>
 
-#include "types.h"
-#include "utils.h"
-
-/*
- * Hash canonico per firma (32 bytes) su tx.
- * Ritorna 0 ok, -1 errore.
+/* libsodium gives us:
+ *   crypto_sign_PUBLICKEYBYTES = 32
+ *   crypto_sign_SECRETKEYBYTES = 64 (seed||pk concatenation)
+ *   crypto_sign_SEEDBYTES      = 32
+ *   crypto_sign_BYTES          = 64 (signature)
+ *   crypto_generichash         = BLAKE2b
  */
-static int tx_hash_for_signature(const tx *t, uint8_t out_hash[32]) {
-    if (!t || !out_hash || !t->signer) return -1;
 
+/* Compile-time agreement with our public constants. */
+_Static_assert(AC_PUBKEY_SIZE   == crypto_sign_PUBLICKEYBYTES, "pubkey size");
+_Static_assert(AC_PRIVKEY_SIZE  == crypto_sign_SECRETKEYBYTES, "privkey size");
+_Static_assert(AC_SEED_SIZE     == crypto_sign_SEEDBYTES,      "seed size");
+_Static_assert(AC_SIG_SIZE      == crypto_sign_BYTES,          "sig size");
+
+int ac_crypto_init(void) {
+    if (sodium_init() < 0) return -1;
+    return 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Keypairs.                                                                  */
+/* -------------------------------------------------------------------------- */
+
+int ac_keypair_random(ac_keypair_t *kp) {
+    uint8_t seed[AC_SEED_SIZE];
+    randombytes_buf(seed, sizeof(seed));
+    int rc = crypto_sign_seed_keypair(kp->pk, kp->sk, seed);
+    ac_secure_zero(seed, sizeof(seed));
+    return rc;
+}
+
+int ac_keypair_from_seed(ac_keypair_t *kp, const uint8_t seed[AC_SEED_SIZE]) {
+    return crypto_sign_seed_keypair(kp->pk, kp->sk, seed);
+}
+
+void ac_keypair_seed(uint8_t seed_out[AC_SEED_SIZE], const ac_keypair_t *kp) {
+    /* RFC 8032: the first 32 bytes of the secret key in libsodium's layout
+     * are precisely the seed. */
+    memcpy(seed_out, kp->sk, AC_SEED_SIZE);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Hash and sign.                                                             */
+/* -------------------------------------------------------------------------- */
+
+void ac_hash_multi(ac_hash_t *out,
+                   const uint8_t *const *chunks,
+                   const size_t *lens,
+                   size_t n) {
     crypto_generichash_state st;
-    if (crypto_generichash_init(&st, NULL, 0, 32) != 0) {
-        return -1;
-    }
-
-    // Domain separation: evita collisioni di contesto con altri hash
-    static const uint8_t DOMAIN[] = { 'T','X','S','I','G','v','1' };
-    crypto_generichash_update(&st, DOMAIN, sizeof(DOMAIN));
-
-    uint8_t b8[8];
-    uint8_t b4[4];
-
-    // expire (u64 LE)
-    store_u64_le(b8, t->expire);
-    crypto_generichash_update(&st, b8, sizeof b8);
-
-    // function_id (u8)
-    crypto_generichash_update(&st, &t->function_id, sizeof(t->function_id));
-
-    // accounts_num (u32 LE) + lista accounts (pubkey in ordine)
-    store_u32_le(b4, t->accounts_num);
-    crypto_generichash_update(&st, b4, sizeof b4);
-
-    // signer pubkey (32B)
-    crypto_generichash_update(&st, t->signer->pub_key, crypto_sign_PUBLICKEYBYTES);
-
-    // accounts list: includi pubkey di ciascun account nell'ordine della lista
-    // (se vuoi un ordine canonico indipendente dalla lista, devi ordinare per pubkey prima)
-    {
-        uint32_t i = 0;
-        account_list_node *cur = t->accounts;
-
-        while (cur && i < t->accounts_num) {
-            if (!cur->acc) {
-                sodium_memzero(&st, sizeof st);
-                return -1;
-            }
-            crypto_generichash_update(&st, cur->acc->pub_key, crypto_sign_PUBLICKEYBYTES);
-            cur = cur->next;
-            i++;
-        }
-
-        // Se accounts_num dichiara più elementi di quelli presenti -> formato invalido
-        if (i != t->accounts_num) {
-            sodium_memzero(&st, sizeof st);
-            return -1;
+    crypto_generichash_init(&st, NULL, 0, AC_HASH_SIZE);
+    for (size_t i = 0; i < n; ++i) {
+        if (lens[i] > 0 && chunks[i] != NULL) {
+            crypto_generichash_update(&st, chunks[i], lens[i]);
         }
     }
+    crypto_generichash_final(&st, out->b, AC_HASH_SIZE);
+}
 
-    // data: (u32 LE len) + bytes
-    if (t->data) {
-        if (t->data->data_len > TX_DATA_MAX_SIZE) {
-            sodium_memzero(&st, sizeof st);
-            return -1;
-        }
+void ac_hash(ac_hash_t *out, const uint8_t *data, size_t len) {
+    crypto_generichash(out->b, AC_HASH_SIZE, data, len, NULL, 0);
+}
 
-        store_u32_le(b4, t->data->data_len);
-        crypto_generichash_update(&st, b4, sizeof b4);
+void ac_sign(ac_sig_t *out, const uint8_t *msg, size_t len, const ac_keypair_t *kp) {
+    unsigned long long siglen = 0;
+    crypto_sign_detached(out->b, &siglen, msg, len, kp->sk);
+}
 
-        if (t->data->data_len > 0) {
-            crypto_generichash_update(&st, t->data->data, t->data->data_len);
-        }
-    } else {
-        // data assente => len = 0
-        store_u32_le(b4, 0);
-        crypto_generichash_update(&st, b4, sizeof b4);
+int ac_verify(const ac_sig_t *sig,
+              const uint8_t *msg, size_t len,
+              const uint8_t pk[AC_PUBKEY_SIZE]) {
+    return crypto_sign_verify_detached(sig->b, msg, len, pk) == 0 ? 1 : 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/* VRF — deterministic Ed25519 signature with domain tag.                     */
+/*                                                                            */
+/*   alpha_tagged = "AGCH:VRF:v1" || alpha                                    */
+/*   proof        = Ed25519_sign(sk, alpha_tagged)                            */
+/*   beta         = BLAKE2b-256("AGCH:VRF-OUT:v1" || proof)                   */
+/* -------------------------------------------------------------------------- */
+
+static const char VRF_DOMAIN[]     = "AGCH:VRF:v1";
+static const char VRF_OUT_DOMAIN[] = "AGCH:VRF-OUT:v1";
+
+static void vrf_compute_beta(ac_vrf_out_t *beta, const uint8_t proof[AC_VRF_PROOF_SIZE]) {
+    const uint8_t *chunks[2] = { (const uint8_t *)VRF_OUT_DOMAIN, proof };
+    const size_t   lens[2]   = { sizeof(VRF_OUT_DOMAIN) - 1,       AC_VRF_PROOF_SIZE };
+    ac_hash_t h;
+    ac_hash_multi(&h, chunks, lens, 2);
+    memcpy(beta->b, h.b, AC_VRF_OUT_SIZE);
+}
+
+void ac_vrf_prove(ac_vrf_proof_t *proof,
+                  ac_vrf_out_t   *beta,
+                  const uint8_t  *alpha, size_t alpha_len,
+                  const ac_keypair_t *kp) {
+    /* Build alpha_tagged in a temporary buffer (stack — VRF inputs are tiny). */
+    uint8_t buf[1024];
+    size_t  buf_len = sizeof(VRF_DOMAIN) - 1 + alpha_len;
+
+    uint8_t *p = buf;
+    bool heap = false;
+    if (buf_len > sizeof(buf)) {
+        p = (uint8_t *)malloc(buf_len);
+        heap = true;
     }
+    memcpy(p, VRF_DOMAIN, sizeof(VRF_DOMAIN) - 1);
+    if (alpha_len > 0) memcpy(p + sizeof(VRF_DOMAIN) - 1, alpha, alpha_len);
 
-    crypto_generichash_final(&st, out_hash, 32);
-    sodium_memzero(&st, sizeof st);
-    return 0;
+    ac_sig_t sig;
+    ac_sign(&sig, p, buf_len, kp);
+    memcpy(proof->b, sig.b, AC_VRF_PROOF_SIZE);
+    if (beta) vrf_compute_beta(beta, proof->b);
+
+    if (heap) free(p);
 }
 
+int ac_vrf_verify(ac_vrf_out_t  *beta,
+                  const ac_vrf_proof_t *proof,
+                  const uint8_t *alpha, size_t alpha_len,
+                  const uint8_t  pk[AC_PUBKEY_SIZE]) {
+    uint8_t buf[1024];
+    size_t  buf_len = sizeof(VRF_DOMAIN) - 1 + alpha_len;
 
-int generate_keys(account* a) {
-    if (!a) return -1;
-    if (crypto_sign_keypair(a->pub_key, a->priv_key) != 0) return -2;
-    return 0;
-}
-
-int generate_keys_from_seed(account* a, const uint8_t seed[crypto_sign_SEEDBYTES]) {
-    if (!a || !seed) return -1;
-    if (crypto_sign_seed_keypair(a->pub_key, a->priv_key, seed) != 0) return -2;
-    return 0;
-}
-
-int derive_pub_key(const uint8_t priv_key[crypto_sign_SECRETKEYBYTES], uint8_t pub_key_out[crypto_sign_PUBLICKEYBYTES]) {
-    if (!priv_key || !pub_key_out) return -1;
-    if (crypto_sign_ed25519_sk_to_pk(pub_key_out, priv_key) != 0) return -2;
-    return 0;
-}
-
-int sign_tx(tx* t, const account* signer) {
-    if (!t || !signer || !t->signer) return -1;
-
-    // chi firma deve essere il signer
-    if (memcmp(signer->pub_key, t->signer->pub_key, crypto_sign_PUBLICKEYBYTES) != 0) {
-        return -2;
+    uint8_t *p = buf;
+    bool heap = false;
+    if (buf_len > sizeof(buf)) {
+        p = (uint8_t *)malloc(buf_len);
+        heap = true;
     }
+    memcpy(p, VRF_DOMAIN, sizeof(VRF_DOMAIN) - 1);
+    if (alpha_len > 0) memcpy(p + sizeof(VRF_DOMAIN) - 1, alpha, alpha_len);
 
-    uint8_t h[32];
-    if (tx_hash_for_signature(t, h) != 0) return -3;
+    ac_sig_t sig;
+    memcpy(sig.b, proof->b, AC_VRF_PROOF_SIZE);
+    int ok = ac_verify(&sig, p, buf_len, pk);
 
-    // Firma l'hash
-    if (crypto_sign_detached(t->signature, NULL, h, sizeof h, signer->priv_key) != 0) {
-        sodium_memzero(h, sizeof h);
-        return -4;
-    }
+    if (heap) free(p);
 
-    sodium_memzero(h, sizeof h);
-    return 0;
+    if (!ok) return 0;
+    if (beta) vrf_compute_beta(beta, proof->b);
+    return 1;
 }
 
-int verify_tx(const tx* t) {
-    if (!t || !t->signer) return -1;
+/* -------------------------------------------------------------------------- */
+/* RNG.                                                                       */
+/* -------------------------------------------------------------------------- */
 
-    uint8_t h[32];
-    if (tx_hash_for_signature(t, h) != 0) return -2;
+void ac_random_bytes(uint8_t *out, size_t len) {
+    randombytes_buf(out, len);
+}
 
-    int ok = crypto_sign_verify_detached(
-        t->signature,
-        h, sizeof h,
-        t->signer->pub_key
-    );
-
-    sodium_memzero(h, sizeof h);
-    return (ok == 0) ? 0 : -3; // 0 = valida, <0 = non valida
+uint64_t ac_random_u64(void) {
+    uint8_t b[8];
+    randombytes_buf(b, sizeof(b));
+    return ac_rd64(b);
 }

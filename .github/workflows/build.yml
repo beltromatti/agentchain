@@ -1,0 +1,51 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-13, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install libsodium and CMake (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsodium-dev cmake build-essential
+
+      - name: Install libsodium and CMake (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install libsodium cmake
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DAGENTCHAIN_WARNINGS_AS_ERRORS=ON
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Smoke test — binary runs
+        run: |
+          ./build/agentchain version
+          ./build/agentchain --help
+
+      - name: 4-node local testnet (20s)
+        run: |
+          N=4 RUN_S=20 testnet/run.sh
+
+      - name: Upload testnet logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: testnet-logs-${{ matrix.os }}
+          path: testnet/run/logs/

@@ -1,1215 +1,580 @@
-#include <pthread.h>
+#include "consensus.h"
+#include "net.h"
+
+#include <inttypes.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
-#include <limits.h>
 
-#include "consensus.h"
-#include "crypto.h"
-#include "network.h"
-#include "txpool.h"
-#include "utils.h"
-#include "log.h"
+#define AC_PENDING_MAX 8
 
-#define CONSENSUS_BLOCK_VERSION 1
-#define CONSENSUS_VOTE_VERSION 1
+/* -------------------------------------------------------------------------- */
+/* Pending blocks: blocks we have seen but not yet committed.                 */
+/* -------------------------------------------------------------------------- */
 
-#define CONSENSUS_SLOT_SECS 5
-#define CONSENSUS_MAX_TX 64
-#define CONSENSUS_MAX_BLOCK_BYTES 2000
-#define CONSENSUS_MAX_VOTES 256
-#define CONSENSUS_PROB_DENOM 1000000ULL
-#define CONSENSUS_MAX_FUTURE_SLOTS 1
-#define CONSENSUS_MAX_PAST_SLOTS 8
-#define CONSENSUS_EMPTY_BLOCK_SECS 30
+typedef struct {
+    bool                 occupied;
+    bool                 committed;
+    bool                 we_voted;
+    uint64_t             height;
+    uint64_t             slot;
+    ac_hash_t            block_hash;
+    ac_block_t           block;          /* deep copy; we own it */
+    ac_commit_signer_t   signers[AC_COMMITTEE_MAX];
+    uint32_t             nsigners;
+    uint64_t             first_seen_ms;
+} pending_t;
 
-static pthread_mutex_t CONS_MTX = PTHREAD_MUTEX_INITIALIZER;
-static blockchain* CONS_CHAIN = NULL;
-static account CONS_VALIDATOR;
-static int HAS_VALIDATOR = 0;
-static pending_block* PENDING = NULL;
-static pthread_t CONS_THREAD;
-static volatile int CONS_RUNNING = 0;
-static uint64_t LAST_PRODUCED_SLOT = 0;
+struct ac_consensus_s {
+    pthread_mutex_t       mu;
+    ac_chain_t           *chain;
+    ac_mempool_t         *mempool;
+    ac_keypair_t          kp;
+    ac_addr_t             my_addr;
+    ac_broadcast_fn       bcast;
+    void                 *bcast_ctx;
+    bool                  validator;
 
-static void votes_free(vote_entry* v) {
-    while (v) {
-        vote_entry* next = v->next;
-        v->next = NULL;
-        free(v);
-        v = next;
-    }
+    pthread_t             slot_thread;
+    bool                  running;
+
+    pending_t             pending[AC_PENDING_MAX];
+};
+
+static void pending_init(pending_t *p) {
+    if (p->occupied) ac_block_free(&p->block);
+    memset(p, 0, sizeof(*p));
 }
 
-static void block_destroy(block* b);
-
-static void pending_free(pending_block* p) {
-    if (!p) return;
-    votes_free(p->votes);
-    p->votes = NULL;
-    p->blk = NULL;
-    free(p);
-}
-
-static void pending_free_with_block(pending_block* p) {
-    if (!p) return;
-    if (p->blk) {
-        block_destroy(p->blk);
-        p->blk = NULL;
-    }
-    pending_free(p);
-}
-
-static void pending_prune_locked(uint64_t current_slot) {
-    pending_block* prev = NULL;
-    pending_block* cur = PENDING;
-    while (cur) {
-        if (cur->slot + CONSENSUS_MAX_PAST_SLOTS < current_slot) {
-            pending_block* drop = cur;
-            if (prev) {
-                prev->next = cur->next;
-            } else {
-                PENDING = cur->next;
-            }
-            cur = cur->next;
-            pending_free_with_block(drop);
-            continue;
+static pending_t *pending_find(ac_consensus_t *cs, const ac_hash_t *bh) {
+    for (size_t i = 0; i < AC_PENDING_MAX; ++i) {
+        if (cs->pending[i].occupied && ac_hash_eq(&cs->pending[i].block_hash, bh)) {
+            return &cs->pending[i];
         }
-        prev = cur;
-        cur = cur->next;
-    }
-}
-
-static pending_block* pending_find_locked(uint64_t id) {
-    pending_block* cur = PENDING;
-    while (cur) {
-        if (cur->id == id) return cur;
-        cur = cur->next;
     }
     return NULL;
 }
 
-static pending_block* pending_find_slot_locked(uint64_t slot) {
-    pending_block* cur = PENDING;
-    while (cur) {
-        if (cur->slot == slot) return cur;
-        cur = cur->next;
-    }
-    return NULL;
-}
-
-static void pending_remove_locked(uint64_t id) {
-    pending_block* prev = NULL;
-    pending_block* cur = PENDING;
-    while (cur) {
-        if (cur->id == id) {
-            if (prev) prev->next = cur->next;
-            else PENDING = cur->next;
-            pending_free(cur);
-            return;
+static pending_t *pending_alloc(ac_consensus_t *cs) {
+    pending_t *oldest = NULL;
+    for (size_t i = 0; i < AC_PENDING_MAX; ++i) {
+        if (!cs->pending[i].occupied) {
+            pending_init(&cs->pending[i]);
+            cs->pending[i].occupied = true;
+            cs->pending[i].first_seen_ms = ac_now_ms();
+            return &cs->pending[i];
         }
-        prev = cur;
-        cur = cur->next;
-    }
-}
-
-static int vote_add_locked(pending_block* pb, const pub_key_t voter) {
-    if (!pb || !voter) return -1;
-    if (pb->vote_count >= CONSENSUS_MAX_VOTES) return 0;
-    vote_entry* cur = pb->votes;
-    while (cur) {
-        if (memcmp(cur->voter, voter, crypto_sign_PUBLICKEYBYTES) == 0) {
-            return 0;
+        if (!oldest || cs->pending[i].first_seen_ms < oldest->first_seen_ms) {
+            oldest = &cs->pending[i];
         }
-        cur = cur->next;
     }
-
-    vote_entry* v = calloc(1, sizeof(*v));
-    if (!v) return -2;
-    memcpy(v->voter, voter, crypto_sign_PUBLICKEYBYTES);
-    v->next = pb->votes;
-    pb->votes = v;
-    pb->vote_count++;
-    return 1;
+    /* Evict oldest. */
+    pending_init(oldest);
+    oldest->occupied = true;
+    oldest->first_seen_ms = ac_now_ms();
+    return oldest;
 }
 
-static void tx_free_account_nodes(account_list_node* head) {
-    while (head) {
-        account_list_node* next = head->next;
-        head->acc = NULL;
-        head->next = NULL;
-        free(head);
-        head = next;
-    }
+/* -------------------------------------------------------------------------- */
+/* VRF helpers (mirror of chain.c internals, kept local for decoupling).      */
+/* -------------------------------------------------------------------------- */
+
+static int leader_alpha(uint8_t out[64], const ac_hash_t *seed, uint64_t slot) {
+    static const char DOMAIN[] = "AGCH:LEADER";
+    memcpy(out, DOMAIN, sizeof(DOMAIN) - 1);
+    memcpy(out + sizeof(DOMAIN) - 1, seed->b, AC_HASH_SIZE);
+    ac_be64(out + sizeof(DOMAIN) - 1 + AC_HASH_SIZE, slot);
+    return (int)(sizeof(DOMAIN) - 1 + AC_HASH_SIZE + 8);
 }
 
-static void tx_destroy_pool_owned(tx* t) {
-    if (!t) return;
-    if (t->data) {
-        free(t->data);
-        t->data = NULL;
-    }
-    if (t->accounts) {
-        tx_free_account_nodes(t->accounts);
-        t->accounts = NULL;
-    }
-    t->signer = NULL;
-    free(t);
+static int committee_alpha(uint8_t out[64], const ac_hash_t *seed, uint64_t slot) {
+    static const char DOMAIN[] = "AGCH:COMMITTEE";
+    memcpy(out, DOMAIN, sizeof(DOMAIN) - 1);
+    memcpy(out + sizeof(DOMAIN) - 1, seed->b, AC_HASH_SIZE);
+    ac_be64(out + sizeof(DOMAIN) - 1 + AC_HASH_SIZE, slot);
+    return (int)(sizeof(DOMAIN) - 1 + AC_HASH_SIZE + 8);
 }
 
-static void tx_list_destroy(tx_list_node* head) {
-    while (head) {
-        tx_list_node* next = head->next;
-        tx* t = head->transaction;
-        head->transaction = NULL;
-        head->next = NULL;
-        free(head);
-        tx_destroy_pool_owned(t);
-        head = next;
-    }
+static int committee_eligible(uint64_t draw_u64, uint64_t sqrt_stake, uint64_t total_sqrt) {
+    if (total_sqrt == 0 || sqrt_stake == 0) return 0;
+    long double p = (long double)sqrt_stake * (long double)AC_COMMITTEE_TARGET
+                  / (long double)total_sqrt;
+    if (p >= 1.0L) return 1;
+    long double thr = p * (long double)UINT64_MAX;
+    return draw_u64 < (uint64_t)thr;
 }
 
-static void block_destroy(block* b) {
-    if (!b) return;
-    tx_list_destroy(b->txs);
-    b->txs = NULL;
-    b->prev_block = NULL;
-    free(b);
-}
+/* Returns 1 if `my_addr` is plausibly the canonical leader at `slot`, with
+ * VRF proof written to *out_proof. Approximation rule (v1): any active
+ * validator whose VRF priority falls in the top half of expected ordering is
+ * considered leader. This is over-permissive — fork choice resolves ties. */
+static int am_i_leader(ac_consensus_t *cs, uint64_t slot, ac_vrf_proof_t *out_proof) {
+    ac_chain_lock(cs->chain);
 
-static void tx_pool_remove_expired_locked(uint64_t now) {
-    while (TX_POOL.txs) {
-        tx_list_node* node = TX_POOL.txs;
-        tx* t = node->transaction;
-        if (!t) {
-            TX_POOL.txs = node->next;
-            node->next = NULL;
-            free(node);
-            TX_POOL.tx_num--;
-            continue;
-        }
-        if (t->expire > now) break;
-        TX_POOL.txs = node->next;
-        node->next = NULL;
-        node->transaction = NULL;
-        free(node);
-        TX_POOL.tx_num--;
-        tx_destroy_pool_owned(t);
-    }
-}
-
-static uint32_t tx_pool_count_ready(void) {
-    uint64_t now = network_time_now();
-    pthread_mutex_lock(&TX_POOL.mtx);
-    tx_pool_remove_expired_locked(now);
-    uint32_t n = TX_POOL.tx_num;
-    pthread_mutex_unlock(&TX_POOL.mtx);
-    return n;
-}
-
-static tx_list_node* tx_pool_detach_for_block(uint32_t max_txs, uint32_t* out_num) {
-    if (out_num) *out_num = 0;
-    if (max_txs == 0) return NULL;
-
-    uint64_t now = network_time_now();
-    pthread_mutex_lock(&TX_POOL.mtx);
-    tx_pool_remove_expired_locked(now);
-
-    tx_list_node* head = NULL;
-    tx_list_node* tail = NULL;
-    uint32_t count = 0;
-    size_t block_size = 1 + 8 + 8 + 8 + crypto_sign_PUBLICKEYBYTES + 4 + crypto_sign_BYTES;
-
-    while (TX_POOL.txs && count < max_txs) {
-        tx_list_node* node = TX_POOL.txs;
-        tx* t = node->transaction;
-
-        if (!t || t->expire <= now || verify_tx(t) < 0) {
-            TX_POOL.txs = node->next;
-            node->next = NULL;
-            node->transaction = NULL;
-            free(node);
-            TX_POOL.tx_num--;
-            tx_destroy_pool_owned(t);
-            continue;
-        }
-
-        size_t tx_len = 0;
-        if (encode_tx(t, NULL, &tx_len) < 0) {
-            TX_POOL.txs = node->next;
-            node->next = NULL;
-            node->transaction = NULL;
-            free(node);
-            TX_POOL.tx_num--;
-            tx_destroy_pool_owned(t);
-            continue;
-        }
-
-        if (block_size + 4 + tx_len > CONSENSUS_MAX_BLOCK_BYTES) {
-            break;
-        }
-
-        TX_POOL.txs = node->next;
-        node->next = NULL;
-        TX_POOL.tx_num--;
-
-        if (!head) {
-            head = node;
-        } else {
-            tail->next = node;
-        }
-        tail = node;
-        count++;
-        block_size += 4 + tx_len;
-    }
-
-    pthread_mutex_unlock(&TX_POOL.mtx);
-    if (out_num) *out_num = count;
-    return head;
-}
-
-static void tx_pool_remove_by_sig(const signature_t sig) {
-    pthread_mutex_lock(&TX_POOL.mtx);
-    tx_list_node* prev = NULL;
-    tx_list_node* cur = TX_POOL.txs;
-    while (cur) {
-        tx* t = cur->transaction;
-        if (t && memcmp(t->signature, sig, crypto_sign_BYTES) == 0) {
-            tx_list_node* victim = cur;
-            if (prev) {
-                prev->next = cur->next;
-            } else {
-                TX_POOL.txs = cur->next;
-            }
-            cur = cur->next;
-            victim->next = NULL;
-            victim->transaction = NULL;
-            free(victim);
-            TX_POOL.tx_num--;
-            tx_destroy_pool_owned(t);
-            continue;
-        }
-        prev = cur;
-        cur = cur->next;
-    }
-    pthread_mutex_unlock(&TX_POOL.mtx);
-}
-
-static int tx_block_wire_hash(const tx* t, uint8_t out[32]) {
-    if (!t || !out) return -1;
-    if (!t->accounts || t->accounts_num == 0) return -2;
-
-    crypto_generichash_state st;
-    if (crypto_generichash_init(&st, NULL, 0, 32) != 0) return -3;
-
-    const uint8_t version = 1;
-    crypto_generichash_update(&st, &version, 1);
-    crypto_generichash_update(&st, t->signature, crypto_sign_BYTES);
-
-    uint8_t b8[8];
-    store_u64_le(b8, t->expire);
-    crypto_generichash_update(&st, b8, sizeof b8);
-
-    crypto_generichash_update(&st, &t->function_id, 1);
-
-    uint8_t b4[4];
-    store_u32_le(b4, t->accounts_num);
-    crypto_generichash_update(&st, b4, sizeof b4);
-
-    account_list_node* cur = t->accounts;
-    uint32_t count = 0;
-    while (cur && count < t->accounts_num) {
-        if (!cur->acc) {
-            sodium_memzero(&st, sizeof st);
-            return -4;
-        }
-        crypto_generichash_update(&st, cur->acc->pub_key, crypto_sign_PUBLICKEYBYTES);
-        cur = cur->next;
-        count++;
-    }
-    if (count != t->accounts_num || cur != NULL) {
-        sodium_memzero(&st, sizeof st);
-        return -5;
-    }
-
-    uint32_t data_len = 0;
-    if (t->data) {
-        if (t->data->data_len > TX_DATA_MAX_SIZE) {
-            sodium_memzero(&st, sizeof st);
-            return -6;
-        }
-        data_len = t->data->data_len;
-    }
-    store_u32_le(b4, data_len);
-    crypto_generichash_update(&st, b4, sizeof b4);
-    if (data_len > 0) {
-        crypto_generichash_update(&st, t->data->data, data_len);
-    }
-
-    crypto_generichash_final(&st, out, 32);
-    sodium_memzero(&st, sizeof st);
-    return 0;
-}
-
-static int block_hash(const block* b, uint8_t out[32]) {
-    if (!b || !out) return -1;
-    crypto_generichash_state st;
-    if (crypto_generichash_init(&st, NULL, 0, 32) != 0) return -2;
-
-    uint8_t b8[8];
-    store_u64_le(b8, b->chain_id);
-    crypto_generichash_update(&st, b8, sizeof b8);
-    store_u64_le(b8, b->slot);
-    crypto_generichash_update(&st, b8, sizeof b8);
-    store_u64_le(b8, b->prev_id);
-    crypto_generichash_update(&st, b8, sizeof b8);
-
-    crypto_generichash_update(&st, b->proposer, crypto_sign_PUBLICKEYBYTES);
-
-    tx_list_node* cur = b->txs;
-    while (cur) {
-        uint8_t h[32];
-        if (!cur->transaction || tx_block_wire_hash(cur->transaction, h) < 0) {
-            sodium_memzero(&st, sizeof st);
-            return -3;
-        }
-        crypto_generichash_update(&st, h, sizeof h);
-        cur = cur->next;
-    }
-
-    crypto_generichash_final(&st, out, 32);
-    sodium_memzero(&st, sizeof st);
-    return 0;
-}
-
-static uint64_t block_id_from_hash(const uint8_t hash[32]) {
-    uint64_t id = load_u64_le(hash);
-    return (id == 0) ? 1 : id;
-}
-
-static int validator_eligible(const pub_key_t pub_key, uint64_t balance,
-                              uint64_t slot, uint64_t prev_id, uint64_t chain_id,
-                              uint64_t last_commit_time) {
-    if (!pub_key) return 0;
-
-    uint64_t slot_time = slot * CONSENSUS_SLOT_SECS;
-    if (last_commit_time == 0 ||
-        (slot_time >= last_commit_time &&
-         (slot_time - last_commit_time) >= CONSENSUS_EMPTY_BLOCK_SECS)) {
-        return 1;
-    }
-
-    if (balance == 0) return 0;
-    uint8_t buf[8 + 8 + 8 + crypto_sign_PUBLICKEYBYTES];
-    size_t off = 0;
-    store_u64_le(&buf[off], chain_id);
-    off += 8;
-    store_u64_le(&buf[off], prev_id);
-    off += 8;
-    store_u64_le(&buf[off], slot);
-    off += 8;
-    memcpy(&buf[off], pub_key, crypto_sign_PUBLICKEYBYTES);
-    off += crypto_sign_PUBLICKEYBYTES;
-
-    uint8_t hash[32];
-    crypto_generichash(hash, sizeof(hash), buf, off, NULL, 0);
-    uint64_t h = load_u64_le(hash);
-
-    uint64_t scale = UINT64_MAX / CONSENSUS_PROB_DENOM;
-    if (scale == 0) scale = 1;
-    uint64_t threshold = (balance >= CONSENSUS_PROB_DENOM) ? UINT64_MAX : (balance * scale);
-    return h <= threshold;
-}
-
-static int is_bootstrap_genesis_locked(blockchain* bc, const pub_key_t pub_key) {
-    if (!bc || !pub_key) return 0;
-    if (bc->height != 0) return 0;
-    if (bc->tip && bc->tip->id != 0) return 0;
-    return memcmp(pub_key, bc->genesis_pub, crypto_sign_PUBLICKEYBYTES) == 0;
-}
-
-static uint64_t current_slot(void) {
-    return network_time_now() / CONSENSUS_SLOT_SECS;
-}
-
-static int block_encode(const block* b, uint8_t* out, size_t* out_len) {
-    if (!b || !out_len) return -1;
-
-    size_t total = 1 + 8 + 8 + 8 + crypto_sign_PUBLICKEYBYTES + 4;
-    uint32_t count = 0;
-    tx_list_node* cur = b->txs;
-    while (cur) {
-        size_t tx_len = 0;
-        if (!cur->transaction || encode_tx(cur->transaction, NULL, &tx_len) < 0) return -2;
-        total += 4 + tx_len;
-        count++;
-        cur = cur->next;
-    }
-    total += crypto_sign_BYTES;
-
-    if (!out) {
-        *out_len = total;
+    ac_account_t me;
+    int has = ac_state_get(ac_chain_state(cs->chain), &cs->my_addr, &me);
+    if (!has || me.stake < AC_MIN_STAKE_UCRD) {
+        ac_chain_unlock(cs->chain);
         return 0;
     }
-    if (*out_len < total) {
-        *out_len = total;
-        return -3;
-    }
 
-    size_t off = 0;
-    out[off++] = CONSENSUS_BLOCK_VERSION;
-    store_u64_le(&out[off], b->chain_id);
-    off += 8;
-    store_u64_le(&out[off], b->slot);
-    off += 8;
-    store_u64_le(&out[off], b->prev_id);
-    off += 8;
-    memcpy(&out[off], b->proposer, crypto_sign_PUBLICKEYBYTES);
-    off += crypto_sign_PUBLICKEYBYTES;
-    store_u32_le(&out[off], count);
-    off += 4;
+    ac_hash_t seed;
+    ac_chain_epoch_seed(cs->chain, ac_epoch_of(slot), &seed);
 
-    cur = b->txs;
-    while (cur) {
-        size_t tx_len = 0;
-        encode_tx(cur->transaction, NULL, &tx_len);
-        store_u32_le(&out[off], (uint32_t)tx_len);
-        off += 4;
-        size_t cap = tx_len;
-        if (encode_tx(cur->transaction, &out[off], &cap) < 0) return -4;
-        off += tx_len;
-        cur = cur->next;
-    }
+    uint8_t alpha[64];
+    int an = leader_alpha(alpha, &seed, slot);
 
-    memcpy(&out[off], b->signature, crypto_sign_BYTES);
-    off += crypto_sign_BYTES;
+    ac_vrf_prove(out_proof, NULL, alpha, (size_t)an, &cs->kp);
 
-    *out_len = off;
-    return 0;
+    /* In v1 we use a simple eligibility threshold: probability per active
+     * validator = 2 / |active_set|, targeting ~2 leader candidates per slot.
+     * If the VRF output's first 8 bytes (interpreted as uniform [0,1)) fall
+     * below the threshold, we consider ourselves a candidate. */
+    size_t nactive = ac_chain_active_count(cs->chain);
+    ac_chain_unlock(cs->chain);
+    if (nactive == 0) return 0;
+
+    ac_vrf_out_t beta;
+    ac_vrf_proof_t tmp = *out_proof;
+    ac_vrf_verify(&beta, &tmp, alpha, (size_t)an, cs->kp.pk);
+
+    long double p = (long double)2.0L / (long double)nactive;
+    if (p > 1.0L) p = 1.0L;
+    long double thr = p * (long double)UINT64_MAX;
+    uint64_t draw = ac_rd64(beta.b);
+    return draw < (uint64_t)thr ? 1 : 0;
 }
 
-static int block_decode(const uint8_t* data, size_t len, block** out_block) {
-    if (!data || !out_block || len < 1 + crypto_sign_BYTES) return -1;
-    size_t off = 0;
-    if (data[off++] != CONSENSUS_BLOCK_VERSION) return -2;
+/* Returns 1 if `my_addr` is in the committee at `slot`. */
+static int am_i_committee(ac_consensus_t *cs, uint64_t slot, ac_vrf_proof_t *out_proof) {
+    ac_chain_lock(cs->chain);
 
-    if (off + 8 + 8 + 8 + crypto_sign_PUBLICKEYBYTES + 4 > len) return -3;
-    block* b = calloc(1, sizeof(*b));
-    if (!b) return -4;
-
-    b->chain_id = load_u64_le(&data[off]);
-    off += 8;
-    b->slot = load_u64_le(&data[off]);
-    off += 8;
-    b->prev_id = load_u64_le(&data[off]);
-    off += 8;
-    memcpy(b->proposer, &data[off], crypto_sign_PUBLICKEYBYTES);
-    off += crypto_sign_PUBLICKEYBYTES;
-    b->tx_num = load_u32_le(&data[off]);
-    off += 4;
-
-    tx_list_node* head = NULL;
-    tx_list_node* tail = NULL;
-
-    for (uint32_t i = 0; i < b->tx_num; i++) {
-        if (off + 4 > len) {
-            tx_list_destroy(head);
-            free(b);
-            return -5;
-        }
-        uint32_t tx_len = load_u32_le(&data[off]);
-        off += 4;
-        if (tx_len == 0 || off + tx_len > len) {
-            tx_list_destroy(head);
-            free(b);
-            return -6;
-        }
-        tx* t = calloc(1, sizeof(*t));
-        if (!t) {
-            tx_list_destroy(head);
-            free(b);
-            return -7;
-        }
-        if (decode_tx(t, (uint8_t*)&data[off], tx_len) < 0) {
-            free(t);
-            tx_list_destroy(head);
-            free(b);
-            return -8;
-        }
-        off += tx_len;
-
-        tx_list_node* node = calloc(1, sizeof(*node));
-        if (!node) {
-            free(t);
-            tx_list_destroy(head);
-            free(b);
-            return -9;
-        }
-        node->transaction = t;
-        if (!head) head = node;
-        else tail->next = node;
-        tail = node;
-    }
-
-    if (off + crypto_sign_BYTES > len) {
-        tx_list_destroy(head);
-        free(b);
-        return -10;
-    }
-    memcpy(b->signature, &data[off], crypto_sign_BYTES);
-    off += crypto_sign_BYTES;
-
-    if (off != len) {
-        tx_list_destroy(head);
-        free(b);
-        return -11;
-    }
-
-    b->txs = head;
-    *out_block = b;
-    return 0;
-}
-
-static int block_sign(block* b, const account* validator) {
-    if (!b || !validator) return -1;
-    uint8_t hash[32];
-    if (block_hash(b, hash) < 0) return -2;
-    if (crypto_sign_detached(b->signature, NULL, hash, sizeof hash, validator->priv_key) != 0) {
-        sodium_memzero(hash, sizeof hash);
-        return -3;
-    }
-    b->id = block_id_from_hash(hash);
-    sodium_memzero(hash, sizeof hash);
-    return 0;
-}
-
-static int block_verify(const block* b) {
-    if (!b) return -1;
-    uint8_t hash[32];
-    if (block_hash(b, hash) < 0) return -2;
-    if (crypto_sign_verify_detached(b->signature, hash, sizeof hash, b->proposer) != 0) {
-        sodium_memzero(hash, sizeof hash);
-        return -3;
-    }
-    uint64_t id = block_id_from_hash(hash);
-    sodium_memzero(hash, sizeof hash);
-    return (id == b->id) ? 0 : -4;
-}
-
-static uint64_t bc_get_balance_locked(blockchain* bc, const pub_key_t key) {
-    account_state_node* cur = bc->accounts;
-    while (cur) {
-        if (memcmp(cur->acc.pub_key, key, crypto_sign_PUBLICKEYBYTES) == 0) {
-            return cur->acc.balance;
-        }
-        cur = cur->next;
-    }
-    return 0;
-}
-
-static account* bc_get_or_create_locked(blockchain* bc, const pub_key_t key) {
-    account_state_node* cur = bc->accounts;
-    while (cur) {
-        if (memcmp(cur->acc.pub_key, key, crypto_sign_PUBLICKEYBYTES) == 0) {
-            return &cur->acc;
-        }
-        cur = cur->next;
-    }
-    account_state_node* node = calloc(1, sizeof(*node));
-    if (!node) return NULL;
-    memcpy(node->acc.pub_key, key, crypto_sign_PUBLICKEYBYTES);
-    node->acc.balance = 0;
-    node->next = bc->accounts;
-    bc->accounts = node;
-    return &node->acc;
-}
-
-static uint64_t temp_get_balance(temp_balance** head, blockchain* bc, const pub_key_t key) {
-    temp_balance* cur = *head;
-    while (cur) {
-        if (memcmp(cur->pub, key, crypto_sign_PUBLICKEYBYTES) == 0) return cur->balance;
-        cur = cur->next;
-    }
-    temp_balance* node = calloc(1, sizeof(*node));
-    if (!node) return 0;
-    memcpy(node->pub, key, crypto_sign_PUBLICKEYBYTES);
-    node->balance = bc_get_balance_locked(bc, key);
-    node->next = *head;
-    *head = node;
-    return node->balance;
-}
-
-static int temp_set_balance(temp_balance** head, const pub_key_t key, uint64_t balance) {
-    temp_balance* cur = *head;
-    while (cur) {
-        if (memcmp(cur->pub, key, crypto_sign_PUBLICKEYBYTES) == 0) {
-            cur->balance = balance;
-            return 0;
-        }
-        cur = cur->next;
-    }
-    temp_balance* node = calloc(1, sizeof(*node));
-    if (!node) return -1;
-    memcpy(node->pub, key, crypto_sign_PUBLICKEYBYTES);
-    node->balance = balance;
-    node->next = *head;
-    *head = node;
-    return 0;
-}
-
-static void temp_balance_free(temp_balance* head) {
-    while (head) {
-        temp_balance* next = head->next;
-        free(head);
-        head = next;
-    }
-}
-
-static int validate_block_txs(blockchain* bc, const block* b) {
-    if (!bc || !b) return -1;
-    uint64_t now = network_time_now();
-
-    pthread_mutex_lock(&bc->mtx);
-    temp_balance* temp = NULL;
-    tx_list_node* cur = b->txs;
-    while (cur) {
-        tx* t = cur->transaction;
-        if (!t || t->expire <= now || verify_tx(t) < 0) {
-            temp_balance_free(temp);
-            pthread_mutex_unlock(&bc->mtx);
-            return -2;
-        }
-
-        if (t->function_id == 1) {
-            if (!t->accounts || !t->accounts->next || !t->data || t->data->data_len < sizeof(uint64_t)) {
-                temp_balance_free(temp);
-                pthread_mutex_unlock(&bc->mtx);
-                return -3;
-            }
-            uint64_t amount = 0;
-            memcpy(&amount, t->data->data, sizeof(uint64_t));
-
-            account* sender = t->accounts->acc;
-            account* receiver = t->accounts->next->acc;
-            if (!sender || !receiver) {
-                temp_balance_free(temp);
-                pthread_mutex_unlock(&bc->mtx);
-                return -4;
-            }
-            uint64_t sender_bal = temp_get_balance(&temp, bc, sender->pub_key);
-            if (sender_bal < amount) {
-                temp_balance_free(temp);
-                pthread_mutex_unlock(&bc->mtx);
-                return -5;
-            }
-            temp_set_balance(&temp, sender->pub_key, sender_bal - amount);
-            uint64_t recv_bal = temp_get_balance(&temp, bc, receiver->pub_key);
-            temp_set_balance(&temp, receiver->pub_key, recv_bal + amount);
-        } else if (t->function_id == 2) {
-            if (!t->signer ||
-                memcmp(t->signer->pub_key, bc->genesis_pub, crypto_sign_PUBLICKEYBYTES) != 0) {
-                temp_balance_free(temp);
-                pthread_mutex_unlock(&bc->mtx);
-                return -6;
-            }
-            if (!t->accounts || !t->accounts->next || !t->data ||
-                t->data->data_len < sizeof(uint64_t)) {
-                temp_balance_free(temp);
-                pthread_mutex_unlock(&bc->mtx);
-                return -7;
-            }
-            uint64_t amount = 0;
-            memcpy(&amount, t->data->data, sizeof(uint64_t));
-            account* receiver = t->accounts->next->acc;
-            if (!receiver) {
-                temp_balance_free(temp);
-                pthread_mutex_unlock(&bc->mtx);
-                return -8;
-            }
-            uint64_t recv_bal = temp_get_balance(&temp, bc, receiver->pub_key);
-            temp_set_balance(&temp, receiver->pub_key, recv_bal + amount);
-        }
-        cur = cur->next;
-    }
-    temp_balance_free(temp);
-    pthread_mutex_unlock(&bc->mtx);
-    return 0;
-}
-
-static int apply_block(blockchain* bc, block* b) {
-    if (!bc || !b) return -1;
-
-    pthread_mutex_lock(&bc->mtx);
-    b->prev_block = bc->tip;
-    bc->tip = b;
-    bc->height++;
-
-    tx_list_node* cur = b->txs;
-    while (cur) {
-        tx* t = cur->transaction;
-        if (!t) {
-            cur = cur->next;
-            continue;
-        }
-
-        if (t->function_id == 1) {
-            if (t->accounts && t->accounts->next && t->data && t->data->data_len >= sizeof(uint64_t)) {
-                uint64_t amount = 0;
-                memcpy(&amount, t->data->data, sizeof(uint64_t));
-                account* sender = bc_get_or_create_locked(bc, t->accounts->acc->pub_key);
-                account* receiver = bc_get_or_create_locked(bc, t->accounts->next->acc->pub_key);
-                if (sender && receiver && sender->balance >= amount) {
-                    sender->balance -= amount;
-                    receiver->balance += amount;
-                }
-            }
-        } else if (t->function_id == 2) {
-            if (t->signer &&
-                memcmp(t->signer->pub_key, bc->genesis_pub, crypto_sign_PUBLICKEYBYTES) == 0 &&
-                t->accounts && t->accounts->next && t->data &&
-                t->data->data_len >= sizeof(uint64_t)) {
-                uint64_t amount = 0;
-                memcpy(&amount, t->data->data, sizeof(uint64_t));
-                account* receiver = bc_get_or_create_locked(bc, t->accounts->next->acc->pub_key);
-                if (receiver) receiver->balance += amount;
-            }
-        }
-        t->confirmed = 1;
-        cur = cur->next;
-    }
-
-    uint64_t slot_time = (b->slot > (UINT64_MAX / CONSENSUS_SLOT_SECS))
-        ? UINT64_MAX
-        : (b->slot * CONSENSUS_SLOT_SECS);
-    bc->last_commit_time = slot_time;
-
-    pthread_mutex_unlock(&bc->mtx);
-    return 0;
-}
-
-static int consensus_add_pending(block* b) {
-    if (!b) return -1;
-    pending_block* pb = calloc(1, sizeof(*pb));
-    if (!pb) return -2;
-    pb->blk = b;
-    pb->id = b->id;
-    pb->slot = b->slot;
-    memcpy(pb->proposer, b->proposer, crypto_sign_PUBLICKEYBYTES);
-    pb->next = PENDING;
-    PENDING = pb;
-    return 0;
-}
-
-static int consensus_broadcast_block(const block* b) {
-    size_t len = 0;
-    if (block_encode(b, NULL, &len) < 0) return -1;
-    uint8_t* buf = malloc(len);
-    if (!buf) return -2;
-    size_t cap = len;
-    if (block_encode(b, buf, &cap) < 0) {
-        free(buf);
-        return -3;
-    }
-    int rc = network_broadcast_block(buf, cap);
-    free(buf);
-    return rc;
-}
-
-static int vote_encode(uint64_t chain_id, uint64_t block_id, uint64_t slot,
-                       const pub_key_t proposer, const account* voter,
-                       uint8_t* out, size_t* out_len) {
-    if (!out_len || !voter) return -1;
-    size_t total = 1 + 8 + 8 + 8 + crypto_sign_PUBLICKEYBYTES +
-        crypto_sign_PUBLICKEYBYTES + crypto_sign_BYTES;
-    if (!out) {
-        *out_len = total;
+    ac_account_t me;
+    int has = ac_state_get(ac_chain_state(cs->chain), &cs->my_addr, &me);
+    if (!has || me.stake < AC_MIN_STAKE_UCRD) {
+        ac_chain_unlock(cs->chain);
         return 0;
     }
-    if (*out_len < total) {
-        *out_len = total;
-        return -2;
-    }
 
-    size_t off = 0;
-    out[off++] = CONSENSUS_VOTE_VERSION;
-    store_u64_le(&out[off], chain_id);
-    off += 8;
-    store_u64_le(&out[off], block_id);
-    off += 8;
-    store_u64_le(&out[off], slot);
-    off += 8;
-    memcpy(&out[off], proposer, crypto_sign_PUBLICKEYBYTES);
-    off += crypto_sign_PUBLICKEYBYTES;
-    memcpy(&out[off], voter->pub_key, crypto_sign_PUBLICKEYBYTES);
-    off += crypto_sign_PUBLICKEYBYTES;
+    ac_hash_t seed;
+    ac_chain_epoch_seed(cs->chain, ac_epoch_of(slot), &seed);
+    uint64_t total_sqrt = ac_chain_total_sqrt_stake(cs->chain);
+    ac_chain_unlock(cs->chain);
 
-    if (crypto_sign_detached(&out[off], NULL, out, off, voter->priv_key) != 0) {
-        return -3;
-    }
-    off += crypto_sign_BYTES;
-    *out_len = off;
+    uint64_t sqrt_me = ac_isqrt_u64(me.stake);
+
+    uint8_t alpha[64];
+    int an = committee_alpha(alpha, &seed, slot);
+    ac_vrf_prove(out_proof, NULL, alpha, (size_t)an, &cs->kp);
+
+    ac_vrf_out_t beta;
+    ac_vrf_proof_t tmp = *out_proof;
+    ac_vrf_verify(&beta, &tmp, alpha, (size_t)an, cs->kp.pk);
+    uint64_t draw = ac_rd64(beta.b);
+
+    return committee_eligible(draw, sqrt_me, total_sqrt);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Vote wire format.                                                          */
+/* -------------------------------------------------------------------------- */
+
+static void vote_encode(uint8_t out[AC_VOTE_WIRE_LEN],
+                        uint64_t height,
+                        const ac_hash_t *block_hash,
+                        const ac_addr_t *signer,
+                        const ac_sig_t  *sig,
+                        const ac_vrf_proof_t *proof) {
+    size_t pos = 0;
+    ac_be64(out + pos, height); pos += 8;
+    memcpy(out + pos, block_hash->b, AC_HASH_SIZE); pos += AC_HASH_SIZE;
+    memcpy(out + pos, signer->b,     AC_PUBKEY_SIZE); pos += AC_PUBKEY_SIZE;
+    memcpy(out + pos, sig->b,        AC_SIG_SIZE);    pos += AC_SIG_SIZE;
+    memcpy(out + pos, proof->b,      AC_VRF_PROOF_SIZE);
+}
+
+static int vote_decode(const uint8_t *buf, size_t len,
+                       uint64_t *height,
+                       ac_hash_t *block_hash,
+                       ac_addr_t *signer,
+                       ac_sig_t *sig,
+                       ac_vrf_proof_t *proof) {
+    if (len != AC_VOTE_WIRE_LEN) return -1;
+    size_t pos = 0;
+    *height = ac_rd64(buf + pos); pos += 8;
+    memcpy(block_hash->b, buf + pos, AC_HASH_SIZE); pos += AC_HASH_SIZE;
+    memcpy(signer->b,     buf + pos, AC_PUBKEY_SIZE); pos += AC_PUBKEY_SIZE;
+    memcpy(sig->b,        buf + pos, AC_SIG_SIZE);    pos += AC_SIG_SIZE;
+    memcpy(proof->b,      buf + pos, AC_VRF_PROOF_SIZE);
     return 0;
 }
 
-static int consensus_broadcast_vote(const block* b) {
-    if (!b || !HAS_VALIDATOR) return -1;
-    size_t len = 0;
-    if (vote_encode(b->chain_id, b->id, b->slot, b->proposer, &CONS_VALIDATOR, NULL, &len) < 0) {
-        return -2;
+/* -------------------------------------------------------------------------- */
+/* Voting + commit threshold.                                                 */
+/* -------------------------------------------------------------------------- */
+
+static void our_vote(ac_consensus_t *cs, pending_t *p, const ac_vrf_proof_t *proof) {
+    if (p->we_voted) return;
+
+    LOG_D("consen.", "voting on h=%" PRIu64 " slot=%" PRIu64,
+          p->height, p->slot);
+
+    uint8_t vmsg[64];
+    int vn = ac_vote_message(vmsg, p->height, &p->block_hash);
+    ac_sig_t sig;
+    ac_sign(&sig, vmsg, (size_t)vn, &cs->kp);
+
+    /* Add to local set. */
+    if (p->nsigners < AC_COMMITTEE_MAX) {
+        ac_commit_signer_t *s = &p->signers[p->nsigners++];
+        s->signer = cs->my_addr;
+        s->sig    = sig;
+        memcpy(s->vrf_proof, proof->b, AC_VRF_PROOF_SIZE);
     }
-    uint8_t* buf = malloc(len);
-    if (!buf) return -3;
-    size_t cap = len;
-    if (vote_encode(b->chain_id, b->id, b->slot, b->proposer, &CONS_VALIDATOR, buf, &cap) < 0) {
-        free(buf);
-        return -4;
-    }
-    int rc = network_broadcast_vote(buf, cap);
-    free(buf);
-    return rc;
+    p->we_voted = true;
+
+    /* Broadcast. */
+    uint8_t wire[AC_VOTE_WIRE_LEN];
+    vote_encode(wire, p->height, &p->block_hash, &cs->my_addr, &sig, proof);
+    if (cs->bcast) cs->bcast(0x08, wire, sizeof(wire), cs->bcast_ctx);
 }
 
-static uint64_t consensus_total_online_stake(void) {
-    if (!CONS_CHAIN) return 0;
-    pub_key_t* peers = NULL;
-    size_t peer_count = network_peer_snapshot_pubkeys(&peers);
+/* If the pending block now meets the commit threshold, finalise it. */
+static void try_commit(ac_consensus_t *cs, pending_t *p) {
+    if (!p->occupied || p->committed) return;
 
-    uint64_t total = 0;
-    pthread_mutex_lock(&CONS_CHAIN->mtx);
-    if (HAS_VALIDATOR) {
-        total += bc_get_balance_locked(CONS_CHAIN, CONS_VALIDATOR.pub_key);
+    ac_chain_lock(cs->chain);
+    uint64_t total_sqrt = ac_chain_total_sqrt_stake(cs->chain);
+    if (total_sqrt == 0) { ac_chain_unlock(cs->chain); return; }
+
+    uint64_t sum_sqrt = 0;
+    for (uint32_t i = 0; i < p->nsigners; ++i) {
+        ac_account_t a;
+        ac_state_get(ac_chain_state(cs->chain), &p->signers[i].signer, &a);
+        if (a.stake >= AC_MIN_STAKE_UCRD) sum_sqrt += ac_isqrt_u64(a.stake);
     }
-    for (size_t i = 0; i < peer_count; i++) {
-        if (HAS_VALIDATOR &&
-            memcmp(peers[i], CONS_VALIDATOR.pub_key, crypto_sign_PUBLICKEYBYTES) == 0) {
-            continue;
+
+    if (sum_sqrt * 3 < total_sqrt * 2) { ac_chain_unlock(cs->chain); return; }
+
+    /* Move signers into the block and try to accept. */
+    p->block.signers = (ac_commit_signer_t *)calloc(p->nsigners, sizeof(ac_commit_signer_t));
+    if (!p->block.signers) { ac_chain_unlock(cs->chain); return; }
+    memcpy(p->block.signers, p->signers, p->nsigners * sizeof(ac_commit_signer_t));
+    p->block.nsigners = p->nsigners;
+
+    ac_accept_t r = ac_chain_accept_block(cs->chain, &p->block);
+    ac_chain_unlock(cs->chain);
+
+    if (r == AC_ACCEPT_OK || r == AC_ACCEPT_DUP) {
+        p->committed = true;
+        LOG_I("consen.", "committed h=%" PRIu64 " slot=%" PRIu64 " signers=%u (status=%s)",
+              p->height, p->slot, p->nsigners, ac_accept_str(r));
+        /* Remove included txs from mempool. */
+        for (uint32_t i = 0; i < p->block.tx_count; ++i) {
+            ac_hash_t h;
+            ac_tx_hash(&h, &p->block.txs[i]);
+            ac_mempool_remove(cs->mempool, &h);
         }
-        total += bc_get_balance_locked(CONS_CHAIN, peers[i]);
-    }
-    pthread_mutex_unlock(&CONS_CHAIN->mtx);
-
-    free(peers);
-    return total;
-}
-
-static uint64_t consensus_votes_stake(const pending_block* pb) {
-    if (!pb || !CONS_CHAIN) return 0;
-    uint64_t sum = 0;
-
-    pthread_mutex_lock(&CONS_CHAIN->mtx);
-    vote_entry* cur = pb->votes;
-    while (cur) {
-        sum += bc_get_balance_locked(CONS_CHAIN, cur->voter);
-        cur = cur->next;
-    }
-    pthread_mutex_unlock(&CONS_CHAIN->mtx);
-
-    return sum;
-}
-
-static int consensus_try_commit(pending_block* pb) {
-    if (!pb || !pb->blk) return -1;
-    if (pb->vote_count == 0) return 0;
-
-    uint64_t total_stake = consensus_total_online_stake();
-    uint64_t vote_stake = consensus_votes_stake(pb);
-    uint64_t needed_stake = (total_stake == 0) ? 0 : (total_stake / 2) + 1;
-    if (vote_stake < needed_stake) return 0;
-
-    if (validate_block_txs(CONS_CHAIN, pb->blk) < 0) return -2;
-    if (apply_block(CONS_CHAIN, pb->blk) < 0) return -3;
-
-    tx_list_node* cur = pb->blk->txs;
-    while (cur) {
-        if (cur->transaction) {
-            tx_pool_remove_by_sig(cur->transaction->signature);
-        }
-        cur = cur->next;
-    }
-
-    {
-        uint64_t height = 0;
-        pthread_mutex_lock(&CONS_CHAIN->mtx);
-        height = CONS_CHAIN->height;
-        pthread_mutex_unlock(&CONS_CHAIN->mtx);
-        log_info("block committed id=%llu height=%llu txs=%u stake=%llu/%llu",
-                 (unsigned long long)pb->blk->id,
-                 (unsigned long long)height,
-                 pb->blk->tx_num,
-                 (unsigned long long)vote_stake,
-                 (unsigned long long)needed_stake);
-    }
-
-    return 1;
-}
-
-static int consensus_accept_block(block* b) {
-    if (!b || !CONS_CHAIN) return -1;
-
-    uint64_t now_slot = current_slot();
-    if (b->slot + CONSENSUS_MAX_PAST_SLOTS < now_slot) return -2;
-    if (b->slot > now_slot + CONSENSUS_MAX_FUTURE_SLOTS) return -3;
-
-    if (b->chain_id != CONS_CHAIN->chain_id || b->chain_id == 0) return -4;
-
-    uint64_t prev_id = 0;
-    pthread_mutex_lock(&CONS_CHAIN->mtx);
-    if (CONS_CHAIN->tip) prev_id = CONS_CHAIN->tip->id;
-    pthread_mutex_unlock(&CONS_CHAIN->mtx);
-
-    if (b->prev_id != prev_id) return -5;
-
-    uint64_t balance = 0;
-    uint64_t last_commit_time = 0;
-    pthread_mutex_lock(&CONS_CHAIN->mtx);
-    balance = bc_get_balance_locked(CONS_CHAIN, b->proposer);
-    last_commit_time = CONS_CHAIN->last_commit_time;
-    int bootstrap_genesis = (b->prev_id == 0) ? is_bootstrap_genesis_locked(CONS_CHAIN, b->proposer) : 0;
-    pthread_mutex_unlock(&CONS_CHAIN->mtx);
-
-    if (!bootstrap_genesis &&
-        !validator_eligible(b->proposer, balance, b->slot, b->prev_id, b->chain_id, last_commit_time)) {
-        return -6;
-    }
-
-    if (block_verify(b) < 0) return -7;
-    if (validate_block_txs(CONS_CHAIN, b) < 0) return -8;
-
-    return 0;
-}
-
-static void consensus_handle_pending_block(block* b) {
-    uint64_t slot = b->slot;
-
-    pthread_mutex_lock(&CONS_MTX);
-    pending_prune_locked(current_slot());
-
-    pending_block* existing = pending_find_slot_locked(slot);
-    if (existing && existing->id == b->id) {
-        pthread_mutex_unlock(&CONS_MTX);
-        block_destroy(b);
-        return;
-    }
-
-    if (existing && b->id >= existing->id) {
-        pthread_mutex_unlock(&CONS_MTX);
-        block_destroy(b);
-        return;
-    }
-
-    if (existing && b->id < existing->id) {
-        pending_block* prev = NULL;
-        pending_block* cur = PENDING;
-        while (cur) {
-            if (cur == existing) {
-                if (prev) prev->next = cur->next;
-                else PENDING = cur->next;
-                pending_free_with_block(cur);
-                break;
+        /* Re-broadcast the fully-signed block so lagging peers can accept it
+         * directly without rebuilding the commit certificate from votes. */
+        if (cs->bcast) {
+            uint8_t *enc = NULL; size_t enc_len = 0;
+            if (ac_block_encode(&enc, &enc_len, &p->block) >= 0) {
+                cs->bcast(0x06, enc, enc_len, cs->bcast_ctx);
+                free(enc);
             }
-            prev = cur;
-            cur = cur->next;
+        }
+    } else {
+        LOG_W("consen.", "commit rejected h=%" PRIu64 ": %s", p->height, ac_accept_str(r));
+        /* Reset signers ownership to local array. */
+        free(p->block.signers);
+        p->block.signers = NULL;
+        p->block.nsigners = 0;
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Block proposal handler.                                                    */
+/* -------------------------------------------------------------------------- */
+
+void ac_consensus_handle_block(ac_consensus_t *cs, const uint8_t *buf, size_t len) {
+    ac_block_t b;
+    if (ac_block_decode(&b, buf, len) < 0) {
+        LOG_D("consen.", "decode block failed");
+        return;
+    }
+
+    /* Quick sanity: version, height, parent. */
+    if (b.header.version != AC_BLOCK_VERSION) { ac_block_free(&b); return; }
+
+    pthread_mutex_lock(&cs->mu);
+
+    ac_hash_t bh;
+    ac_block_hash(&bh, &b.header);
+
+    /* If we already have it, fold any external signers into our local set. */
+    pending_t *p = pending_find(cs, &bh);
+    if (p) {
+        /* Merge signers. */
+        for (uint32_t i = 0; i < b.nsigners; ++i) {
+            bool seen = false;
+            for (uint32_t j = 0; j < p->nsigners; ++j) {
+                if (ac_addr_eq(&p->signers[j].signer, &b.signers[i].signer)) { seen = true; break; }
+            }
+            if (!seen && p->nsigners < AC_COMMITTEE_MAX) {
+                p->signers[p->nsigners++] = b.signers[i];
+            }
+        }
+        ac_block_free(&b);
+        try_commit(cs, p);
+        pthread_mutex_unlock(&cs->mu);
+        return;
+    }
+
+    /* New proposal. Verify the proposer's VRF proof at least. */
+    ac_chain_lock(cs->chain);
+    uint64_t our_height = ac_chain_height(cs->chain);
+    if (b.header.height > our_height + 1) {
+        /* Future block: we're lagging. Request the gap. */
+        uint64_t target = b.header.height;
+        ac_chain_unlock(cs->chain);
+        ac_block_free(&b);
+        pthread_mutex_unlock(&cs->mu);
+        if (cs->bcast) {
+            uint8_t req[12];
+            ac_be64(req, our_height + 1);
+            uint32_t count = (uint32_t)(target - our_height);
+            if (count > 64) count = 64;
+            ac_be32(req + 8, count);
+            cs->bcast(AC_MSG_HEADERS_REQ, req, sizeof(req), cs->bcast_ctx);
+        }
+        return;
+    }
+    if (b.header.height != our_height + 1 ||
+        !ac_hash_eq(&b.header.parent_hash, ac_chain_tip_hash(cs->chain))) {
+        ac_chain_unlock(cs->chain);
+        ac_block_free(&b);
+        pthread_mutex_unlock(&cs->mu);
+        return;
+    }
+    ac_hash_t seed;
+    ac_chain_epoch_seed(cs->chain, ac_epoch_of(b.header.slot), &seed);
+    ac_chain_unlock(cs->chain);
+
+    uint8_t alpha[64];
+    int an = leader_alpha(alpha, &seed, b.header.slot);
+    ac_vrf_proof_t proof;
+    memcpy(proof.b, b.header.proposer_vrf_proof, AC_VRF_PROOF_SIZE);
+    ac_vrf_out_t beta;
+    if (!ac_vrf_verify(&beta, &proof, alpha, (size_t)an, b.header.proposer.b)) {
+        ac_block_free(&b);
+        pthread_mutex_unlock(&cs->mu);
+        return;
+    }
+
+    /* Stash. */
+    p = pending_alloc(cs);
+    p->height = b.header.height;
+    p->slot   = b.header.slot;
+    p->block_hash = bh;
+    p->block = b;
+    /* Move signers (b owned them; we now own the structure). */
+    p->nsigners = b.nsigners;
+    for (uint32_t i = 0; i < b.nsigners && i < AC_COMMITTEE_MAX; ++i) {
+        p->signers[i] = b.signers[i];
+    }
+    /* Detach signers from the embedded block (we keep them in p->signers). */
+    if (p->block.signers) { free(p->block.signers); p->block.signers = NULL; p->block.nsigners = 0; }
+
+    LOG_D("consen.", "received block h=%" PRIu64 " slot=%" PRIu64 " txs=%u",
+          b.header.height, b.header.slot, b.header.tx_count);
+
+    /* Vote if we're committee. */
+    if (cs->validator) {
+        ac_vrf_proof_t cproof;
+        if (am_i_committee(cs, b.header.slot, &cproof)) {
+            our_vote(cs, p, &cproof);
         }
     }
 
-    consensus_add_pending(b);
-    pending_block* pb = pending_find_locked(b->id);
-    if (pb && HAS_VALIDATOR) {
-        vote_add_locked(pb, CONS_VALIDATOR.pub_key);
+    try_commit(cs, p);
+    pthread_mutex_unlock(&cs->mu);
+}
+
+void ac_consensus_handle_vote(ac_consensus_t *cs, const uint8_t *buf, size_t len) {
+    uint64_t height = 0;
+    ac_hash_t bh;
+    ac_addr_t signer;
+    ac_sig_t  sig;
+    ac_vrf_proof_t proof;
+    if (vote_decode(buf, len, &height, &bh, &signer, &sig, &proof) < 0) return;
+
+    /* Verify signature over vote message. */
+    uint8_t vmsg[64];
+    int vn = ac_vote_message(vmsg, height, &bh);
+    if (!ac_verify(&sig, vmsg, (size_t)vn, signer.b)) return;
+
+    pthread_mutex_lock(&cs->mu);
+    pending_t *p = pending_find(cs, &bh);
+    if (!p) { pthread_mutex_unlock(&cs->mu); return; }
+
+    /* Verify VRF proof for committee membership at p->slot. */
+    ac_chain_lock(cs->chain);
+    ac_hash_t seed;
+    ac_chain_epoch_seed(cs->chain, ac_epoch_of(p->slot), &seed);
+    uint64_t total_sqrt = ac_chain_total_sqrt_stake(cs->chain);
+    ac_account_t sa;
+    ac_state_get(ac_chain_state(cs->chain), &signer, &sa);
+    ac_chain_unlock(cs->chain);
+
+    if (sa.stake < AC_MIN_STAKE_UCRD) { pthread_mutex_unlock(&cs->mu); return; }
+
+    uint8_t calpha[64];
+    int can = committee_alpha(calpha, &seed, p->slot);
+    ac_vrf_out_t beta;
+    if (!ac_vrf_verify(&beta, &proof, calpha, (size_t)can, signer.b)) {
+        pthread_mutex_unlock(&cs->mu); return;
     }
-    if (pb) {
-        int rc = consensus_try_commit(pb);
-        if (rc > 0) {
-            pending_remove_locked(pb->id);
+    uint64_t draw = ac_rd64(beta.b);
+    if (!committee_eligible(draw, ac_isqrt_u64(sa.stake), total_sqrt)) {
+        pthread_mutex_unlock(&cs->mu); return;
+    }
+
+    /* Append unless dup. */
+    for (uint32_t i = 0; i < p->nsigners; ++i) {
+        if (ac_addr_eq(&p->signers[i].signer, &signer)) {
+            pthread_mutex_unlock(&cs->mu); return;
         }
     }
-    pthread_mutex_unlock(&CONS_MTX);
+    if (p->nsigners < AC_COMMITTEE_MAX) {
+        p->signers[p->nsigners].signer = signer;
+        p->signers[p->nsigners].sig    = sig;
+        memcpy(p->signers[p->nsigners].vrf_proof, proof.b, AC_VRF_PROOF_SIZE);
+        p->nsigners++;
+    }
 
-    consensus_broadcast_vote(b);
+    try_commit(cs, p);
+    pthread_mutex_unlock(&cs->mu);
 }
 
-static void consensus_produce_block(void) {
-    if (!HAS_VALIDATOR || !CONS_CHAIN) return;
+/* -------------------------------------------------------------------------- */
+/* Slot timer thread.                                                         */
+/* -------------------------------------------------------------------------- */
 
-    pthread_mutex_lock(&CONS_CHAIN->mtx);
-    int chain_synced = CONS_CHAIN->synced;
-    pthread_mutex_unlock(&CONS_CHAIN->mtx);
-    if (!chain_synced) return;
+static void slot_routine(ac_consensus_t *cs, uint64_t slot) {
+    if (!cs->validator) return;
 
-    uint32_t pool_ready = tx_pool_count_ready();
-    if (pool_ready == 0) return;
+    ac_vrf_proof_t lproof;
+    if (!am_i_leader(cs, slot, &lproof)) return;
 
-    uint64_t slot = current_slot();
-    if (LAST_PRODUCED_SLOT == slot) return;
+    /* Take a tx snapshot from mempool. */
+    ac_tx_t *snap = (ac_tx_t *)calloc(256, sizeof(ac_tx_t));
+    if (!snap) return;
+    size_t n = ac_mempool_snapshot(cs->mempool, snap, 256);
+    /* Prune expired. */
+    ac_mempool_prune_expired(cs->mempool, slot);
 
-    pthread_mutex_lock(&CONS_CHAIN->mtx);
-    uint64_t prev_id = CONS_CHAIN->tip ? CONS_CHAIN->tip->id : 0;
-    uint64_t chain_id = CONS_CHAIN->chain_id;
-    uint64_t balance = bc_get_balance_locked(CONS_CHAIN, CONS_VALIDATOR.pub_key);
-    uint64_t last_commit_time = CONS_CHAIN->last_commit_time;
-    int bootstrap_genesis = (prev_id == 0) ? is_bootstrap_genesis_locked(CONS_CHAIN, CONS_VALIDATOR.pub_key) : 0;
-    pthread_mutex_unlock(&CONS_CHAIN->mtx);
+    ac_chain_lock(cs->chain);
+    ac_block_t b;
+    int rc = ac_chain_build_block(cs->chain, slot, &cs->kp, snap, (uint32_t)n, &b);
+    ac_chain_unlock(cs->chain);
+    free(snap);
 
-    uint64_t now = network_time_now();
-    uint64_t elapsed = 0;
-    if (last_commit_time == 0) elapsed = UINT64_MAX;
-    else if (now > last_commit_time) elapsed = now - last_commit_time;
-    else elapsed = 0;
-
-    if (pool_ready < CONSENSUS_MAX_TX && elapsed < CONSENSUS_EMPTY_BLOCK_SECS) {
-        return;
-    }
-
-    if (!bootstrap_genesis &&
-        !validator_eligible(CONS_VALIDATOR.pub_key, balance, slot, prev_id, chain_id, last_commit_time)) {
-        return;
-    }
-
-    pthread_mutex_lock(&CONS_MTX);
-    if (pending_find_slot_locked(slot)) {
-        pthread_mutex_unlock(&CONS_MTX);
-        return;
-    }
-    pthread_mutex_unlock(&CONS_MTX);
-
-    uint32_t tx_num = 0;
-    tx_list_node* txs = tx_pool_detach_for_block(CONSENSUS_MAX_TX, &tx_num);
-    if (!txs || tx_num == 0) return;
-
-    block* b = calloc(1, sizeof(*b));
-    if (!b) {
-        if (txs) tx_list_destroy(txs);
-        return;
-    }
-
-    b->chain_id = chain_id;
-    b->slot = slot;
-    b->prev_id = prev_id;
-    memcpy(b->proposer, CONS_VALIDATOR.pub_key, crypto_sign_PUBLICKEYBYTES);
-    b->txs = txs;
-    b->tx_num = tx_num;
-
-    if (block_sign(b, &CONS_VALIDATOR) < 0) {
-        block_destroy(b);
-        return;
-    }
-
-    LAST_PRODUCED_SLOT = slot;
-    log_info("block proposed id=%llu slot=%llu txs=%u",
-             (unsigned long long)b->id,
-             (unsigned long long)b->slot,
-             b->tx_num);
-    consensus_handle_pending_block(b);
-    consensus_broadcast_block(b);
-}
-
-static void* consensus_thread(void* arg) {
-    (void)arg;
-    while (CONS_RUNNING) {
-        consensus_produce_block();
-        struct timespec ts;
-        ts.tv_sec = 0;
-        ts.tv_nsec = 200 * 1000000L;
-        nanosleep(&ts, NULL);
-    }
-    return NULL;
-}
-
-int consensus_init(blockchain* bc) {
-    if (!bc) return -1;
-    CONS_CHAIN = bc;
-    CONS_RUNNING = 1;
-    if (pthread_create(&CONS_THREAD, NULL, consensus_thread, NULL) != 0) {
-        CONS_RUNNING = 0;
-        return -2;
-    }
-    return 0;
-}
-
-void consensus_shutdown(void) {
-    if (CONS_RUNNING) {
-        CONS_RUNNING = 0;
-        pthread_join(CONS_THREAD, NULL);
-    }
-}
-
-int consensus_set_validator(const account* validator) {
-    if (!validator) return -1;
-    memcpy(&CONS_VALIDATOR, validator, sizeof(CONS_VALIDATOR));
-    HAS_VALIDATOR = 1;
-    return 0;
-}
-
-int consensus_handle_block(const uint8_t* data, size_t len) {
-    block* b = NULL;
-    if (block_decode(data, len, &b) < 0) return -1;
-    uint8_t hash[32];
-    if (block_hash(b, hash) < 0) {
-        block_destroy(b);
-        return -2;
-    }
-    b->id = block_id_from_hash(hash);
-    sodium_memzero(hash, sizeof hash);
-
-    int rc = consensus_accept_block(b);
     if (rc < 0) {
-        log_warn("block rejected rc=%d id=%llu prev_id=%llu slot=%llu",
-                 rc,
-                 (unsigned long long)b->id,
-                 (unsigned long long)b->prev_id,
-                 (unsigned long long)b->slot);
-        block_destroy(b);
-        return -3;
+        return;
     }
 
-    consensus_handle_pending_block(b);
+    /* Replace VRF proof with the one we just computed (proves leader). */
+    memcpy(b.header.proposer_vrf_proof, lproof.b, AC_VRF_PROOF_SIZE);
 
+    pthread_mutex_lock(&cs->mu);
+    ac_hash_t bh;
+    ac_block_hash(&bh, &b.header);
+
+    /* Stash as pending. */
+    pending_t *p = pending_alloc(cs);
+    p->height = b.header.height;
+    p->slot   = slot;
+    p->block_hash = bh;
+    p->block = b;
+    p->nsigners = 0;
+    if (p->block.signers) { free(p->block.signers); p->block.signers = NULL; p->block.nsigners = 0; }
+
+    /* Add our own vote if we're committee. */
+    ac_vrf_proof_t cproof;
+    if (am_i_committee(cs, slot, &cproof)) {
+        our_vote(cs, p, &cproof);
+    }
+
+    /* Broadcast block (without commit cert). */
+    uint8_t *enc = NULL;
+    size_t enc_len = 0;
+    if (ac_block_encode(&enc, &enc_len, &p->block) >= 0) {
+        if (cs->bcast) cs->bcast(0x06, enc, enc_len, cs->bcast_ctx);
+        free(enc);
+    }
+
+    try_commit(cs, p);
+    pthread_mutex_unlock(&cs->mu);
+
+    LOG_I("consen.", "proposed block h=%" PRIu64 " slot=%" PRIu64 " txs=%u",
+          b.header.height, slot, b.header.tx_count);
+}
+
+static void *slot_loop(void *arg) {
+    ac_consensus_t *cs = (ac_consensus_t *)arg;
+
+    uint64_t genesis = ac_chain_genesis_time(cs->chain);
+    while (cs->running) {
+        uint64_t now = ac_now_ms();
+        if (now < genesis) { ac_sleep_ms(genesis - now); continue; }
+        uint64_t current_slot = (now - genesis) / AC_SLOT_DURATION_MS;
+        uint64_t next_start = genesis + (current_slot + 1) * AC_SLOT_DURATION_MS;
+        uint64_t sleep_ms = next_start > now ? next_start - now : 0;
+        ac_sleep_ms(sleep_ms);
+
+        slot_routine(cs, current_slot + 1);
+    }
+    return NULL;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Lifecycle.                                                                 */
+/* -------------------------------------------------------------------------- */
+
+ac_consensus_t *ac_consensus_new(const ac_consensus_config_t *cfg) {
+    if (!cfg || !cfg->chain || !cfg->mempool) return NULL;
+    ac_consensus_t *cs = (ac_consensus_t *)calloc(1, sizeof(*cs));
+    if (!cs) return NULL;
+    pthread_mutex_init(&cs->mu, NULL);
+    cs->chain     = cfg->chain;
+    cs->mempool   = cfg->mempool;
+    cs->kp        = cfg->keypair;
+    cs->bcast     = cfg->broadcast;
+    cs->bcast_ctx = cfg->broadcast_ctx;
+    cs->validator = cfg->validator;
+    memcpy(cs->my_addr.b, cfg->keypair.pk, AC_PUBKEY_SIZE);
+    return cs;
+}
+
+void ac_consensus_free(ac_consensus_t *cs) {
+    if (!cs) return;
+    if (cs->running) ac_consensus_stop(cs);
+    for (size_t i = 0; i < AC_PENDING_MAX; ++i) pending_init(&cs->pending[i]);
+    pthread_mutex_destroy(&cs->mu);
+    free(cs);
+}
+
+int ac_consensus_start(ac_consensus_t *cs) {
+    cs->running = true;
+    if (pthread_create(&cs->slot_thread, NULL, slot_loop, cs) != 0) {
+        cs->running = false;
+        return -1;
+    }
     return 0;
 }
 
-int consensus_handle_vote(const uint8_t* data, size_t len) {
-    if (!data || len < 1 + 8 + 8 + 8 + crypto_sign_PUBLICKEYBYTES * 2 + crypto_sign_BYTES) return -1;
-    size_t off = 0;
-    if (data[off++] != CONSENSUS_VOTE_VERSION) return -2;
-
-    uint64_t chain_id = load_u64_le(&data[off]);
-    off += 8;
-    uint64_t block_id = load_u64_le(&data[off]);
-    off += 8;
-    uint64_t slot = load_u64_le(&data[off]);
-    off += 8;
-    const uint8_t* proposer = &data[off];
-    off += crypto_sign_PUBLICKEYBYTES;
-    const uint8_t* voter = &data[off];
-    off += crypto_sign_PUBLICKEYBYTES;
-
-    const uint8_t* sig = &data[off];
-    size_t sign_len = off;
-    if (off + crypto_sign_BYTES != len) return -3;
-    if (crypto_sign_verify_detached(sig, data, sign_len, voter) != 0) return -4;
-
-    if (!CONS_CHAIN || chain_id != CONS_CHAIN->chain_id) return -5;
-
-    pthread_mutex_lock(&CONS_MTX);
-    pending_block* pb = pending_find_locked(block_id);
-    if (!pb || pb->slot != slot ||
-        memcmp(pb->proposer, proposer, crypto_sign_PUBLICKEYBYTES) != 0) {
-        pthread_mutex_unlock(&CONS_MTX);
-        return -7;
-    }
-
-    vote_add_locked(pb, voter);
-    int rc = consensus_try_commit(pb);
-    block* committed = NULL;
-    if (rc > 0) {
-        committed = pb->blk;
-        pending_remove_locked(pb->id);
-    }
-    pthread_mutex_unlock(&CONS_MTX);
-
-    if (committed) {
-        consensus_broadcast_vote(committed);
-    }
-
-    return 0;
+void ac_consensus_stop(ac_consensus_t *cs) {
+    cs->running = false;
+    pthread_join(cs->slot_thread, NULL);
 }

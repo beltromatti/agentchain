@@ -1,74 +1,83 @@
-#pragma once
-#ifndef CRYPTO_H
-#define CRYPTO_H
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-#include <stdint.h>
-#include <stddef.h>
-#include <string.h>
-#include <sodium.h>
-
-#include "types.h"
-
-/*
- * crypto.h
+/* AgentChain Engine — cryptographic primitives.
  *
- * Transaction signing / verification helpers (Ed25519) + canonical TX hash for signature.
- *
- * Notes:
- * - Requires libsodium initialized via `sodium_init()` once at program start.
- * - `account` is assumed to store:
- *     - pub_key[crypto_sign_PUBLICKEYBYTES]  (32 bytes)
- *     - priv_key[crypto_sign_SECRETKEYBYTES] (64 bytes)
- * - `tx` is assumed to store:
- *     - uint8_t signature[crypto_sign_BYTES] (64 bytes)
- *     - `signer` pointer to `account`
- *
- * Error codes are negative values (0 means success/valid).
+ * Wraps libsodium and implements the deterministic Ed25519-based VRF
+ * documented in PROTOCOL.md § 3.2.
  */
 
-/* =========================
- * Key management
- * ========================= */
+#ifndef AGENTCHAIN_CRYPTO_H
+#define AGENTCHAIN_CRYPTO_H
 
-/* Generates a fresh random keypair for account `a`.
- * Returns: 0 on success, <0 on error.
- */
-int generate_keys(account *a);
+#include "common.h"
 
-/* Deterministically generates a keypair from a 32-byte seed.
- * Returns: 0 on success, <0 on error.
- */
-int generate_keys_from_seed(account *a, const uint8_t seed[crypto_sign_SEEDBYTES]);
+/* One-time initialiser. Must be called before any other crypto function.
+ * Returns 0 on success. */
+int ac_crypto_init(void);
 
-/* Derives Ed25519 public key from a 64-byte secret key.
- * Returns: 0 on success, <0 on error.
- */
-int derive_pub_key(const uint8_t priv_key[crypto_sign_SECRETKEYBYTES],
-                   uint8_t pub_key_out[crypto_sign_PUBLICKEYBYTES]);
+/* -------------------------------------------------------------------------- */
+/* Key material.                                                              */
+/* -------------------------------------------------------------------------- */
 
-/* =========================
- * Transaction signing / verification
- * ========================= */
+typedef struct {
+    uint8_t pk[AC_PUBKEY_SIZE];
+    uint8_t sk[AC_PRIVKEY_SIZE];
+} ac_keypair_t;
 
-/* Signs transaction `t` using `signer` (must match `t->signer`).
- * Writes detached signature into `t->signature`.
- * Returns: 0 on success, <0 on error.
- */
-int sign_tx(tx *t, const account *signer);
+/* Generates a fresh keypair from the OS RNG. */
+int ac_keypair_random(ac_keypair_t *kp);
 
-/* Verifies detached signature of transaction `t` against `t->signer->pub_key`.
- * Returns:
- *   0  => valid
- *  <0  => invalid or error
- */
-int verify_tx(const tx *t);
+/* Derives a keypair from a 32-byte seed (deterministic). */
+int ac_keypair_from_seed(ac_keypair_t *kp, const uint8_t seed[AC_SEED_SIZE]);
 
-#ifdef __cplusplus
-}
-#endif
+/* Recovers the seed from an Ed25519 secret key (first 32 bytes by RFC 8032). */
+void ac_keypair_seed(uint8_t seed_out[AC_SEED_SIZE], const ac_keypair_t *kp);
 
-#endif /* CRYPTO_H */
+/* -------------------------------------------------------------------------- */
+/* Hash and signatures.                                                       */
+/* -------------------------------------------------------------------------- */
+
+/* BLAKE2b-256 keyless hash. Concatenates [chunks[i] for i in 0..n).
+ * `chunks` and `lens` parallel arrays of length `n`. */
+void ac_hash_multi(ac_hash_t *out,
+                   const uint8_t *const *chunks,
+                   const size_t *lens,
+                   size_t n);
+
+/* Convenience: single-chunk hash. */
+void ac_hash(ac_hash_t *out, const uint8_t *data, size_t len);
+
+/* Ed25519 sign. msg/len arbitrary. */
+void ac_sign(ac_sig_t *out, const uint8_t *msg, size_t len, const ac_keypair_t *kp);
+
+/* Ed25519 verify. Returns 1 on valid, 0 on invalid. */
+int ac_verify(const ac_sig_t *sig,
+              const uint8_t *msg, size_t len,
+              const uint8_t pk[AC_PUBKEY_SIZE]);
+
+/* -------------------------------------------------------------------------- */
+/* VRF (deterministic Ed25519-based, PROTOCOL § 3.2).                         */
+/* -------------------------------------------------------------------------- */
+
+typedef struct { uint8_t b[AC_VRF_PROOF_SIZE]; } ac_vrf_proof_t;
+typedef struct { uint8_t b[AC_VRF_OUT_SIZE];   } ac_vrf_out_t;
+
+/* Produce VRF proof and output for input alpha. */
+void ac_vrf_prove(ac_vrf_proof_t *proof,
+                  ac_vrf_out_t   *beta,
+                  const uint8_t  *alpha, size_t alpha_len,
+                  const ac_keypair_t *kp);
+
+/* Verify proof for input alpha against public key.
+ * On success writes beta and returns 1. On failure returns 0. */
+int ac_vrf_verify(ac_vrf_out_t  *beta,
+                  const ac_vrf_proof_t *proof,
+                  const uint8_t *alpha, size_t alpha_len,
+                  const uint8_t  pk[AC_PUBKEY_SIZE]);
+
+/* -------------------------------------------------------------------------- */
+/* Random.                                                                    */
+/* -------------------------------------------------------------------------- */
+
+void ac_random_bytes(uint8_t *out, size_t len);
+uint64_t ac_random_u64(void);
+
+#endif /* AGENTCHAIN_CRYPTO_H */

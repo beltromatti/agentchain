@@ -1,0 +1,28 @@
+# Quick-start: docker compose up --build
+# Brings up a single AgentChain node with persistent state.
+
+services:
+  agentchain:
+    build:
+      context: ../../
+      dockerfile: deploy/docker/Dockerfile
+    image: agentchain/engine:1.0.0
+    container_name: agentchain
+    restart: unless-stopped
+    ports:
+      - "30303:30303"   # P2P
+      - "30304:30304"   # JSON-RPC (only expose if you trust the network)
+    volumes:
+      - agentchain-data:/var/lib/agentchain
+      - ./genesis.txt:/etc/agentchain/genesis.txt:ro
+    command:
+      - node
+      - --data-dir=/var/lib/agentchain
+      - --port=30303
+      - --rpc-port=30304
+      - --rpc-host=0.0.0.0
+      - --seeds=seed1.agentchain.noesis.ai:30303,seed2.agentchain.noesis.ai:30303
+      - --validator
+
+volumes:
+  agentchain-data:

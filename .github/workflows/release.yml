@@ -1,0 +1,108 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x86_64
+            runner: ubuntu-22.04
+            artifact_suffix: linux-x86_64
+          - target: macos-x86_64
+            runner: macos-13
+            artifact_suffix: macos-x86_64
+          - target: macos-arm64
+            runner: macos-14
+            artifact_suffix: macos-arm64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install build deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake autoconf automake libtool pkg-config
+
+      - name: Install build deps (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install cmake autoconf automake libtool pkg-config
+
+      - name: Build static libsodium
+        run: |
+          set -euo pipefail
+          mkdir -p third_party
+          cd third_party
+          curl -fsSL https://download.libsodium.org/libsodium/releases/libsodium-1.0.20.tar.gz -o libsodium.tar.gz
+          tar xzf libsodium.tar.gz
+          cd libsodium-1.0.20
+          ./configure --prefix="$PWD/_install" --disable-shared --enable-static --with-pic
+          make -j
+          make install
+          echo "SODIUM_STATIC=$PWD/_install" >> "$GITHUB_ENV"
+
+      - name: Configure AgentChain (static sodium)
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSODIUM_INCLUDE_DIRS="$SODIUM_STATIC/include" \
+            -DSODIUM_LIBRARIES="$SODIUM_STATIC/lib/libsodium.a"
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Smoke test
+        run: |
+          ./build/agentchain version
+          ./build/agentchain --help
+
+      - name: Strip binary (Linux)
+        if: runner.os == 'Linux'
+        run: strip build/agentchain
+
+      - name: Strip binary (macOS)
+        if: runner.os == 'macOS'
+        run: strip build/agentchain
+
+      - name: Determine version
+        id: ver
+        run: echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Stage artefact
+        run: |
+          mkdir -p dist/agentchain-${{ steps.ver.outputs.version }}-${{ matrix.artifact_suffix }}
+          cp build/agentchain               dist/agentchain-${{ steps.ver.outputs.version }}-${{ matrix.artifact_suffix }}/
+          cp PROTOCOL.md README.md          dist/agentchain-${{ steps.ver.outputs.version }}-${{ matrix.artifact_suffix }}/
+          cp TECHNICAL-IMPLEMENTATION.md    dist/agentchain-${{ steps.ver.outputs.version }}-${{ matrix.artifact_suffix }}/
+          cp LICENSE                        dist/agentchain-${{ steps.ver.outputs.version }}-${{ matrix.artifact_suffix }}/
+          cp -r deploy                      dist/agentchain-${{ steps.ver.outputs.version }}-${{ matrix.artifact_suffix }}/
+          cd dist
+          tar czf agentchain-${{ steps.ver.outputs.version }}-${{ matrix.artifact_suffix }}.tar.gz \
+              agentchain-${{ steps.ver.outputs.version }}-${{ matrix.artifact_suffix }}
+          shasum -a 256 agentchain-${{ steps.ver.outputs.version }}-${{ matrix.artifact_suffix }}.tar.gz \
+              > agentchain-${{ steps.ver.outputs.version }}-${{ matrix.artifact_suffix }}.tar.gz.sha256
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.version }}
+          name: AgentChain ${{ steps.ver.outputs.version }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            dist/agentchain-${{ steps.ver.outputs.version }}-${{ matrix.artifact_suffix }}.tar.gz
+            dist/agentchain-${{ steps.ver.outputs.version }}-${{ matrix.artifact_suffix }}.tar.gz.sha256

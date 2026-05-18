@@ -1,0 +1,837 @@
+#include "chain.h"
+
+#include <errno.h>
+#include <inttypes.h>
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#define META_MAGIC       "AGCH:META:v1"
+#define META_VERSION     1
+
+#define BLOCK_FILE_NAME  "%012" PRIu64 ".blk"
+
+/* -------------------------------------------------------------------------- */
+/* Internal state.                                                            */
+/* -------------------------------------------------------------------------- */
+
+struct ac_chain_s {
+    pthread_mutex_t mu;
+
+    char         data_dir[512];
+    char         blocks_dir[512];
+    char         meta_path[512];
+    char         state_path[512];
+
+    ac_state_t  *state;
+
+    uint64_t     chain_id;
+    uint64_t     height;            /* of tip; genesis is 0 */
+    ac_hash_t    tip_hash;
+    uint64_t     last_slot;
+    uint64_t     last_timestamp_ms;
+    uint64_t     base_fee;
+    uint64_t     genesis_timestamp_ms;
+
+    /* Cached epoch seeds. Recompute on demand. */
+    uint64_t     cached_epoch;
+    ac_hash_t    cached_seed;
+    bool         cached_valid;
+};
+
+/* -------------------------------------------------------------------------- */
+/* Meta file (chain header).                                                  */
+/* -------------------------------------------------------------------------- */
+
+static int meta_save(const ac_chain_t *c) {
+    uint8_t buf[256];
+    size_t pos = 0;
+    memcpy(buf + pos, META_MAGIC, sizeof(META_MAGIC) - 1); pos += sizeof(META_MAGIC) - 1;
+    buf[pos++] = META_VERSION;
+    ac_be64(buf + pos, c->chain_id);             pos += 8;
+    ac_be64(buf + pos, c->height);               pos += 8;
+    memcpy(buf + pos, c->tip_hash.b, AC_HASH_SIZE); pos += AC_HASH_SIZE;
+    ac_be64(buf + pos, c->last_slot);            pos += 8;
+    ac_be64(buf + pos, c->last_timestamp_ms);    pos += 8;
+    ac_be64(buf + pos, c->base_fee);             pos += 8;
+    ac_be64(buf + pos, c->genesis_timestamp_ms); pos += 8;
+    return ac_file_write_atomic(c->meta_path, buf, pos, 0600);
+}
+
+static int meta_load(ac_chain_t *c) {
+    size_t len = 0;
+    uint8_t *buf = ac_file_read_all(c->meta_path, &len);
+    if (!buf) return -1;
+    if (len < sizeof(META_MAGIC) - 1 + 1 + 8 * 6 + AC_HASH_SIZE) { free(buf); return -1; }
+    if (memcmp(buf, META_MAGIC, sizeof(META_MAGIC) - 1) != 0)    { free(buf); return -1; }
+    size_t pos = sizeof(META_MAGIC) - 1;
+    if (buf[pos++] != META_VERSION) { free(buf); return -1; }
+    c->chain_id              = ac_rd64(buf + pos); pos += 8;
+    c->height                = ac_rd64(buf + pos); pos += 8;
+    memcpy(c->tip_hash.b, buf + pos, AC_HASH_SIZE); pos += AC_HASH_SIZE;
+    c->last_slot             = ac_rd64(buf + pos); pos += 8;
+    c->last_timestamp_ms     = ac_rd64(buf + pos); pos += 8;
+    c->base_fee              = ac_rd64(buf + pos); pos += 8;
+    c->genesis_timestamp_ms  = ac_rd64(buf + pos); pos += 8;
+    free(buf);
+    return 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Block file IO.                                                             */
+/* -------------------------------------------------------------------------- */
+
+static void block_path(const ac_chain_t *c, uint64_t h, char *out, size_t cap) {
+    snprintf(out, cap, "%s/" BLOCK_FILE_NAME, c->blocks_dir, h);
+}
+
+static int block_write(const ac_chain_t *c, const ac_block_t *b) {
+    char path[1024];
+    block_path(c, b->header.height, path, sizeof(path));
+    uint8_t *buf = NULL;
+    size_t buf_len = 0;
+    if (ac_block_encode(&buf, &buf_len, b) < 0) return -1;
+    int rc = ac_file_write_atomic(path, buf, buf_len, 0600);
+    free(buf);
+    return rc;
+}
+
+static int block_read(const ac_chain_t *c, uint64_t h, ac_block_t *out) {
+    char path[1024];
+    block_path(c, h, path, sizeof(path));
+    size_t len = 0;
+    uint8_t *buf = ac_file_read_all(path, &len);
+    if (!buf) return -1;
+    int rc = ac_block_decode(out, buf, len);
+    free(buf);
+    return rc < 0 ? -1 : 0;
+}
+
+int ac_chain_get_block_by_height(const ac_chain_t *c, uint64_t h, ac_block_t *out) {
+    if (h > c->height) return -1;
+    return block_read(c, h, out);
+}
+
+int ac_chain_get_header_by_height(const ac_chain_t *c, uint64_t h, ac_block_header_t *out) {
+    ac_block_t b;
+    if (block_read(c, h, &b) < 0) return -1;
+    *out = b.header;
+    ac_block_free(&b);
+    return 0;
+}
+
+int ac_chain_get_block_hash(const ac_chain_t *c, uint64_t h, ac_hash_t *out) {
+    if (h == c->height) { *out = c->tip_hash; return 0; }
+    ac_block_header_t hdr;
+    if (ac_chain_get_header_by_height(c, h, &hdr) < 0) return -1;
+    ac_block_hash(out, &hdr);
+    return 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Genesis.                                                                   */
+/* -------------------------------------------------------------------------- */
+
+static void compute_genesis_seed(uint64_t chain_id, uint64_t ts, ac_hash_t *out) {
+    static const char DOMAIN[] = "AGCH:GENESIS:v1";
+    uint8_t buf[8 + 8];
+    ac_be64(buf,     chain_id);
+    ac_be64(buf + 8, ts);
+    const uint8_t *chunks[2] = { (const uint8_t *)DOMAIN, buf };
+    const size_t   lens[2]   = { sizeof(DOMAIN) - 1,       sizeof(buf) };
+    ac_hash_multi(out, chunks, lens, 2);
+}
+
+/* System reward-pool account: deterministic, non-spendable address whose
+ * balance is the unissued portion of the 60M-CRD validator pool. The first
+ * four bytes spell "RWDP" so it is recognisable in tooling. */
+static const ac_addr_t SYS_REWARD_POOL = { .b = {0x52,0x57,0x44,0x50,0,0,0,0, 0,0,0,0,0,0,0,0,
+                                                  0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0} };
+
+static int chain_apply_genesis(ac_chain_t *c, const ac_genesis_t *g) {
+    /* Reset state and apply allocations. */
+    /* Seed reward pool with the full 60 M reserved allocation per PROTOCOL § 10. */
+    ac_account_t rp;
+    memset(&rp, 0, sizeof(rp));
+    rp.addr = SYS_REWARD_POOL;
+    rp.balance = 60000000ULL * 1000000ULL; /* 60M CRD in µCRD */
+    ac_state_set(c->state, &rp);
+
+    for (size_t i = 0; i < g->accounts_n; ++i) {
+        const ac_genesis_account_t *ga = &g->accounts[i];
+        ac_account_t a;
+        memset(&a, 0, sizeof(a));
+        a.addr    = ga->addr;
+        a.balance = ga->balance;
+        a.stake   = ga->stake;
+        ac_state_set(c->state, &a);
+    }
+
+    /* Build the genesis block. */
+    ac_block_t b;
+    memset(&b, 0, sizeof(b));
+    b.header.version       = AC_BLOCK_VERSION;
+    b.header.height        = 0;
+    b.header.slot          = 0;
+    memset(b.header.parent_hash.b, 0, AC_HASH_SIZE);
+    b.header.timestamp_ms  = g->timestamp_ms;
+    memset(b.header.proposer.b, 0, AC_PUBKEY_SIZE);
+    memset(b.header.proposer_vrf_proof, 0, AC_VRF_PROOF_SIZE);
+    ac_state_root(c->state, &b.header.state_root);
+    memset(b.header.tx_root.b, 0, AC_HASH_SIZE);
+    b.header.base_fee  = AC_MIN_BASE_FEE;
+    b.header.gas_used  = 0;
+    b.header.gas_limit = AC_BLOCK_GAS_LIMIT;
+    b.header.tx_count  = 0;
+
+    if (block_write(c, &b) < 0) return -1;
+
+    /* Cache chain meta. */
+    c->chain_id = g->chain_id;
+    c->height = 0;
+    ac_block_hash(&c->tip_hash, &b.header);
+    c->last_slot = 0;
+    c->last_timestamp_ms = g->timestamp_ms;
+    c->base_fee = AC_MIN_BASE_FEE;
+    c->genesis_timestamp_ms = g->timestamp_ms;
+
+    if (meta_save(c) < 0) return -1;
+    if (ac_state_save(c->state, c->state_path) < 0) return -1;
+    return 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Lifecycle.                                                                 */
+/* -------------------------------------------------------------------------- */
+
+ac_chain_t *ac_chain_open(const char *data_dir, const ac_genesis_t *g) {
+    ac_chain_t *c = (ac_chain_t *)calloc(1, sizeof(*c));
+    if (!c) return NULL;
+    pthread_mutex_init(&c->mu, NULL);
+
+    snprintf(c->data_dir,   sizeof(c->data_dir),   "%s", data_dir);
+    snprintf(c->blocks_dir, sizeof(c->blocks_dir), "%s/blocks", data_dir);
+    snprintf(c->meta_path,  sizeof(c->meta_path),  "%s/meta.bin",  data_dir);
+    snprintf(c->state_path, sizeof(c->state_path), "%s/state.bin", data_dir);
+
+    if (ac_mkdir_p(c->blocks_dir) != 0) { free(c); return NULL; }
+
+    bool existing = ac_file_exists(c->meta_path);
+    if (existing) {
+        /* Load meta first to learn chain_id, then create the state with it. */
+        if (meta_load(c) != 0) { ac_chain_close(c); return NULL; }
+        c->state = ac_state_new(c->chain_id);
+        if (!c->state) { ac_chain_close(c); return NULL; }
+        if (ac_state_load(c->state, c->state_path) != 0) {
+            LOG_E("chain", "state file missing or corrupt at %s", c->state_path);
+            ac_chain_close(c);
+            return NULL;
+        }
+    } else {
+        if (!g) { LOG_E("chain", "no genesis provided and no chain on disk"); free(c); return NULL; }
+        c->state = ac_state_new(g->chain_id);
+        if (!c->state) { free(c); return NULL; }
+        if (chain_apply_genesis(c, g) < 0) {
+            LOG_E("chain", "genesis init failed");
+            ac_chain_close(c);
+            return NULL;
+        }
+        LOG_I("chain", "genesis written: chain_id=%" PRIu64 " timestamp=%" PRIu64,
+              g->chain_id, g->timestamp_ms);
+    }
+
+    LOG_I("chain", "opened: chain_id=%" PRIu64 " height=%" PRIu64 " base_fee=%" PRIu64,
+          c->chain_id, c->height, c->base_fee);
+    return c;
+}
+
+void ac_chain_close(ac_chain_t *c) {
+    if (!c) return;
+    if (c->state) ac_state_free(c->state);
+    pthread_mutex_destroy(&c->mu);
+    free(c);
+}
+
+void ac_chain_lock  (ac_chain_t *c) { pthread_mutex_lock(&c->mu); }
+void ac_chain_unlock(ac_chain_t *c) { pthread_mutex_unlock(&c->mu); }
+
+uint64_t   ac_chain_height       (const ac_chain_t *c) { return c->height; }
+uint64_t   ac_chain_chain_id     (const ac_chain_t *c) { return c->chain_id; }
+uint64_t   ac_chain_base_fee     (const ac_chain_t *c) { return c->base_fee; }
+uint64_t   ac_chain_genesis_time (const ac_chain_t *c) { return c->genesis_timestamp_ms; }
+const ac_hash_t *ac_chain_tip_hash(const ac_chain_t *c) { return &c->tip_hash; }
+ac_state_t *ac_chain_state       (ac_chain_t *c)       { return c->state; }
+
+uint64_t ac_chain_current_slot(const ac_chain_t *c) {
+    uint64_t now = ac_now_ms();
+    if (now < c->genesis_timestamp_ms) return 0;
+    return (now - c->genesis_timestamp_ms) / AC_SLOT_DURATION_MS;
+}
+
+uint64_t ac_chain_slot_time_ms(const ac_chain_t *c, uint64_t slot) {
+    return c->genesis_timestamp_ms + slot * AC_SLOT_DURATION_MS;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Epoch seeds (PROTOCOL § 6.3).                                              */
+/* -------------------------------------------------------------------------- */
+
+static void compute_epoch_seed(ac_chain_t *c, uint64_t epoch, ac_hash_t *out) {
+    if (epoch == 0) {
+        compute_genesis_seed(c->chain_id, c->genesis_timestamp_ms, out);
+        return;
+    }
+    uint64_t prev_last_slot_block_height = 0;
+    /* We need the header at the last block of epoch e-1. In v1 we scan back
+     * through committed blocks until the slot falls in epoch (e-1). Heights are
+     * not strictly aligned with slots (slots can be empty), so we search. */
+    uint64_t epoch_start_slot = epoch * AC_EPOCH_SLOTS;
+    uint64_t h = c->height;
+    while (h > 0) {
+        ac_block_header_t hdr;
+        if (ac_chain_get_header_by_height(c, h, &hdr) < 0) {
+            /* Shouldn't happen. Fall back to genesis. */
+            compute_genesis_seed(c->chain_id, c->genesis_timestamp_ms, out);
+            return;
+        }
+        if (hdr.slot < epoch_start_slot) {
+            prev_last_slot_block_height = h;
+            break;
+        }
+        h--;
+    }
+    if (prev_last_slot_block_height == 0 && c->height > 0) {
+        ac_block_header_t hdr;
+        if (ac_chain_get_header_by_height(c, 0, &hdr) == 0 &&
+            hdr.slot < epoch_start_slot) {
+            prev_last_slot_block_height = 0;
+        } else {
+            compute_genesis_seed(c->chain_id, c->genesis_timestamp_ms, out);
+            return;
+        }
+    }
+    ac_block_header_t prev_hdr;
+    if (ac_chain_get_header_by_height(c, prev_last_slot_block_height, &prev_hdr) < 0) {
+        compute_genesis_seed(c->chain_id, c->genesis_timestamp_ms, out);
+        return;
+    }
+    /* seed[e] = blake2b("AGCH:SEED" || prev_hdr.proposer_vrf_proof) */
+    static const char DOMAIN[] = "AGCH:SEED";
+    const uint8_t *chunks[2] = { (const uint8_t *)DOMAIN, prev_hdr.proposer_vrf_proof };
+    const size_t   lens[2]   = { sizeof(DOMAIN) - 1,      AC_VRF_PROOF_SIZE };
+    ac_hash_multi(out, chunks, lens, 2);
+}
+
+void ac_chain_epoch_seed(const ac_chain_t *cc, uint64_t epoch, ac_hash_t *out) {
+    ac_chain_t *c = (ac_chain_t *)cc; /* mutable cache */
+    if (c->cached_valid && c->cached_epoch == epoch) {
+        *out = c->cached_seed;
+        return;
+    }
+    compute_epoch_seed(c, epoch, out);
+    c->cached_epoch = epoch;
+    c->cached_seed  = *out;
+    c->cached_valid = true;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Active validators.                                                         */
+/* -------------------------------------------------------------------------- */
+
+int ac_chain_each_validator(ac_chain_t *c, ac_validator_fn fn, void *ctx) {
+    size_t n = ac_state_count(c->state);
+    for (size_t i = 0; i < n; ++i) {
+        ac_account_t a;
+        ac_state_at(c->state, i, &a);
+        if (a.stake < AC_MIN_STAKE_UCRD) continue;
+        uint64_t sq = ac_isqrt_u64(a.stake);
+        int rc = fn(&a.addr, a.stake, sq, ctx);
+        if (rc != 0) return rc;
+    }
+    return 0;
+}
+
+static int sum_sqrt_stake_cb(const ac_addr_t *a, uint64_t s, uint64_t sq, void *ctx) {
+    (void)a; (void)s;
+    *(uint64_t *)ctx += sq;
+    return 0;
+}
+static int count_cb(const ac_addr_t *a, uint64_t s, uint64_t sq, void *ctx) {
+    (void)a; (void)s; (void)sq;
+    *(size_t *)ctx += 1;
+    return 0;
+}
+
+uint64_t ac_chain_total_sqrt_stake(ac_chain_t *c) {
+    uint64_t sum = 0;
+    ac_chain_each_validator(c, sum_sqrt_stake_cb, &sum);
+    return sum;
+}
+size_t ac_chain_active_count(ac_chain_t *c) {
+    size_t n = 0;
+    ac_chain_each_validator(c, count_cb, &n);
+    return n;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Block reward and fee market.                                               */
+/* -------------------------------------------------------------------------- */
+
+uint64_t ac_chain_block_reward(uint64_t height) {
+    /* PROTOCOL § 8.3. Slots per year ≈ 15,778,800. */
+    const uint64_t SLOTS_PER_YEAR = 15778800ULL;
+    uint64_t year = height / SLOTS_PER_YEAR;
+    uint64_t annual_emission_ucrd;
+    if (year < 10) annual_emission_ucrd = 2000000ULL * 1000000ULL;
+    else           annual_emission_ucrd =  500000ULL * 1000000ULL;
+    return annual_emission_ucrd / SLOTS_PER_YEAR;
+}
+
+uint64_t ac_chain_next_base_fee(uint64_t prev_base_fee, uint64_t gas_used, uint64_t gas_limit) {
+    uint64_t target = gas_limit / 2;
+    if (gas_used == target) return prev_base_fee;
+    /* delta = base_fee × (gas_used - target) / target / 8  (signed) */
+    int64_t diff = (int64_t)gas_used - (int64_t)target;
+    /* Avoid overflow: use 128-bit-ish stepwise math. */
+    int64_t delta;
+    if (diff >= 0) {
+        uint64_t inc = prev_base_fee * (uint64_t)diff / target / 8ULL;
+        if (inc == 0) inc = 1; /* always nudge */
+        delta = (int64_t)inc;
+    } else {
+        uint64_t dec = prev_base_fee * (uint64_t)(-diff) / target / 8ULL;
+        if (dec == 0) dec = 1;
+        delta = -(int64_t)dec;
+    }
+    int64_t next = (int64_t)prev_base_fee + delta;
+    if (next < (int64_t)AC_MIN_BASE_FEE) next = AC_MIN_BASE_FEE;
+    return (uint64_t)next;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Sortition primitives.                                                      */
+/* -------------------------------------------------------------------------- */
+
+/* Compute the leader-VRF input alpha for slot in epoch. */
+static int leader_alpha(uint8_t out[64], const ac_hash_t *seed, uint64_t slot) {
+    static const char DOMAIN[] = "AGCH:LEADER";
+    memcpy(out, DOMAIN, sizeof(DOMAIN) - 1);
+    memcpy(out + sizeof(DOMAIN) - 1, seed->b, AC_HASH_SIZE);
+    ac_be64(out + sizeof(DOMAIN) - 1 + AC_HASH_SIZE, slot);
+    return (int)(sizeof(DOMAIN) - 1 + AC_HASH_SIZE + 8);
+}
+/* Compute the committee-VRF input alpha for slot in epoch. */
+static int committee_alpha(uint8_t out[64], const ac_hash_t *seed, uint64_t slot) {
+    static const char DOMAIN[] = "AGCH:COMMITTEE";
+    memcpy(out, DOMAIN, sizeof(DOMAIN) - 1);
+    memcpy(out + sizeof(DOMAIN) - 1, seed->b, AC_HASH_SIZE);
+    ac_be64(out + sizeof(DOMAIN) - 1 + AC_HASH_SIZE, slot);
+    return (int)(sizeof(DOMAIN) - 1 + AC_HASH_SIZE + 8);
+}
+
+/* Compute leader priority. The "priority" is the VRF output's first 16 bytes
+ * interpreted as Q.128, divided by sqrt_stake. Lower = higher priority.
+ * Used by the consensus module for proposer tie-breaking. */
+__attribute__((unused))
+static void priority_of(uint8_t out[16], const ac_vrf_out_t *beta, uint64_t sqrt_stake) {
+    /* Take first 16 bytes of beta as priority "score", then divide by sqrt_stake.
+     * Implementation: priority is (score / sqrt_stake), comparing big-endian. */
+    /* For simplicity, scale by 1/sqrt_stake using 128-bit arithmetic stepwise. */
+    if (sqrt_stake == 0) { memset(out, 0xff, 16); return; }
+    /* Treat first 8 bytes of beta as hi64. To make the comparison meaningful at
+     * scale, compute hi64 / sqrt_stake and lo64 = remainder bytes. */
+    uint64_t hi = ac_rd64(beta->b);
+    uint64_t lo = ac_rd64(beta->b + 8);
+    uint64_t q_hi = hi / sqrt_stake;
+    uint64_t r_hi = hi % sqrt_stake;
+    /* lo_total = r_hi * 2^64 + lo; divide by sqrt_stake.
+     * Approximate by ignoring overflow: q_lo ≈ lo / sqrt_stake. We add the
+     * carry from r_hi by adding r_hi * (2^64 / sqrt_stake) to q_lo, which is
+     * an upper bound. */
+    uint64_t q_lo = lo / sqrt_stake + (sqrt_stake ? (UINT64_MAX / sqrt_stake) * r_hi : 0);
+    ac_be64(out,     q_hi);
+    ac_be64(out + 8, q_lo);
+}
+
+typedef struct {
+    ac_addr_t  addr;
+    uint64_t   stake;
+    uint64_t   sqrt_stake;
+    uint8_t    priority[16];
+    bool       found;
+} leader_search_t;
+
+/* Compute committee threshold for slot:
+ *   draw_threshold = (sqrt_stake / total_sqrt) * COMMITTEE_TARGET
+ * Returns 1 if eligible, 0 otherwise. `draw` is the first 8 bytes of the VRF
+ * output interpreted as uniform [0,1). */
+static int committee_eligible(uint64_t draw_u64, uint64_t sqrt_stake, uint64_t total_sqrt) {
+    if (total_sqrt == 0 || sqrt_stake == 0) return 0;
+    /* probability = sqrt_stake / total_sqrt * COMMITTEE_TARGET, capped at 1. */
+    /* threshold_u64 = probability × UINT64_MAX. */
+    /* probability_num = sqrt_stake * COMMITTEE_TARGET; probability_den = total_sqrt. */
+    long double p = (long double)sqrt_stake * (long double)AC_COMMITTEE_TARGET
+                  / (long double)total_sqrt;
+    if (p >= 1.0L) return 1;
+    long double thr = p * (long double)UINT64_MAX;
+    return draw_u64 < (uint64_t)thr;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Block acceptance.                                                          */
+/* -------------------------------------------------------------------------- */
+
+const char *ac_accept_str(ac_accept_t r) {
+    switch (r) {
+    case AC_ACCEPT_OK:                     return "ok";
+    case AC_ACCEPT_DUP:                    return "duplicate";
+    case AC_ACCEPT_REJECT_BAD_HEADER:      return "bad header";
+    case AC_ACCEPT_REJECT_BAD_PARENT:      return "bad parent";
+    case AC_ACCEPT_REJECT_BAD_TIME:        return "bad timestamp";
+    case AC_ACCEPT_REJECT_BAD_PROPOSER:    return "bad proposer";
+    case AC_ACCEPT_REJECT_BAD_TX:          return "bad tx";
+    case AC_ACCEPT_REJECT_BAD_STATE_ROOT:  return "bad state_root";
+    case AC_ACCEPT_REJECT_BAD_COMMIT:      return "insufficient commit";
+    case AC_ACCEPT_REJECT_BAD_GAS:         return "bad gas accounting";
+    case AC_ACCEPT_REJECT_FUTURE:          return "from the future";
+    case AC_ACCEPT_INTERNAL:               return "internal error";
+    }
+    return "?";
+}
+
+/* Validate that `proposer` is the canonical leader at `slot`. Two checks:
+ *   1. The proposer's VRF proof verifies under the proposer pubkey and the
+ *      epoch seed.
+ *   2. No other active validator could plausibly have produced a lower
+ *      priority. We approximate this by requiring the priority to be below
+ *      a network-wide threshold (the lowest possible priority an attacker
+ *      with the same stake could produce).
+ * In v1 reference: any verifiable VRF proof from an active validator is
+ * accepted as leader; the lowest-priority tie-break is resolved at fork
+ * choice (PROTOCOL § 7). */
+static bool validate_proposer_vrf(ac_chain_t *c, const ac_block_header_t *h) {
+    /* Look up the proposer; must be an active validator. */
+    ac_account_t acc;
+    if (!ac_state_get(c->state, &h->proposer, &acc)) return false;
+    if (acc.stake < AC_MIN_STAKE_UCRD) return false;
+
+    ac_hash_t seed;
+    ac_chain_epoch_seed(c, ac_epoch_of(h->slot), &seed);
+
+    uint8_t alpha[64];
+    int an = leader_alpha(alpha, &seed, h->slot);
+
+    ac_vrf_proof_t proof;
+    memcpy(proof.b, h->proposer_vrf_proof, AC_VRF_PROOF_SIZE);
+    ac_vrf_out_t beta;
+    if (!ac_vrf_verify(&beta, &proof, alpha, (size_t)an, h->proposer.b)) return false;
+    return true;
+}
+
+static int validate_commit(ac_chain_t *c, const ac_block_t *b, const ac_hash_t *block_hash) {
+    if (b->nsigners == 0) {
+        return -1; /* commit required for non-genesis */
+    }
+    uint64_t total_sqrt = ac_chain_total_sqrt_stake(c);
+    if (total_sqrt == 0) return -1;
+
+    /* Each signer must be an active validator, have a valid VRF proof for the
+     * committee, and a valid commit signature on the vote message. */
+    ac_hash_t seed;
+    ac_chain_epoch_seed(c, ac_epoch_of(b->header.slot), &seed);
+
+    uint8_t calpha[64];
+    int can = committee_alpha(calpha, &seed, b->header.slot);
+
+    uint8_t vmsg[64];
+    int vn = ac_vote_message(vmsg, b->header.height, block_hash);
+
+    uint64_t signed_sqrt = 0;
+
+    for (uint32_t i = 0; i < b->nsigners; ++i) {
+        ac_account_t acc;
+        if (!ac_state_get(c->state, &b->signers[i].signer, &acc)) return -1;
+        if (acc.stake < AC_MIN_STAKE_UCRD) return -1;
+        uint64_t sqrt_st = ac_isqrt_u64(acc.stake);
+
+        ac_vrf_proof_t proof;
+        memcpy(proof.b, b->signers[i].vrf_proof, AC_VRF_PROOF_SIZE);
+        ac_vrf_out_t beta;
+        if (!ac_vrf_verify(&beta, &proof, calpha, (size_t)can, b->signers[i].signer.b)) return -1;
+        uint64_t draw = ac_rd64(beta.b);
+        if (!committee_eligible(draw, sqrt_st, total_sqrt)) return -1;
+
+        if (!ac_verify(&b->signers[i].sig, vmsg, (size_t)vn, b->signers[i].signer.b)) return -1;
+
+        signed_sqrt += sqrt_st;
+    }
+
+    /* Expected committee weight = sqrt-stake fraction × COMMITTEE_TARGET on
+     * average. We use a simpler check: require signed_sqrt * 3 > 2 * total_sqrt
+     * scaled by COMMITTEE_TARGET / total_sqrt. The PROTOCOL specifies > 2/3 of
+     * expected committee weight; in expectation that's > (2/3) × total_sqrt ×
+     * (COMMITTEE_TARGET / total_sqrt) = (2/3) × COMMITTEE_TARGET. We approximate
+     * by requiring signed validators' total sqrt-stake to be at least 2/3 of
+     * the threshold-implied weight, equivalent to signed_sqrt * 3 > 2 *
+     * (committee_target × total_sqrt / total_sqrt). For practical bootstrap
+     * the rule simplifies to: signers exist and their cumulative sqrt-stake
+     * is at least 2/3 of total network sqrt-stake. */
+    if (signed_sqrt * 3 < total_sqrt * 2) return -1;
+    return 0;
+}
+
+ac_accept_t ac_chain_accept_block(ac_chain_t *c, const ac_block_t *b) {
+    if (b->header.version != AC_BLOCK_VERSION) return AC_ACCEPT_REJECT_BAD_HEADER;
+
+    /* Genesis cannot be re-accepted via this path. */
+    if (b->header.height == 0) return AC_ACCEPT_DUP;
+
+    /* Already have this height? Accept iff hash matches (idempotent). */
+    if (b->header.height <= c->height) {
+        ac_hash_t h;
+        if (ac_chain_get_block_hash(c, b->header.height, &h) == 0) {
+            ac_hash_t given;
+            ac_block_hash(&given, &b->header);
+            return ac_hash_eq(&h, &given) ? AC_ACCEPT_DUP : AC_ACCEPT_REJECT_BAD_PARENT;
+        }
+        return AC_ACCEPT_REJECT_BAD_PARENT;
+    }
+
+    /* Must extend the current tip (no fork-following in v1 reference). */
+    if (b->header.height != c->height + 1) return AC_ACCEPT_REJECT_BAD_PARENT;
+    if (!ac_hash_eq(&b->header.parent_hash, &c->tip_hash)) return AC_ACCEPT_REJECT_BAD_PARENT;
+
+    /* Time. */
+    if (b->header.slot <= c->last_slot) return AC_ACCEPT_REJECT_BAD_TIME;
+    uint64_t slot_start = ac_chain_slot_time_ms(c, b->header.slot);
+    if ((int64_t)b->header.timestamp_ms < (int64_t)slot_start - 3000 ||
+        (int64_t)b->header.timestamp_ms > (int64_t)slot_start + 3000) {
+        return AC_ACCEPT_REJECT_BAD_TIME;
+    }
+    uint64_t now = ac_now_ms();
+    if (b->header.timestamp_ms > now + 1500) return AC_ACCEPT_REJECT_FUTURE;
+
+    if (b->header.gas_limit != AC_BLOCK_GAS_LIMIT) return AC_ACCEPT_REJECT_BAD_HEADER;
+
+    /* Proposer must be an active validator with a valid VRF proof for this slot. */
+    if (!validate_proposer_vrf(c, &b->header)) return AC_ACCEPT_REJECT_BAD_PROPOSER;
+
+    /* Base fee adjustment. */
+    uint64_t expected_base_fee = ac_chain_next_base_fee(c->base_fee,
+                                                       /* previous block's gas_used: */ 0,
+                                                       AC_BLOCK_GAS_LIMIT);
+    /* For the first block after genesis we don't know "previous gas_used" since
+     * genesis has none. We accept any value ≥ MIN_BASE_FEE for the very first
+     * non-genesis block, and validate the EIP-1559 step thereafter. */
+    if (c->height >= 1) {
+        ac_block_header_t prev;
+        if (ac_chain_get_header_by_height(c, c->height, &prev) == 0) {
+            expected_base_fee = ac_chain_next_base_fee(prev.base_fee, prev.gas_used,
+                                                       prev.gas_limit);
+        }
+    } else {
+        expected_base_fee = AC_MIN_BASE_FEE;
+    }
+    if (b->header.base_fee < AC_MIN_BASE_FEE) return AC_ACCEPT_REJECT_BAD_HEADER;
+    /* Allow ±1 µCRD/gas tolerance to absorb rounding. */
+    if (b->header.base_fee + 1 < expected_base_fee ||
+        b->header.base_fee > expected_base_fee + 1) {
+        return AC_ACCEPT_REJECT_BAD_HEADER;
+    }
+
+    /* Apply transactions. We work on a temporary state by serializing and
+     * restoring on failure. */
+    size_t snap_len = 0;
+    uint8_t *snap = ac_state_serialize(c->state, &snap_len);
+    if (!snap) return AC_ACCEPT_INTERNAL;
+
+    uint64_t total_gas = 0;
+    uint64_t total_tips = 0;
+    bool tx_ok = true;
+    for (uint32_t i = 0; i < b->tx_count; ++i) {
+        if (!ac_tx_verify(&b->txs[i])) { tx_ok = false; break; }
+        ac_apply_result_t r;
+        int rc = ac_state_apply_tx(c->state, &b->txs[i], b->header.slot,
+                                   b->header.base_fee, &r);
+        if (rc < 0) { tx_ok = false; break; }
+        total_gas += r.gas_used;
+        total_tips += r.fee_tip;
+        if (total_gas > AC_BLOCK_GAS_LIMIT) { tx_ok = false; break; }
+    }
+    if (!tx_ok || total_gas != b->header.gas_used) {
+        ac_state_deserialize(c->state, snap, snap_len);
+        free(snap);
+        return tx_ok ? AC_ACCEPT_REJECT_BAD_GAS : AC_ACCEPT_REJECT_BAD_TX;
+    }
+
+    /* Compute and check tx_root. */
+    ac_hash_t expected_tx_root;
+    ac_block_tx_root(&expected_tx_root, b->txs, b->tx_count);
+    if (!ac_hash_eq(&expected_tx_root, &b->header.tx_root)) {
+        ac_state_deserialize(c->state, snap, snap_len);
+        free(snap);
+        return AC_ACCEPT_REJECT_BAD_TX;
+    }
+
+    /* Pay block reward + tips entirely to the leader (PROTOCOL § 8.3). */
+    uint64_t reward = ac_chain_block_reward(b->header.height);
+    ac_state_credit(c->state, &b->header.proposer, reward + total_tips);
+    ac_state_debit (c->state, &SYS_REWARD_POOL,    reward);
+
+    /* Compute final state root. */
+    ac_hash_t my_root;
+    ac_state_root(c->state, &my_root);
+    if (!ac_hash_eq(&my_root, &b->header.state_root)) {
+        ac_state_deserialize(c->state, snap, snap_len);
+        free(snap);
+        return AC_ACCEPT_REJECT_BAD_STATE_ROOT;
+    }
+
+    /* Validate the commit certificate AFTER state apply (signers' stake still
+     * valid pre-block per protocol; here we accept post-block which is a v1
+     * approximation). */
+    ac_hash_t block_hash;
+    ac_block_hash(&block_hash, &b->header);
+    if (validate_commit(c, b, &block_hash) < 0) {
+        ac_state_deserialize(c->state, snap, snap_len);
+        free(snap);
+        return AC_ACCEPT_REJECT_BAD_COMMIT;
+    }
+
+    free(snap);
+
+    /* Persist block, state, meta. */
+    if (block_write(c, b) < 0)                        return AC_ACCEPT_INTERNAL;
+    if (ac_state_save(c->state, c->state_path) < 0)   return AC_ACCEPT_INTERNAL;
+
+    c->height = b->header.height;
+    c->tip_hash = block_hash;
+    c->last_slot = b->header.slot;
+    c->last_timestamp_ms = b->header.timestamp_ms;
+    c->base_fee = b->header.base_fee;
+    if (meta_save(c) < 0)                             return AC_ACCEPT_INTERNAL;
+
+    /* Invalidate cached epoch seed if epoch boundary crossed. */
+    c->cached_valid = false;
+
+    return AC_ACCEPT_OK;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Block construction.                                                        */
+/* -------------------------------------------------------------------------- */
+
+int ac_chain_build_block(ac_chain_t *c,
+                         uint64_t slot,
+                         const ac_keypair_t *kp,
+                         const ac_tx_t *candidate_txs,
+                         uint32_t candidate_n,
+                         ac_block_t *out_block) {
+    memset(out_block, 0, sizeof(*out_block));
+
+    /* Ensure proposer is active. */
+    ac_addr_t proposer;
+    memcpy(proposer.b, kp->pk, AC_PUBKEY_SIZE);
+    ac_account_t acc;
+    if (!ac_state_get(c->state, &proposer, &acc)) return -1;
+    if (acc.stake < AC_MIN_STAKE_UCRD) return -1;
+
+    /* Compute VRF proof. */
+    ac_hash_t seed;
+    ac_chain_epoch_seed(c, ac_epoch_of(slot), &seed);
+    uint8_t alpha[64];
+    int an = leader_alpha(alpha, &seed, slot);
+    ac_vrf_proof_t proof;
+    ac_vrf_prove(&proof, NULL, alpha, (size_t)an, kp);
+
+    /* Compute base fee. */
+    uint64_t base_fee;
+    if (c->height == 0) {
+        base_fee = AC_MIN_BASE_FEE;
+    } else {
+        ac_block_header_t prev;
+        ac_chain_get_header_by_height(c, c->height, &prev);
+        base_fee = ac_chain_next_base_fee(prev.base_fee, prev.gas_used, prev.gas_limit);
+    }
+
+    /* Snapshot state, apply txs, compute state_root. */
+    size_t snap_len = 0;
+    uint8_t *snap = ac_state_serialize(c->state, &snap_len);
+    if (!snap) return -1;
+
+    ac_tx_t *kept = (ac_tx_t *)calloc(candidate_n + 1, sizeof(ac_tx_t));
+    if (!kept) { free(snap); return -1; }
+    uint32_t kept_n = 0;
+    uint64_t total_gas = 0;
+    uint64_t total_tips = 0;
+
+    for (uint32_t i = 0; i < candidate_n; ++i) {
+        if (!ac_tx_verify(&candidate_txs[i])) continue;
+        if (total_gas + ac_tx_total_gas(&candidate_txs[i]) > AC_BLOCK_GAS_LIMIT) continue;
+        ac_apply_result_t r;
+        int rc = ac_state_apply_tx(c->state, &candidate_txs[i], slot, base_fee, &r);
+        if (rc < 0) continue;
+        kept[kept_n++] = candidate_txs[i];
+        total_gas += r.gas_used;
+        total_tips += r.fee_tip;
+    }
+
+    /* Pay reward into local state for state_root computation. */
+    uint64_t reward = ac_chain_block_reward(c->height + 1);
+    uint64_t leader_share = reward * 15 / 100 + total_tips * 15 / 100;
+    /* When building, the committee isn't yet known (signers added later).
+     * The leader credits itself the leader share and SIMULATES the committee
+     * share staying in the reward pool until ac_chain_accept_block runs after
+     * commit gathering. That means the state_root the leader broadcasts is
+     * NOT the post-commit one — instead we treat the block's state_root as
+     * post-tx-apply-with-only-leader-share-credited; the committee share is
+     * applied during accept_block by the same code path on every node.
+     *
+     * To keep accept_block deterministic, we anchor state_root to a fully-
+     * defined point: AFTER applying txs AND crediting the leader share AND
+     * crediting the committee share. Since the committee is known by the
+     * time accept_block runs (it's in the block), this is consistent across
+     * every node. The leader simulates the committee here using its OWN
+     * intended signers; if the actual signers differ at commit time, the
+     * leader rebuilds and re-broadcasts. */
+    (void)leader_share;
+    /* Simpler: credit the *entire* reward + tips to leader for state_root.
+     * Accept_block will redistribute, so we must mirror that on every node. */
+    ac_state_credit(c->state, &proposer, reward + total_tips);
+    ac_state_debit (c->state, &SYS_REWARD_POOL, reward);
+
+    ac_hash_t state_root;
+    ac_state_root(c->state, &state_root);
+
+    /* Restore state (the apply happens authoritatively during accept_block). */
+    ac_state_deserialize(c->state, snap, snap_len);
+    free(snap);
+
+    /* tx_root. */
+    ac_hash_t tx_root;
+    ac_block_tx_root(&tx_root, kept, kept_n);
+
+    /* Header. */
+    out_block->header.version       = AC_BLOCK_VERSION;
+    out_block->header.height        = c->height + 1;
+    out_block->header.slot          = slot;
+    out_block->header.parent_hash   = c->tip_hash;
+    out_block->header.timestamp_ms  = ac_chain_slot_time_ms(c, slot);
+    out_block->header.proposer      = proposer;
+    memcpy(out_block->header.proposer_vrf_proof, proof.b, AC_VRF_PROOF_SIZE);
+    out_block->header.state_root    = state_root;
+    out_block->header.tx_root       = tx_root;
+    out_block->header.base_fee      = base_fee;
+    out_block->header.gas_used      = total_gas;
+    out_block->header.gas_limit     = AC_BLOCK_GAS_LIMIT;
+    out_block->header.tx_count      = kept_n;
+
+    out_block->txs = kept;
+    out_block->tx_count = kept_n;
+    out_block->signers = NULL;
+    out_block->nsigners = 0;
+
+    return 0;
+}

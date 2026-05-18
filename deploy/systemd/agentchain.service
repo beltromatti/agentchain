@@ -1,0 +1,38 @@
+[Unit]
+Description=AgentChain Engine — Layer-1 node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=agentchain
+Group=agentchain
+ExecStart=/usr/local/bin/agentchain node \
+    --data-dir   /var/lib/agentchain \
+    --genesis    /etc/agentchain/genesis.txt \
+    --port       30303 \
+    --rpc-port   30304 \
+    --seeds      seed1.agentchain.noesis.ai:30303,seed2.agentchain.noesis.ai:30303 \
+    --validator
+Restart=on-failure
+RestartSec=5s
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/var/lib/agentchain
+LimitNOFILE=65535
+
+# Resource limits — be a polite home guest
+MemoryHigh=256M
+MemoryMax=512M
+CPUQuota=50%
+
+[Install]
+WantedBy=multi-user.target

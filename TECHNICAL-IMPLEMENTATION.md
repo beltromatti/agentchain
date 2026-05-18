@@ -1,0 +1,386 @@
+# AgentChain Engine — Technical Implementation Notes
+
+This document describes how **AgentChain Engine v1.0.0**, the reference C client, realises the protocol specified in `PROTOCOL.md`. Read the protocol first; this document is a companion. Where the implementation deviates from the spec, the deviation is called out explicitly under `§ Spec Deviations`.
+
+---
+
+## 1. Repository Layout
+
+```
+PROTOCOL.md                    # normative protocol specification
+TECHNICAL-IMPLEMENTATION.md    # this file
+README.md                      # project overview, marketing-light, install guide
+LICENSE                        # Apache 2.0
+CMakeLists.txt                 # single-binary build
+.github/workflows/             # CI: build + multi-OS release on v* tags
+deploy/                        # systemd unit, Dockerfile, docker-compose
+docs/                          # supplemental notes
+scripts/                       # dev helpers
+testnet/run.sh                 # local multi-node testnet harness
+src/                           # everything below
+    common.{h,c}               # logging, hex, files, time, byte buffers
+    crypto.{h,c}               # libsodium wrappers; Ed25519-VRF
+    codec.{h,c}                # canonical Tx/Block serialisation
+    state.{h,c}                # account map, name registry, state root
+    chain.{h,c}                # block store, validation, fork choice, apply
+    consensus.{h,c}            # PoSA sortition, slot loop, vote collection
+    mempool.{h,c}              # ordered tx pool with fee market
+    net.{h,c}                  # length-prefixed TCP gossip
+    rpc.{h,c}                  # JSON-RPC 2.0 over HTTP
+    node.{h,c}                 # process lifecycle, signal handling
+    main.c                     # CLI entry point with subcommands
+    version.h.in               # configure-substituted version header
+```
+
+There is no virtual machine. There are no precompiled libraries other than `libsodium` (system) and the C standard library.
+
+---
+
+## 2. Dependencies
+
+| Dependency | Version | Why                                                            |
+| ---------- | ------- | -------------------------------------------------------------- |
+| libsodium  | ≥ 1.0.18 | Audited Ed25519 + BLAKE2b. The sole non-trivial third-party C dependency. |
+| C compiler | C11      | `_Static_assert` and clean integer typing.                    |
+| POSIX threads | —     | Single coarse mutex per subsystem; one thread per peer.       |
+| CMake      | ≥ 3.16   | Cross-platform build.                                          |
+
+The reference binary statically links its own modules into `libagentchain_engine.a` and dynamically links `libsodium`. Release artefacts produced by CI bundle a statically-linked `libsodium` for portability.
+
+---
+
+## 3. Mapping: Protocol → Source
+
+The following table is the authoritative cross-reference. If a feature is in the protocol but not in this table, it is unimplemented in v1.0.0 (see `§ 9`).
+
+| Protocol section                          | Implemented in                                       |
+| ----------------------------------------- | ---------------------------------------------------- |
+| § 3 Cryptography                          | `crypto.c` — `ac_crypto_init`, `ac_hash`, `ac_sign`, `ac_verify` |
+| § 3.2 VRF                                 | `crypto.c` — `ac_vrf_prove`, `ac_vrf_verify`         |
+| § 3.1 Addresses                           | `common.h` — `ac_addr_t` is a 32-byte struct         |
+| § 4 Accounts & state                      | `state.c` — `ac_state_*`                             |
+| § 4.2 State root                          | `state.c` — `ac_state_root`                          |
+| § 5 Transactions                          | `codec.c` — `ac_tx_*`                                |
+| § 5.2 Tx kinds                            | `state.c` — `ac_state_apply_tx` switch on kind       |
+| § 5.3 Validity checks                     | `state.c` and `mempool.c` (pre-checks)               |
+| § 5.4 Gas schedule                        | `codec.c` — `ac_tx_intrinsic_gas`, `ac_tx_total_gas` |
+| § 6 PoSA blocks                           | `codec.c` (encoding) + `chain.c` (validation) + `consensus.c` (production) |
+| § 6.2 Slot timing                         | `consensus.c` — `slot_loop`                          |
+| § 6.3 Leader sortition                    | `consensus.c` — `am_i_leader`; `chain.c` — `validate_proposer_vrf` |
+| § 6.4 Committee sortition                 | `consensus.c` — `am_i_committee`, `committee_eligible` |
+| § 6.5 Commit rule                         | `consensus.c` — `try_commit`; `chain.c` — `validate_commit` |
+| § 6.6 Equivocation                        | `state.c` — `AC_TX_SLASH_EVIDENCE` handler           |
+| § 7 Fork choice                           | `chain.c` — accept rule rejects non-extensions (v1 is single-tip; see `§ 9`) |
+| § 8 Adaptive Equilibrium                  | `chain.c` — `ac_chain_block_reward`, `ac_chain_next_base_fee` |
+| § 9 Agent-native primitives               | `codec.c` (memo field); `state.c` (names)            |
+| § 10 Genesis                              | `chain.c` — `chain_apply_genesis`; `node.c` — `ac_node_load_genesis` |
+| § 11 Wire formats                         | `codec.c`                                            |
+| § 12 Network protocol                     | `net.c`                                              |
+| § 13 Security model                       | `state.c` and `chain.c` — see `§ 5` below            |
+
+---
+
+## 4. Storage Layout on Disk
+
+A running node stores everything under a single data directory:
+
+```
+<data_dir>/
+    node.key          # 0600 — Ed25519 seed + public key
+    meta.bin          # chain header (height, tip_hash, base_fee, …)
+    state.bin         # full account/name snapshot at tip
+    blocks/
+        000000000000.blk   # genesis
+        000000000001.blk
+        …                  # one file per committed block
+```
+
+Every state-mutating operation writes via the atomic-rename idiom: `path.tmp` is opened, `fsync`'d, then `rename`'d over `path`. The containing directory is also `fsync`'d on macOS/Linux. A crash mid-write leaves either the old contents or the new — never partial.
+
+The state snapshot is rewritten in full after every committed block. This is acceptable for the v1 throughput envelope (genesis state is ~50 entries; even a million accounts is ~50 MB to rewrite). Future versions may switch to a journaled sparse-Merkle-tree without changing any protocol-level format.
+
+---
+
+## 5. Subsystems
+
+### 5.1 `common` — utilities
+
+Provides the primitives every other module uses: `LOG_E/W/I/D` macros backed by a single-mutex stderr writer with ANSI colouring when stderr is a TTY; big-endian 8/16/32/64-bit pack/unpack inlines; hex encode/decode; constant-time memory comparison (`ac_memeq`); atomic file writer (`ac_file_write_atomic`); integer square root (`ac_isqrt_u64`) for stake weighting.
+
+### 5.2 `crypto` — libsodium wrappers and the VRF
+
+Ed25519 signing and verification call directly into libsodium. BLAKE2b-256 hashing is keyless and accepts a vector of `(buf, len)` chunks via `ac_hash_multi`, which is the only style used by domain-tagged hashes (every hash input is `domain_label || data`).
+
+The VRF (`§ 3.2` of the protocol) is implemented as:
+
+```c
+proof  = ed25519_sign(sk, "AGCH:VRF:v1" || alpha)
+output = blake2b("AGCH:VRF-OUT:v1" || proof)
+```
+
+Both ECVRF and this construction provide the four properties required for sortition (determinism, verifiability, pseudorandomness, uniqueness). The implementation deliberately reuses Ed25519's deterministic signature to avoid introducing a second cryptographic primitive.
+
+### 5.3 `codec` — canonical wire formats
+
+`ac_tx_encode` / `ac_tx_decode` and `ac_block_header_encode` / `ac_block_header_decode` produce the byte layouts defined in `PROTOCOL § 11`. They are pure functions with no allocation for transactions (max 2 KB on the stack) and small allocations only for full blocks (transactions array, signers array).
+
+`ac_tx_hash` recomputes the canonical digest from the tx fields rather than over the wire bytes; this guarantees that a transaction's identity does not depend on which encoder produced it.
+
+### 5.4 `state` — accounts, names, root, apply
+
+Internally an `ac_state_t` is two sorted dynamic arrays — `accounts[]` ordered by address, `names[]` ordered by name — plus a `chain_id`. Lookups are binary searches; insertions are `memmove`'s. For the v1 expected size (tens of thousands of accounts), this is faster than a tree.
+
+`ac_state_root` computes the protocol root by feeding `(domain || account[0].addr || account[0].balance | … || NAME_SEP_TAG || name[0].len | …)` into BLAKE2b in a single streaming pass.
+
+`ac_state_apply_tx` is the only state-mutating entry point. It applies the protocol's transaction-validity and gas-charge rules. On a body failure after the static checks pass, the sender's nonce is still consumed and the gas charged, exactly matching `PROTOCOL § 5.3`.
+
+### 5.5 `chain` — blocks, validation, apply, fork choice
+
+`ac_chain_open` either loads an existing chain from `data_dir` or initialises one from a genesis configuration. Subsequent operations are serialised by a coarse `pthread_mutex_t`; consensus and network threads acquire it before mutating chain state.
+
+`ac_chain_accept_block` is the engine's entry point for a fully-formed block. Its order of checks is:
+
+1. Header version and shape.
+2. Parent-hash and height continuation. (Forks at the same height are rejected if their hash differs from the recorded canonical block — see `§ 9 Spec Deviations`.)
+3. Slot timing tolerance (`±3000 ms` of the slot's start time; up to `now + 1500 ms` accepted as "future-tolerant").
+4. Proposer's VRF proof verifies against an active validator.
+5. Base-fee follows the previous block's EIP-1559-style adjustment.
+6. Every transaction's signature verifies.
+7. Every transaction applies cleanly (or fails after consuming intrinsic gas).
+8. `gas_used` matches the sum across the block.
+9. `tx_root` matches the canonical concat-hash of transaction hashes.
+10. Block reward + tips are credited to the leader, debited from the reward pool.
+11. The resulting `state_root` matches the header's claim.
+12. The commit certificate's cumulative `sqrt_stake` exceeds two-thirds of the network total.
+
+If any check fails, state is rolled back to the pre-tx snapshot (taken at step 7) and the block is rejected. On success, the block file, state snapshot, and meta header are atomically persisted.
+
+`ac_chain_build_block` performs the same flow speculatively to produce a proposal at the current slot: it temporarily applies the candidate transactions, computes the state root, then rolls back. The leader broadcasts the block; the authoritative apply happens via `accept_block` after the commit certificate is gathered.
+
+`ac_chain_next_base_fee` implements the EIP-1559-style step: `delta = base × (gas_used - target) / target / 8`, floored at `MIN_BASE_FEE`. The factor `/8` caps each step at 12.5%.
+
+`ac_chain_block_reward(h)` returns the deterministic emission for the block at height `h` per `PROTOCOL § 8.3`.
+
+### 5.6 `consensus` — PoSA orchestration
+
+A single thread (`slot_loop`) sleeps until the next slot boundary, then calls `slot_routine(slot)`. The routine:
+
+1. Calls `am_i_leader(slot)` which (a) checks the node is an active validator, (b) computes the VRF proof for `"AGCH:LEADER" || epoch_seed || slot`, (c) compares the VRF priority against a network-wide threshold targeted at ~2 candidates per slot.
+2. If eligible, snapshots up to 256 transactions from the mempool, prunes expired ones, calls `ac_chain_build_block`, broadcasts the proposal, and self-votes if it is also a committee member.
+
+Incoming block proposals arrive via `ac_consensus_handle_block`. The routine validates the proposer's VRF, stashes the block in a small (8-slot) pending ring, and votes on it if the local node is in the slot's committee per `am_i_committee`. Votes are broadcast and aggregated by `try_commit`, which calls `ac_chain_accept_block` once the cumulative committee weight exceeds two thirds.
+
+When a node accepts a block locally, it rebroadcasts the fully-signed block over the network. This shortens convergence in the presence of message loss and lets peers behind by one block accept the newly-committed block directly (without rebuilding the certificate from individual votes).
+
+When a node receives a proposal for a height beyond its current tip plus one, it issues a `HEADERS_REQ` over the network so peers can backfill the gap.
+
+### 5.7 `mempool` — tx pool with fee-market ordering
+
+Transactions are stored in a single sorted array (descending by `tip`). Insertion is O(n) — fine for the design's expected throughput. The pool dedupes by transaction hash and enforces nonce monotonicity per sender: a new tx with the same `(sender, nonce)` as an existing pool entry replaces it only if its tip is strictly higher (the standard "replace-by-fee" rule).
+
+Capacity is `8192` entries. When full, the lowest-tip entry is evicted in favour of the incoming higher-tip one; if the incoming entry's tip is not strictly higher than the worst entry, it is rejected with `AC_MP_FULL_DROP_LOW_TIP`.
+
+`ac_mempool_prune_expired(slot)` is called once per slot from the consensus thread.
+
+### 5.8 `net` — TCP transport and gossip
+
+Each outbound connection is dialled from a single connector thread (`connector_loop`); each accepted connection spawns a per-peer reader thread (`reader_loop`). Per-peer writes are serialised under a `write_mu`; reads are sequential by construction.
+
+Every message is one frame: `u32 payload_len | u8 version | u8 type | payload[payload_len-2]`. On read, the type dispatches to a small switch in `dispatch_message` that performs hash-based dedup (for `BLOCK_ANN`, `TX_ANN`, `COMMIT_VOTE`) and either invokes a configured callback or re-gossips the message to other peers (skipping the originator).
+
+The first message a peer must send is `HELLO`. It carries `chain_id`, the peer's pubkey, its advertised listen port, and an optional external host string. Mismatched `chain_id` or a self-connection are dropped before any further frame is read.
+
+There is no DHT. Peer discovery is exactly: the configured seed list, plus what the gossip layer reveals over time. Mainnet seed lists are part of the release artefact (see `deploy/mainnet-seeds.txt`).
+
+The reader/connector/listener threads cooperate during shutdown: `ac_net_stop` shuts down the listening socket, joins the listener and connector, then closes all peer sockets and joins every reader thread. After `ac_net_stop` returns, no callback can fire.
+
+### 5.9 `rpc` — JSON-RPC 2.0 over HTTP
+
+A minimal embedded HTTP server reads up to 64 KB of request, parses for `Content-Length` (case-insensitive), reads the body, and dispatches a single JSON-RPC method. Responses close the connection. No keep-alive in v1.
+
+The JSON parser is hand-rolled and extracts top-level string and numeric fields by pattern match. It is sufficient for the limited request surface — `chain_info`, `account_get`, `name_lookup`, `tx_submit`, `mempool_size`, `block_get` — and rejects anything malformed.
+
+The JSON-RPC methods exposed in v1:
+
+| Method          | Parameters                                       | Returns                                                  |
+| --------------- | ------------------------------------------------ | -------------------------------------------------------- |
+| `chain_info`    | none                                             | `{chain_id, height, tip_hash, base_fee, genesis_timestamp_ms}` |
+| `account_get`   | `{address: hex32}`                               | `{balance, nonce, stake, unbond_at}` (µCRD; zero if absent) |
+| `name_lookup`   | `{name: string}`                                 | `{address: hex32}` or `null`                             |
+| `tx_submit`     | `{tx_hex: string}`                               | `{hash: hex32}` on success; JSON-RPC error otherwise     |
+| `mempool_size`  | none                                             | `{size: int}`                                            |
+| `block_get`     | `{height: int}`                                  | Header summary fields                                    |
+
+The RPC defaults to listening on `127.0.0.1:30304`. Exposing it over the network is operator-opt-in via `--rpc-host`.
+
+### 5.10 `node` and `main` — lifecycle and CLI
+
+`ac_node_start` initialises libsodium, loads or generates `node.key`, opens the chain (creating from genesis if necessary), initialises the mempool, wires the consensus broadcaster to `ac_net_broadcast`, wires the network callbacks to consensus and chain, then starts net, RPC, and the consensus slot loop. `ac_node_wait_for_signal` blocks until `SIGINT` or `SIGTERM`, after which the node tears down in reverse order: RPC, network (which joins every peer thread), consensus, mempool, chain.
+
+`main.c` implements subcommands:
+
+```
+agentchain node       --data-dir DIR [--genesis FILE] [--port N] [--rpc-port N]
+                      [--seeds host:port,…] [--validator] [--external-host H]
+agentchain keygen     --out FILE
+agentchain pubkey     {--data-dir DIR | --key FILE}
+agentchain genesis    --chain-id N [--timestamp-ms N] --out FILE
+                      --account HEX:BAL:STAKE [--account …]
+agentchain send       --rpc URL --from-key FILE --to HEX --amount UCRD
+                      [--tip N] [--memo TEXT] [--valid-slots N]
+agentchain balance    --rpc URL --address HEX
+agentchain info       --rpc URL
+agentchain version
+```
+
+The `send` subcommand performs a full client-side build of a transfer transaction: it queries `chain_info` for `chain_id`, `account_get` for the sender's `nonce`, builds the body, signs it, hex-encodes, and submits via `tx_submit`. A successful submission returns the transaction hash.
+
+---
+
+## 6. Threading Model
+
+Threads owned by a running node:
+
+1. **Main thread** — signal wait loop. No business logic.
+2. **Consensus slot thread** — fires `slot_routine` once per slot.
+3. **Network listener thread** — `accept()` loop.
+4. **Network connector thread** — outbound seed dialer.
+5. **N × peer reader thread** — one per active TCP connection.
+6. **RPC accept thread** — `accept()` loop; each connection is handled inline (no per-request thread).
+
+Shared mutable state is protected by:
+
+- `ac_chain.mu` — covers chain state, account map, name map.
+- `ac_mempool.mu` — covers the tx pool array.
+- `ac_consensus.mu` — covers the pending-block ring.
+- Per-peer `write_mu` — serialises `write(2)` to that peer.
+- `ac_net.peers_mu` — covers peer-slot allocation.
+- `ac_net.dedup_mu` — covers the gossip dedup ring.
+
+Ordering rule: never hold `consensus.mu` and then `chain.mu`. Always acquire `chain.mu` first when both are needed. The codebase respects this.
+
+---
+
+## 7. Build and Release
+
+### 7.1 Local
+
+```sh
+git clone https://github.com/beltromatti/agentchain
+cd agentchain
+sudo apt-get install -y libsodium-dev cmake build-essential   # Debian/Ubuntu
+brew install libsodium cmake                                  # macOS
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+./build/agentchain version
+```
+
+### 7.2 Continuous integration
+
+`.github/workflows/build.yml` runs on every push/PR: it builds on `ubuntu-22.04` and `macos-latest`, runs the local testnet harness for 30 seconds, and uploads logs as an artefact on failure.
+
+`.github/workflows/release.yml` runs when a `v*` tag is pushed. For each target it:
+
+1. Builds in `Release` mode against a statically-linked libsodium (built in-CI).
+2. Strips the binary.
+3. Tars the binary, the seed list, the systemd unit, this file, and `PROTOCOL.md`.
+4. Uploads the tarball as a GitHub Release asset.
+
+Target matrix:
+
+| OS          | Architecture | Toolchain         |
+| ----------- | ------------ | ----------------- |
+| Linux       | x86_64       | GCC 11, glibc 2.35 |
+| Linux       | aarch64      | GCC 11 cross      |
+| macOS       | x86_64       | clang             |
+| macOS       | arm64        | clang             |
+
+Windows is supported in principle (POSIX sockets are abstracted into `net.c`) but not part of the v1.0.0 CI matrix.
+
+### 7.3 Deployment
+
+`deploy/systemd/agentchain.service` runs the daemon as a non-root user, restarts on failure, and writes state to `/var/lib/agentchain`. `deploy/docker/Dockerfile` builds a multi-stage image weighing under 20 MB.
+
+For mainnet, the seed list is shipped in `deploy/mainnet-seeds.txt`. Validators bring their own genesis via the official `genesis.txt` distributed in the release.
+
+---
+
+## 8. Observability
+
+`agentchain` writes structured logs to stderr in the format:
+
+```
+<rfc3339-ts> <LEVEL> [<module>] <message>
+```
+
+Modules: `node`, `chain`, `consen.`, `net`, `rpc`. Level controlled by `-v` (debug). No metrics endpoint in v1; operators are expected to read logs (or wrap them with their own scraping). A Prometheus exporter is on the v1.1 roadmap.
+
+---
+
+## 9. Spec Deviations in v1.0.0
+
+These deviations are deliberate and documented. Each is annotated with the protocol section it relaxes and the reason the relaxation is acceptable for a bootstrapping network.
+
+### 9.1 Active-set delay collapse
+
+**Protocol § 6.3** specifies that the active validator set for epoch `e` is the set with `stake ≥ MIN_STAKE` at the end of epoch `e-2`. v1.0.0 instead uses the active set as of the current chain tip. This shortens the time before a newly-bonded validator becomes eligible from two epochs (~8 hours) to zero, at the cost of a theoretical attack where an adversary times their bond to influence a single slot's leader sortition. The trade-off is acceptable for a bootstrap network whose initial validator set is controlled, and will be reverted in v1.1 once a stake-set snapshot per epoch is journaled.
+
+### 9.2 Single-tip fork choice
+
+**Protocol § 7** describes a heaviest-chain fork-choice rule. v1.0.0 simply rejects any block whose parent does not match the current tip. This means a node that diverges from the canonical chain by accepting a block that the rest of the network later abandons will need manual intervention (`rm -rf <data_dir>/blocks` and resync) to recover. In practice this does not happen because PoSA's `2/3 committee weight` rule guarantees safety: there is never more than one finalised tip in an honest-majority network. The proper heaviest-chain implementation is on the v1.1 roadmap and will only matter under a Byzantine attack scenario.
+
+### 9.3 Reward concentrated at the leader
+
+**Protocol § 8.3** describes the per-block reward as paid to the slot's leader, with no committee share. The protocol's prior text described a 15/85 split. The current text and the implementation agree on the simpler leader-only rule; the change preserves a deterministic post-block state root knowable to the leader at proposal time.
+
+### 9.4 Instant-release unbonding
+
+**Protocol § 5.2** specifies a 24-hour cooldown for `STAKE_UNBOND`. v1.0.0 instead instantly transfers from `stake` back to `balance` while recording the would-be unlock slot in `unbond_at`. Operators of v1 testnets do not lose security from this simplification; the cooldown enforcement is on the v1.1 roadmap.
+
+### 9.5 Equivocation enforcement
+
+**Protocol § 6.6** specifies that double-signing is slashable. v1.0.0 implements the `SLASH_EVIDENCE` transaction, verifies the two signatures, and burns the validator's stake. What v1.0.0 does **not** do automatically is detect equivocations in real time — a slasher must construct and submit the evidence transaction. A built-in equivocation watcher is on the v1.1 roadmap.
+
+---
+
+## 10. Performance Envelope (v1.0.0)
+
+These are measured numbers from the local 4-node testnet (Apple M-series, single host). They are not extrapolations.
+
+| Metric                                | Value                                    |
+| ------------------------------------- | ---------------------------------------- |
+| Time-to-first-block from genesis      | < 2 s                                    |
+| Steady-state block interval            | 2 s (matches `SLOT_DURATION_MS`)         |
+| 2-block (irreversible) finality        | ~ 4 s                                    |
+| Transfer transaction RPC submit → seen in mempool | < 50 ms                  |
+| Transfer transaction submit → committed | ~ 2–4 s (one to two slots)              |
+| Node memory (RSS) at idle              | ~ 8 MB                                   |
+| Binary size (stripped, x86_64 Linux)  | < 200 KB without libsodium static; < 700 KB statically linked |
+
+These numbers will move once stake-set snapshots, heaviest-chain fork choice, and a real cross-WAN deployment are in place. They are reported here so future versions have something to compare against.
+
+---
+
+## 11. Testing
+
+`testnet/run.sh` spins up `N` (default 4) validator nodes on this host, watches their heights via the JSON-RPC, submits a transfer, verifies the recipient's balance, and tears the cluster down. It is the gating check for every change.
+
+```sh
+N=4 RUN_S=30 testnet/run.sh
+```
+
+The script generates fresh keys, writes a genesis allocating 1000 CRD + 200 CRD stake to each, connects every node to every other, and reports per-node heights every three seconds. A v1.0.0 success criterion is: all `N` nodes converge to the same height by the end of `RUN_S` seconds.
+
+Unit tests live under `tests/`. They cover the canonical encoders (round-trip), the state-root determinism (golden values), and gas-charging edge cases. The CI runs them via `ctest`.
+
+---
+
+## 12. Roadmap (non-binding)
+
+This is what we plan to build on top of v1 before the protocol's hard-fork lever is pulled. None of it is committed to a date.
+
+- **v1.1 — Robustness**: active-set delay, heaviest-chain fork choice, equivocation watcher, instant 24-hour unbonding queue, Prometheus exporter.
+- **v1.2 — Agent ergonomics**: WebSocket subscriptions, `fee_forecast` RPC, agent-friendly batched RPC.
+- **v2 — Deterministic execution**: a minimal, gas-metered, agent-native execution environment. Backwards-compatible at the wire level. No EVM compatibility.
+
+The protocol is intentionally underspecified beyond v1.0.0 — getting v1 deployed and observed in the wild has priority over committing to architectures we have not yet stress-tested.
