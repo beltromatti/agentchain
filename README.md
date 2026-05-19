@@ -41,7 +41,7 @@ The native asset is **Credit (CRD)**. The smallest unit is the micro-Credit (`µ
 - **Public read-only RPC:** `http://34.61.207.49:30304`
 - **Genesis file** (canonical, bit-for-bit reproducible): [`deploy/mainnet-genesis.txt`](deploy/mainnet-genesis.txt)
 - **Block time:** 2 s · **2-block finality:** ~4 s
-- **Engine release:** [`v1.0.7`](https://github.com/beltromatti/agentchain/releases/tag/v1.0.7)
+- **Engine release:** [`v1.0.11`](https://github.com/beltromatti/agentchain/releases/tag/v1.0.11)
 
 The first seed is operated by Noesis AI on a Google Cloud Always-Free `e2-micro` instance. We are honest about what this means: until other independent validators bond stake and bring up their own nodes, Noesis AI is the dominant operator. The protocol is designed to make that transition trivial — see [Run your own node](#run-your-own-node) below. The chain accepts new validators the moment they bond `STAKE_BOND`; no central coordination is required.
 
@@ -59,8 +59,8 @@ Download the pre-built binary for your OS — Linux x86_64/arm64, macOS x86_64/a
 
 ```sh
 # macOS arm64 example
-curl -L https://github.com/beltromatti/agentchain/releases/latest/download/agentchain-v1.0.7-macos-arm64.tar.gz | tar xz
-cd agentchain-v1.0.7-*
+curl -L https://github.com/beltromatti/agentchain/releases/latest/download/agentchain-v1.0.11-macos-arm64.tar.gz | tar xz
+cd agentchain-v1.0.11-*
 ./agentchain version
 ./agentchain info --rpc 34.61.207.49:30304
 ```

@@ -1,6 +1,6 @@
-# AgentChain Security Audit — v1.0.7
+# AgentChain Security Audit — v1.0.11
 
-**Audited release:** AgentChain Engine v1.0.7 (`commit 2b84a05`)
+**Audited release:** AgentChain Engine v1.0.11 (`commit 0740c16`)
 **Audit date:** 2026-05-19
 **Auditor:** Noesis AI — internal review
 **Scope:** Reference C client + AgentChain Protocol v1, including the live mainnet (`chain_id=1`) bootstrap operated by Noesis AI on Google Cloud.
@@ -101,6 +101,9 @@ The codebase is ~5,200 lines of C11 against POSIX. We audited every `malloc`/`fr
 | F-10 | `HEADERS_REQ` storm from a gossip-lagging peer | Medium | **Resolved (v1.0.5).** Local rate-limits `HEADERS_REQ` to at most one per 4 s (or when the tip gap grows by >64); per-request batch raised from 64 to 256 blocks. |
 | F-11 | Synchronous broadcast can stall consensus thread on a slow peer | High | **Resolved (v1.0.6).** Each peer slot owns a non-blocking outbound queue + a dedicated writer thread; producers (`ac_net_broadcast`, `ac_net_send_to`) enqueue and return immediately. A peer that overflows its 4 MB queue is shut down. |
 | F-12 | `ac_block_decode` reads `body_len` at the wrong offset for transactions; first block containing a tx halts catch-up sync | Critical | **Resolved (v1.0.7).** Corrected offset (70 instead of 66) in the tx-length walker; reject `body_len > AC_TX_BODY_MAX` and `memo_len > AC_MEMO_MAX` before consuming the cursor. Regression test added (`tests/test_codec.c::test_full_block_with_tx_roundtrip`). |
+| F-13 | `tx_submit` succeeded locally but did not gossip; non-validator RPC clients couldn't broadcast transactions | High | **Resolved (v1.0.9).** RPC's `tx_submit` invokes a new `broadcast_tx` callback after the mempool insert, which the node wires to `ac_net_broadcast(TX_ANN, ...)`. |
+| F-14 | `validate_commit` used the post-apply validator set, so a block that itself added a validator (`STAKE_BOND`) could never accumulate enough committee signatures to commit | High | **Resolved (v1.0.10).** `ac_chain_accept_block` snapshots the *pre-block* validator metrics (total `sqrt_stake` + per-signer stake lookup) and passes them to `validate_commit`. The threshold is now computed against the set that signed, not the set after the block applies. |
+| F-15 | Two simultaneously-eligible leaders could each accumulate ≥2/3 committee weight on distinct proposals, finalising conflicting blocks at the same height | Critical | **Resolved (v1.0.11).** Committee members no longer vote on the first proposal they see. They wait 900 ms after slot start, then select the proposal with the **lowest VRF-derived leader priority** they've observed for that slot and sign exactly one `COMMIT_VOTE`. Priority is a deterministic function of (epoch seed, slot, proposer pubkey, proposer `sqrt_stake`), so every honest committee member chooses the same winner. With <1/3 Byzantine stake, the alternative proposal cannot reach the 2/3 commit threshold. Documented in `PROTOCOL.md § 6.5.1`; verified by 1-, 2-, and 4-node testnet smokes plus an end-to-end mainnet validator-handover demonstration (Phases A→B→C→D) with zero forks across every transition. |
 
 **Tools applied:** GCC and Clang at `-Wall -Wextra -Wpedantic -Wshadow -Wstrict-prototypes -Wmissing-prototypes -Wpointer-arith -Wcast-align -Wwrite-strings -Wunreachable-code -Wformat=2 -Wformat-security -Wundef`, treated as errors in CI on the `build.yml` workflow. The current `main` builds with `-Werror` clean across Ubuntu 22.04 (GCC 11), Ubuntu 24.04 ARM (GCC 13), macOS 14 (Apple Clang), and Windows 2022 (MinGW64 GCC 14). *[evidence: `.github/workflows/build.yml`]*
 

@@ -162,12 +162,16 @@ If any check fails, state is rolled back to the pre-tx snapshot (taken at step 7
 
 ### 5.6 `consensus` — PoSA orchestration
 
-A single thread (`slot_loop`) sleeps until the next slot boundary, then calls `slot_routine(slot)`. The routine:
+A single thread (`slot_loop`) runs each slot in two phases:
 
-1. Calls `am_i_leader(slot)` which (a) checks the node is an active validator, (b) computes the VRF proof for `"AGCH:LEADER" || epoch_seed || slot`, (c) compares the VRF priority against a network-wide threshold targeted at ~2 candidates per slot.
-2. If eligible, snapshots up to 256 transactions from the mempool, prunes expired ones, calls `ac_chain_build_block`, broadcasts the proposal, and self-votes if it is also a committee member.
+1. **At slot start** — call `slot_routine(slot)`:
+   - `am_i_leader(slot)` checks the node is an active validator, computes the VRF proof for `"AGCH:LEADER" || epoch_seed || slot`, and compares the VRF priority against a network-wide threshold targeted at ~2 candidates per slot.
+   - If eligible, snapshot up to 256 transactions from the mempool, prune expired ones, call `ac_chain_build_block`, stash the proposal, and broadcast it. The proposal does **not** carry the proposer's own vote — the vote phase below handles that.
+2. **At `slot_start + AC_VOTE_DELAY_MS` (900 ms)** — call `vote_phase(slot)`:
+   - If the node is a committee member, scan the pending ring for proposals at `slot` and pick the one with the lowest leader priority (`§ 6.5.1` in `PROTOCOL.md`).
+   - Sign exactly one `COMMIT_VOTE` for that proposal and broadcast it. `try_commit` aggregates the vote and calls `ac_chain_accept_block` once the cumulative `sqrt_stake` of signers exceeds two thirds.
 
-Incoming block proposals arrive via `ac_consensus_handle_block`. The routine validates the proposer's VRF, stashes the block in a small (8-slot) pending ring, and votes on it if the local node is in the slot's committee per `am_i_committee`. Votes are broadcast and aggregated by `try_commit`, which calls `ac_chain_accept_block` once the cumulative committee weight exceeds two thirds.
+Incoming proposals arrive via `ac_consensus_handle_block`: the routine validates the proposer's VRF, computes the proposer's leader priority, and stashes the block in an 8-slot pending ring. It does *not* vote immediately — the deferred vote phase is what gives every honest committee member the same proposal set to choose from, so they all converge on the lowest-priority block. Without that convergence step, two leader-eligible validators in the same slot could each accumulate ≥2/3 committee weight on distinct proposals.
 
 When a node accepts a block locally, it rebroadcasts the fully-signed block over the network. This shortens convergence in the presence of message loss and lets peers behind by one block accept the newly-committed block directly (without rebuilding the certificate from individual votes).
 
