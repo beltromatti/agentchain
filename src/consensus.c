@@ -15,7 +15,6 @@
 typedef struct {
     bool                 occupied;
     bool                 committed;
-    bool                 we_voted;
     uint64_t             height;
     uint64_t             slot;
     ac_hash_t            block_hash;
@@ -23,7 +22,25 @@ typedef struct {
     ac_commit_signer_t   signers[AC_COMMITTEE_MAX];
     uint32_t             nsigners;
     uint64_t             first_seen_ms;
+
+    /* Proposer's VRF priority for this slot — lower wins. Computed from
+     * the block's proposer_vrf_proof and the proposer's pre-block sqrt-
+     * stake. See PROTOCOL.md § 6.3. */
+    uint8_t              priority[16];
 } pending_t;
+
+/* Per-slot voting state. A validator votes at most once per slot: on the
+ * proposal with the lowest priority it has seen by the time the vote
+ * window opens. Without this convergence step, two leader-eligible
+ * validators in the same slot can both reach the 2/3 threshold on
+ * different blocks — a fork. The wait window lets every committee member
+ * observe the same set of proposals before locking in. */
+typedef struct {
+    uint64_t   slot;                /* 0 = unused */
+    uint8_t    best_priority[16];   /* 0xFF...FF when no proposal yet */
+    ac_hash_t  voted_block;         /* the block we ended up voting on */
+    bool       voted;               /* true after we have voted in this slot */
+} slot_vote_t;
 
 struct ac_consensus_s {
     pthread_mutex_t       mu;
@@ -39,16 +56,22 @@ struct ac_consensus_s {
     bool                  running;
 
     pending_t             pending[AC_PENDING_MAX];
+    slot_vote_t           slot_votes[AC_PENDING_MAX];
 
     /* Rate-limit HEADERS_REQ so we do not spam the seed with 30 requests
      * per minute (one per incoming gossip BLOCK_ANN). With each request
-     * pulling 64 blocks back, that fills the seed's send buffer faster
+     * pulling 256 blocks back, that fills the seed's send buffer faster
      * than the receiver can drain. */
     uint64_t              last_hdrs_req_ms;
     uint64_t              last_hdrs_req_target;
 };
 
 #define AC_HDRS_REQ_MIN_INTERVAL_MS 4000
+
+/* Vote-phase wait window: how long after slot start before we vote on the
+ * best proposal we have seen. 900 ms inside a 2 s slot leaves ~1100 ms for
+ * vote propagation and try_commit. */
+#define AC_VOTE_DELAY_MS 900
 
 static void pending_init(pending_t *p) {
     if (p->occupied) ac_block_free(&p->block);
@@ -113,10 +136,13 @@ static int committee_eligible(uint64_t draw_u64, uint64_t sqrt_stake, uint64_t t
     return draw_u64 < (uint64_t)thr;
 }
 
-/* Returns 1 if `my_addr` is plausibly the canonical leader at `slot`, with
- * VRF proof written to *out_proof. Approximation rule (v1): any active
- * validator whose VRF priority falls in the top half of expected ordering is
- * considered leader. This is over-permissive — fork choice resolves ties. */
+/* Returns 1 if `my_addr` is leader-eligible at `slot`, with VRF proof written
+ * to *out_proof. We intentionally allow ~2 eligible leaders per slot on
+ * average: this gives liveness redundancy when one leader is offline or
+ * partitioned. Safety with multiple proposers is provided by the priority-
+ * based vote convergence in vote_phase() — every honest committee member
+ * votes on the same lowest-priority proposal, so at most one block per slot
+ * can reach the 2/3 sqrt-stake commit threshold. See PROTOCOL.md § 6.3. */
 static int am_i_leader(ac_consensus_t *cs, uint64_t slot, ac_vrf_proof_t *out_proof) {
     ac_chain_lock(cs->chain);
 
@@ -219,14 +245,66 @@ static int vote_decode(const uint8_t *buf, size_t len,
 }
 
 /* -------------------------------------------------------------------------- */
-/* Voting + commit threshold.                                                 */
+/* Per-slot priority tracking + vote convergence.                             */
 /* -------------------------------------------------------------------------- */
 
-static void our_vote(ac_consensus_t *cs, pending_t *p, const ac_vrf_proof_t *proof) {
-    if (p->we_voted) return;
+/* Compute the proposer's priority for a slot, per PROTOCOL § 6.3.
+ * Lower = better leader. We use BLAKE2b("AGCH:PRIO" || beta) shifted by the
+ * proposer's sqrt-stake — higher stake gives proportionally lower priority
+ * scores, so well-staked validators win sortition more often. */
+static void compute_priority(uint8_t out[16], const ac_vrf_out_t *beta, uint64_t sqrt_stake) {
+    if (sqrt_stake == 0) { memset(out, 0xFF, 16); return; }
+    /* Domain-tagged hash of beta so callers do not interpret the raw VRF
+     * output. Take the first 16 bytes as a Q.128 unsigned scalar. */
+    ac_hash_t h;
+    static const char DOMAIN[] = "AGCH:PRIO";
+    const uint8_t *chunks[2] = { (const uint8_t *)DOMAIN, beta->b };
+    const size_t   lens[2]   = { sizeof(DOMAIN) - 1,       AC_VRF_OUT_SIZE };
+    ac_hash_multi(&h, chunks, lens, 2);
+    /* Divide the 128-bit numerator by sqrt_stake. Compute high/low halves
+     * carefully so we do not overflow. */
+    uint64_t hi = ac_rd64(h.b);
+    uint64_t lo = ac_rd64(h.b + 8);
+    uint64_t q_hi = hi / sqrt_stake;
+    uint64_t r_hi = hi % sqrt_stake;
+    /* lo_total = r_hi * 2^64 + lo; approximate by upper bound on overflow. */
+    uint64_t q_lo = lo / sqrt_stake;
+    if (sqrt_stake > 0) q_lo += (UINT64_MAX / sqrt_stake) * r_hi;
+    ac_be64(out,     q_hi);
+    ac_be64(out + 8, q_lo);
+}
 
-    LOG_D("consen.", "voting on h=%" PRIu64 " slot=%" PRIu64,
-          p->height, p->slot);
+/* Find or allocate a slot-vote tracking entry for `slot`. Reuses the
+ * oldest entry when the table is full. */
+static slot_vote_t *slot_vote_for(ac_consensus_t *cs, uint64_t slot) {
+    slot_vote_t *oldest = NULL;
+    for (size_t i = 0; i < AC_PENDING_MAX; ++i) {
+        slot_vote_t *sv = &cs->slot_votes[i];
+        if (sv->slot == slot) return sv;
+        if (!oldest || sv->slot < oldest->slot) oldest = sv;
+    }
+    /* Evict oldest. */
+    memset(oldest, 0, sizeof(*oldest));
+    oldest->slot = slot;
+    memset(oldest->best_priority, 0xFF, sizeof(oldest->best_priority));
+    return oldest;
+}
+
+/* Bytewise compare two 16-byte priorities. < 0 if a < b. */
+static int priority_cmp(const uint8_t a[16], const uint8_t b[16]) {
+    return memcmp(a, b, 16);
+}
+
+/* Lock-held: emit a single commit-vote for the given pending block. The
+ * caller guarantees we have not already voted in this slot. */
+static void our_vote_now(ac_consensus_t *cs, pending_t *p) {
+    /* Recompute our own committee-membership proof for this slot — the
+     * proof is what other validators verify in handle_vote. */
+    ac_vrf_proof_t cproof;
+    if (!am_i_committee(cs, p->slot, &cproof)) return;
+
+    LOG_D("consen.", "voting on h=%" PRIu64 " slot=%" PRIu64 " (prio=%02x%02x..)",
+          p->height, p->slot, p->priority[0], p->priority[1]);
 
     uint8_t vmsg[64];
     int vn = ac_vote_message(vmsg, p->height, &p->block_hash);
@@ -238,13 +316,17 @@ static void our_vote(ac_consensus_t *cs, pending_t *p, const ac_vrf_proof_t *pro
         ac_commit_signer_t *s = &p->signers[p->nsigners++];
         s->signer = cs->my_addr;
         s->sig    = sig;
-        memcpy(s->vrf_proof, proof->b, AC_VRF_PROOF_SIZE);
+        memcpy(s->vrf_proof, cproof.b, AC_VRF_PROOF_SIZE);
     }
-    p->we_voted = true;
+
+    slot_vote_t *sv = slot_vote_for(cs, p->slot);
+    sv->voted = true;
+    sv->voted_block = p->block_hash;
+    memcpy(sv->best_priority, p->priority, 16);
 
     /* Broadcast. */
     uint8_t wire[AC_VOTE_WIRE_LEN];
-    vote_encode(wire, p->height, &p->block_hash, &cs->my_addr, &sig, proof);
+    vote_encode(wire, p->height, &p->block_hash, &cs->my_addr, &sig, &cproof);
     if (cs->bcast) cs->bcast(0x08, wire, sizeof(wire), cs->bcast_ctx);
 }
 
@@ -408,14 +490,23 @@ void ac_consensus_handle_block(ac_consensus_t *cs, const uint8_t *buf, size_t le
     LOG_D("consen.", "received block h=%" PRIu64 " slot=%" PRIu64 " txs=%u",
           b.header.height, b.header.slot, b.header.tx_count);
 
-    /* Vote if we're committee. */
-    if (cs->validator) {
-        ac_vrf_proof_t cproof;
-        if (am_i_committee(cs, b.header.slot, &cproof)) {
-            our_vote(cs, p, &cproof);
-        }
+    /* Compute the proposer's VRF priority and record it on the pending
+     * entry. The actual commit vote is deferred to vote_phase() so every
+     * committee member can converge on the lowest-priority proposal. */
+    ac_chain_lock(cs->chain);
+    ac_account_t pa;
+    ac_state_get(ac_chain_state(cs->chain), &b.header.proposer, &pa);
+    ac_chain_unlock(cs->chain);
+    compute_priority(p->priority, &beta, ac_isqrt_u64(pa.stake));
+
+    slot_vote_t *sv = slot_vote_for(cs, b.header.slot);
+    if (priority_cmp(p->priority, sv->best_priority) < 0) {
+        memcpy(sv->best_priority, p->priority, 16);
     }
 
+    /* If we already accumulated 2/3 of votes (e.g. a fully-signed block was
+     * rebroadcast), commit immediately. The vote phase will skip slots that
+     * have already committed. */
     try_commit(cs, p);
     pthread_mutex_unlock(&cs->mu);
 }
@@ -519,10 +610,26 @@ static void slot_routine(ac_consensus_t *cs, uint64_t slot) {
     p->nsigners = 0;
     if (p->block.signers) { free(p->block.signers); p->block.signers = NULL; p->block.nsigners = 0; }
 
-    /* Add our own vote if we're committee. */
-    ac_vrf_proof_t cproof;
-    if (am_i_committee(cs, slot, &cproof)) {
-        our_vote(cs, p, &cproof);
+    /* Compute and record our own proposer priority for this slot. We do
+     * NOT vote yet — vote_phase() runs at slot+AC_VOTE_DELAY_MS and selects
+     * the lowest-priority proposal among everything we have seen. */
+    ac_chain_lock(cs->chain);
+    ac_account_t me_acct;
+    ac_state_get(ac_chain_state(cs->chain), &cs->my_addr, &me_acct);
+    ac_hash_t pseed;
+    ac_chain_epoch_seed(cs->chain, ac_epoch_of(slot), &pseed);
+    ac_chain_unlock(cs->chain);
+
+    uint8_t palpha[64];
+    int pan = leader_alpha(palpha, &pseed, slot);
+    ac_vrf_out_t pbeta;
+    ac_vrf_proof_t ptmp = lproof;
+    ac_vrf_verify(&pbeta, &ptmp, palpha, (size_t)pan, cs->kp.pk);
+    compute_priority(p->priority, &pbeta, ac_isqrt_u64(me_acct.stake));
+
+    slot_vote_t *sv = slot_vote_for(cs, slot);
+    if (priority_cmp(p->priority, sv->best_priority) < 0) {
+        memcpy(sv->best_priority, p->priority, 16);
     }
 
     /* Broadcast block (without commit cert). */
@@ -540,19 +647,64 @@ static void slot_routine(ac_consensus_t *cs, uint64_t slot) {
           b.header.height, slot, b.header.tx_count);
 }
 
+/* Vote phase: invoked at slot_start + AC_VOTE_DELAY_MS. Selects the lowest-
+ * priority pending proposal for this slot and emits exactly one commit vote
+ * for it. Every honest committee member runs the same selection over (with
+ * high probability) the same proposal set, so the network converges on a
+ * single block per slot regardless of how many leaders proposed. */
+static void vote_phase(ac_consensus_t *cs, uint64_t slot) {
+    if (!cs->validator) return;
+    pthread_mutex_lock(&cs->mu);
+
+    slot_vote_t *sv = slot_vote_for(cs, slot);
+    if (sv->voted) { pthread_mutex_unlock(&cs->mu); return; }
+
+    pending_t *best = NULL;
+    for (size_t i = 0; i < AC_PENDING_MAX; ++i) {
+        pending_t *p = &cs->pending[i];
+        if (!p->occupied || p->slot != slot || p->committed) continue;
+        if (!best || priority_cmp(p->priority, best->priority) < 0) best = p;
+    }
+    if (!best) { pthread_mutex_unlock(&cs->mu); return; }
+
+    our_vote_now(cs, best);
+    try_commit(cs, best);
+    pthread_mutex_unlock(&cs->mu);
+}
+
 static void *slot_loop(void *arg) {
     ac_consensus_t *cs = (ac_consensus_t *)arg;
-
     uint64_t genesis = ac_chain_genesis_time(cs->chain);
-    while (cs->running) {
-        uint64_t now = ac_now_ms();
-        if (now < genesis) { ac_sleep_ms(genesis - now); continue; }
-        uint64_t current_slot = (now - genesis) / AC_SLOT_DURATION_MS;
-        uint64_t next_start = genesis + (current_slot + 1) * AC_SLOT_DURATION_MS;
-        uint64_t sleep_ms = next_start > now ? next_start - now : 0;
-        ac_sleep_ms(sleep_ms);
 
-        slot_routine(cs, current_slot + 1);
+    /* Align to the start of the next slot. */
+    uint64_t now = ac_now_ms();
+    if (now < genesis) ac_sleep_ms(genesis - now);
+    now = ac_now_ms();
+    uint64_t current_slot = (now - genesis) / AC_SLOT_DURATION_MS;
+    uint64_t slot_start = genesis + (current_slot + 1) * AC_SLOT_DURATION_MS;
+    if (slot_start > now) ac_sleep_ms(slot_start - now);
+
+    uint64_t slot = current_slot + 1;
+
+    while (cs->running) {
+        /* Phase 1 — at slot start: propose (if leader). */
+        slot_routine(cs, slot);
+
+        /* Phase 2 — at slot_start + AC_VOTE_DELAY_MS: vote on lowest-priority
+         * proposal we've seen for this slot. */
+        slot_start = genesis + slot * AC_SLOT_DURATION_MS;
+        uint64_t vote_at = slot_start + AC_VOTE_DELAY_MS;
+        now = ac_now_ms();
+        if (vote_at > now) ac_sleep_ms(vote_at - now);
+        if (!cs->running) break;
+
+        vote_phase(cs, slot);
+
+        /* Phase 3 — sleep until next slot start, then loop. */
+        slot++;
+        uint64_t next_start = genesis + slot * AC_SLOT_DURATION_MS;
+        now = ac_now_ms();
+        if (next_start > now) ac_sleep_ms(next_start - now);
     }
     return NULL;
 }

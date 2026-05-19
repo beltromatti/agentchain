@@ -272,6 +272,18 @@ A block at slot `s` is **committed** in the view of a validator when its `Commit
 
 where the denominator is the **expected** committee weight (the total of all eligible-this-slot weights, computable by anyone with the active set and the epoch seed). This is a *strict* two-thirds rule. Because signers must prove committee eligibility via their VRF proof, a non-member cannot pretend to be a committee voter.
 
+#### 6.5.1 Vote convergence under multiple proposers
+
+The leader threshold (`§ 6.3`) intentionally allows up to two proposers per slot, for liveness redundancy. Without further protocol guidance, two simultaneous proposals could each accumulate signatures from a disjoint subset of the committee and produce competing 2/3-weighted commit certificates — a fork.
+
+To rule this out, every committee member follows a deterministic single-vote rule:
+
+1. **Wait** until `slot_start + AC_VOTE_DELAY_MS` (currently 900 ms inside a 2 s slot) before voting. The window lets proposals propagate to the whole network.
+2. **Select** among all valid proposals seen for that slot the one with the **lowest leader priority** (`§ 6.3`), recomputed from the proposer's VRF output and pre-block `sqrt_stake`.
+3. **Sign exactly one** `COMMIT_VOTE` for that block. A second vote in the same slot is not generated and is treated as equivocation if observed (`§ 6.6`).
+
+Because priority is a deterministic function of (epoch seed, slot, proposer pubkey, proposer stake), every honest committee member that has observed both proposals selects the same winner. As long as honest committee weight exceeds 2/3, the alternative proposal cannot reach the commit threshold — even when both proposers are honest. The rule scales identically from 2 validators to 10⁶ validators: it does not depend on cardinality.
+
 Once committed, a block is irrevocably part of one validator's local view. Finality across the network is *probabilistic in time but deterministic in commitments*: with the committee's honest threshold above 2/3, no two committed blocks at the same height can be produced by a non-equivocating committee. Equivocation, if it occurs, is detectable (`§ 6.6`).
 
 In practice, applications treat a block as final once one further block has been committed on top of it (k = 2 block confirmations, ~4 seconds).
