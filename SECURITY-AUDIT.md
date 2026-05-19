@@ -76,6 +76,7 @@ Generated only at validator-keygen time via `crypto_sign_keypair` → libsodium 
 | I-7 | Encoder/decoder symmetry | Tx + Header round-trip exactly | `test_codec.c::test_transfer_tx`, `test_header_roundtrip` |
 | I-8 | Equivocation is provable & punishable | `SLASH_EVIDENCE` body verifies two committee-vote signatures over distinct block hashes at the same height by the same key | `apply_tx` for kind `0x05` performs the verification before slashing |
 | I-9 | Domain separation prevents cross-context signature reuse | Every signature input is prefixed with a distinct ASCII tag (`"AGCH:TX:v1"`, `"AGCH:VOTE:v1"`, `"AGCH:VRF:v1"`, `"AGCH:BLOCK:v1"`, `"AGCH:STATE:v1"`, etc.) | exhaustive enumeration in `src/codec.c`, `src/consensus.c`, `src/state.c`, `src/crypto.c` |
+| I-10 | Committee members sign at most one `COMMIT_VOTE` per slot, and that vote targets the proposal with the lowest deterministic VRF leader priority | `consensus.c::vote_phase` runs at `slot_start + AC_VOTE_DELAY_MS` (900 ms), iterates pending proposals for the slot, picks the lowest `priority[16]` (computed by `compute_priority` from the proposer's β and pre-block `sqrt_stake`), and sets the per-slot `voted` flag to prevent a re-vote | `PROTOCOL.md § 6.5.1` is normative; observed end-to-end on `chain_id=1` 2026-05-19 — see `§ 6` below and `TECHNICAL-IMPLEMENTATION.md § 9.6` |
 
 ---
 
@@ -83,7 +84,7 @@ Generated only at validator-keygen time via `crypto_sign_keypair` → libsodium 
 
 ### 4.1 Memory safety
 
-The codebase is ~5,200 lines of C11 against POSIX. We audited every `malloc`/`free`/`realloc`/`memcpy`/`memmove` call.
+The codebase is ~6,600 lines of C11 against POSIX. We audited every `malloc`/`free`/`realloc`/`memcpy`/`memmove` call.
 
 **Findings:**
 
@@ -105,7 +106,7 @@ The codebase is ~5,200 lines of C11 against POSIX. We audited every `malloc`/`fr
 | F-14 | `validate_commit` used the post-apply validator set, so a block that itself added a validator (`STAKE_BOND`) could never accumulate enough committee signatures to commit | High | **Resolved (v1.0.10).** `ac_chain_accept_block` snapshots the *pre-block* validator metrics (total `sqrt_stake` + per-signer stake lookup) and passes them to `validate_commit`. The threshold is now computed against the set that signed, not the set after the block applies. |
 | F-15 | Two simultaneously-eligible leaders could each accumulate ≥2/3 committee weight on distinct proposals, finalising conflicting blocks at the same height | Critical | **Resolved (v1.0.11).** Committee members no longer vote on the first proposal they see. They wait 900 ms after slot start, then select the proposal with the **lowest VRF-derived leader priority** they've observed for that slot and sign exactly one `COMMIT_VOTE`. Priority is a deterministic function of (epoch seed, slot, proposer pubkey, proposer `sqrt_stake`), so every honest committee member chooses the same winner. With <1/3 Byzantine stake, the alternative proposal cannot reach the 2/3 commit threshold. Documented in `PROTOCOL.md § 6.5.1`; verified by 1-, 2-, and 4-node testnet smokes plus an end-to-end mainnet validator-handover demonstration (Phases A→B→C→D) with zero forks across every transition. |
 
-**Tools applied:** GCC and Clang at `-Wall -Wextra -Wpedantic -Wshadow -Wstrict-prototypes -Wmissing-prototypes -Wpointer-arith -Wcast-align -Wwrite-strings -Wunreachable-code -Wformat=2 -Wformat-security -Wundef`, treated as errors in CI on the `build.yml` workflow. The current `main` builds with `-Werror` clean across Ubuntu 22.04 (GCC 11), Ubuntu 24.04 ARM (GCC 13), macOS 14 (Apple Clang), and Windows 2022 (MinGW64 GCC 14). *[evidence: `.github/workflows/build.yml`]*
+**Tools applied:** GCC and Clang at `-Wall -Wextra -Wpedantic -Wshadow -Wstrict-prototypes -Wmissing-prototypes -Wpointer-arith -Wcast-align -Wwrite-strings -Wunreachable-code -Wformat=2 -Wformat-security -Wundef`, treated as errors in CI on the `build.yml` workflow. The current `main` builds with `-Werror` clean across the five release targets: Ubuntu 22.04 x86_64 (GCC 11), Ubuntu 24.04 arm64 (GCC 13), macOS 14 arm64 (Apple Clang), macOS 14 x86_64 cross (Apple Clang `-arch x86_64`), and Windows 2022 (MinGW64 GCC 14). *[evidence: `.github/workflows/build.yml`, `.github/workflows/release.yml`]*
 
 The project does not yet have an external static-analysis (Coverity/CodeQL) report; that is on the v1.1 roadmap.
 
@@ -164,7 +165,7 @@ The HTTP parser is a strict line-oriented reader with a 64 KB request cap; overs
 
 ## 6. Operational Surface (mainnet seed)
 
-The current mainnet seed is documented in `deploy/mainnet-seeds.txt`. As of v1.0.1 it runs on a GCP Always-Free `e2-micro` in `us-central1-a` (Iowa), operated by Noesis AI, behind a static IPv4 with two open ports:
+The current mainnet seed is documented in `deploy/mainnet-seeds.txt`. It runs on a GCP Always-Free `e2-micro` in `us-central1-a` (Iowa), operated by Noesis AI, behind a static IPv4 with two open ports:
 
 - `TCP 30303` — P2P gossip (public).
 - `TCP 30304` — JSON-RPC over HTTP (public, read-mostly, signature-verified writes).
@@ -175,9 +176,21 @@ The current mainnet seed is documented in `deploy/mainnet-seeds.txt`. As of v1.0
 - Automatic restart on failure (`Restart=on-failure RestartSec=5s`).
 - Private validator key stored at `/var/lib/agentchain/node.key` mode `0600`, never copied off the host.
 
+**Validator-handover demonstration (2026-05-19, v1.0.11 mainnet).** On the v1.0.11 genesis (`timestamp_ms=1779201674000`), the protocol's external-validator path was exercised end-to-end. A residential macOS host received CRD from the Iowa seed, bonded `STAKE_BOND` for 1000 CRD, became leader-eligible immediately, and the chain transitioned through four phases without forks and without missed slots:
+
+| Phase | Active validators                | Height range | Signers/commit | Outcome   |
+| ----- | -------------------------------- | ------------ | -------------- | --------- |
+| A     | seed + macOS host                | 56 → 118     | 2              | seamless  |
+| B     | macOS host alone (seed offline)  | 119 → 140    | 1              | seamless  |
+| C     | both back after seed restart     | 153 → 168    | 2              | seamless  |
+| D     | seed alone (macOS host offline)  | 184 → 203    | 1              | seamless  |
+
+The demonstration is the operational evidence behind I-10 (single-vote convergence) and F-15 (the v1.0.11 fix) being effective on a real WAN. Logs are in the v1.0.11 release notes and the seed's `journalctl -u agentchain` output.
+
 **Acknowledged risks:**
-- **Single-host trust.** With one validator currently holding 100% of bonded stake, an attacker who compromised the host could equivocate or halt the chain. The mitigation path is the open invitation to additional validators: the chain accepts new `STAKE_BOND` transactions immediately, and `sqrt`-stake weighting means the marginal contribution of new validators is amplified.
+- **Single-host trust.** Outside of the validator-handover window above, total bonded stake sits on a single host. An attacker who compromised that host could equivocate or halt the chain. The mitigation path is the open invitation to additional validators: the chain accepts new `STAKE_BOND` transactions immediately (see `TECHNICAL-IMPLEMENTATION.md § 9.1`), `sqrt`-stake weighting amplifies their marginal contribution, and the handover demo above proves the path works.
 - **Single-region availability.** The seed runs in one geographic region. The mitigation is the same: independent operators bringing up additional seeds, which the protocol supports without any central coordination beyond an updated seed list in `deploy/mainnet-seeds.txt` (PRs welcome).
+- **Bootstrap genesis simplification.** The deployed genesis ships a single ~40M CRD account rather than the protocol-specified four-bucket 100M CRD distribution. This is operator state, not a security regression — see `TECHNICAL-IMPLEMENTATION.md § 9.7`.
 
 ---
 
@@ -214,6 +227,11 @@ Honestly enumerated; tracked for v1.1:
 
   Live evidence (Iowa seed at chain_id=1, ~27k blocks at the time of test): a fresh peer connected from Italy catches up at ~50 blocks/s; drift to tip shrinks monotonically and reaches single-digit blocks in a few minutes. Full sync is now functional.
 
+- O-9. *(Closed in v1.0.9, v1.0.10, v1.0.11.)* Three further consensus-path defects were uncovered during the validator-onboarding work and resolved in successive releases (full chronology in `TECHNICAL-IMPLEMENTATION.md § 9.6`):
+  - **v1.0.9 (F-13)** — RPC `tx_submit` inserted into the mempool but never gossiped. Non-validator RPC clients submitted transactions that no validator ever saw. Fixed by adding a `broadcast_tx` callback wired to `ac_net_broadcast(TX_ANN, …)`.
+  - **v1.0.10 (F-14)** — `validate_commit` evaluated the 2/3 threshold against the *post-apply* validator set, so a block adding a validator (`STAKE_BOND`) could not itself meet the threshold. Fixed by snapshotting the pre-block validator metrics in `ac_chain_accept_block` and threading them through `validate_commit`.
+  - **v1.0.11 (F-15)** — two simultaneously-eligible leaders could each accumulate ≥2/3 committee weight on disjoint signer sets, finalising conflicting blocks at the same height (observed on the pre-reset chain at h=28699). Fixed by deferred priority-based vote convergence (Protocol § 6.5.1, invariant I-10). Verified end-to-end by the Phase A→D mainnet handover described in `§ 6`.
+
 ---
 
 ## 9. Reproducibility
@@ -235,7 +253,9 @@ Release artefacts ship with reproducible SHA-256 sums published alongside each t
 
 ## 10. Conclusion
 
-AgentChain Engine v1.0.1 is judged **safe for alpha-mainnet operation** subject to the open items in `§ 8` and the operator-trust caveats in `§ 6`. The cryptographic core rests on a single audited dependency (`libsodium`) and a small surface of domain-tagged compositions. The implementation has no known memory-safety, integer-overflow, or threading-deadlock bugs at the time of writing.
+AgentChain Engine **v1.0.11** is judged **safe for alpha-mainnet operation** subject to the open items in `§ 8` and the operator-trust caveats in `§ 6`. The cryptographic core rests on a single audited dependency (`libsodium`) and a small surface of domain-tagged compositions. The implementation has no known memory-safety, integer-overflow, or threading-deadlock bugs at the time of writing.
+
+Two structural defects discovered post-launch are now closed: the post-apply validator-set bug (F-14, v1.0.10) and the simultaneously-eligible-leader fork window (F-15, v1.0.11). Both required protocol-level reasoning rather than spot fixes; both were verified against real-WAN mainnet traffic on 2026-05-19. The chain has since produced an uninterrupted single-tip history under v1.0.11.
 
 We will publish a fresh revision of this document on every release that touches cryptography, consensus, or networking.
 

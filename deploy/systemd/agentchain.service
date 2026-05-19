@@ -29,10 +29,12 @@ ProtectControlGroups=true
 ReadWritePaths=/var/lib/agentchain
 LimitNOFILE=65535
 
-# Resource limits — be a polite home guest
-MemoryHigh=256M
-MemoryMax=512M
-CPUQuota=50%
+# Resource limits — calibrated against the GCP Always-Free e2-micro
+# (1 GB RAM, 2 vCPU bursty). Matches the values the audit (SECURITY-AUDIT § 6)
+# records for the live mainnet seed. Tighten further on smaller hosts.
+MemoryHigh=512M
+MemoryMax=768M
+CPUQuota=80%
 
 [Install]
 WantedBy=multi-user.target
