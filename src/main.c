@@ -29,7 +29,9 @@ static void print_usage(const char *argv0) {
         "  keygen     Generate a new Ed25519 keypair to a file\n"
         "  pubkey     Print this node's public key\n"
         "  genesis    Write a genesis configuration file\n"
-        "  send       Submit a transfer transaction via JSON-RPC\n"
+        "  send       Submit a TRANSFER transaction via JSON-RPC\n"
+        "  stake      Submit a STAKE_BOND   transaction (become / top-up a validator)\n"
+        "  unbond     Submit a STAKE_UNBOND transaction (release stake to balance)\n"
         "  balance    Query an account balance via JSON-RPC\n"
         "  info       Print chain info via JSON-RPC\n"
         "  version    Print version and exit\n"
@@ -288,49 +290,62 @@ static int cmd_balance(int argc, char **argv) {
 }
 
 /* -------------------------------------------------------------------------- */
-/* `send`.                                                                    */
+/* Tx-submission helpers (shared by `send`, `stake`, `unbond`).               */
 /* -------------------------------------------------------------------------- */
 
-static int cmd_send(int argc, char **argv) {
-    const char *rpc       = get_opt(argc, argv, "--rpc");
-    const char *key_file  = get_opt(argc, argv, "--from-key");
-    const char *to_hex    = get_opt(argc, argv, "--to");
-    const char *amount_s  = get_opt(argc, argv, "--amount");
-    const char *tip_s     = get_opt(argc, argv, "--tip");
-    const char *memo      = get_opt(argc, argv, "--memo");
-    const char *valid_s   = get_opt(argc, argv, "--valid-slots");
+typedef struct {
+    const char  *rpc;
+    const char  *key_file;
+    const char  *tip_s;
+    const char  *memo;
+    const char  *valid_s;
+} tx_submit_opts_t;
 
-    if (!key_file || !to_hex || !amount_s) {
-        fprintf(stderr, "send: --from-key FILE --to HEX --amount UCRD required\n");
+static tx_submit_opts_t parse_submit_opts(int argc, char **argv) {
+    tx_submit_opts_t o;
+    o.rpc      = get_opt(argc, argv, "--rpc");
+    o.key_file = get_opt(argc, argv, "--from-key");
+    o.tip_s    = get_opt(argc, argv, "--tip");
+    o.memo     = get_opt(argc, argv, "--memo");
+    o.valid_s  = get_opt(argc, argv, "--valid-slots");
+    return o;
+}
+
+/* Submit a signed transaction via JSON-RPC. The caller fills in `kind`,
+ * `body` and `body_len`; this routine fills in chain_id/nonce/sender from
+ * the network, signs, encodes, posts, and prints the response. */
+static int submit_tx(const char *action,
+                     const tx_submit_opts_t *opts,
+                     uint8_t kind,
+                     const uint8_t *body, uint32_t body_len,
+                     uint32_t gas_limit) {
+    if (!opts->key_file) {
+        fprintf(stderr, "%s: --from-key FILE required\n", action);
         return 2;
     }
-    if (!rpc) rpc = "127.0.0.1:30304";
+    const char *rpc = opts->rpc ? opts->rpc : "127.0.0.1:30304";
     char host[64]; uint16_t port;
     if (split_host_port(rpc, host, sizeof(host), &port) < 0) return 2;
 
     if (ac_crypto_init() != 0) return 1;
 
-    /* Load keypair. */
     ac_keypair_t kp;
-    if (ac_node_keypair_load_or_create(key_file, &kp, NULL) != 0) {
-        fprintf(stderr, "send: cannot load %s\n", key_file); return 1;
+    if (ac_node_keypair_load_or_create(opts->key_file, &kp, NULL) != 0) {
+        fprintf(stderr, "%s: cannot load %s\n", action, opts->key_file); return 1;
     }
 
-    /* Get chain_info for chain_id and slot. */
     char resp[8192];
     if (http_post_json(host, port,
             "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"chain_info\"}",
             resp, sizeof(resp)) < 0) {
-        fprintf(stderr, "send: chain_info RPC failed\n"); return 1;
+        fprintf(stderr, "%s: chain_info RPC failed\n", action); return 1;
     }
-    const char *body = http_body(resp);
-    if (!body) return 1;
-    uint64_t chain_id = 0, height = 0, genesis_ts = 0;
-    json_get_uint64(body, "chain_id",              &chain_id);
-    json_get_uint64(body, "height",                &height);
-    json_get_uint64(body, "genesis_timestamp_ms",  &genesis_ts);
+    const char *resp_body = http_body(resp);
+    if (!resp_body) return 1;
+    uint64_t chain_id = 0, genesis_ts = 0;
+    json_get_uint64(resp_body, "chain_id",             &chain_id);
+    json_get_uint64(resp_body, "genesis_timestamp_ms", &genesis_ts);
 
-    /* Get nonce. */
     char sender_hex[2 * AC_PUBKEY_SIZE + 1];
     ac_hex_encode(sender_hex, kp.pk, AC_PUBKEY_SIZE);
     char req[512];
@@ -338,49 +353,47 @@ static int cmd_send(int argc, char **argv) {
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"account_get\",\"params\":{\"address\":\"%s\"}}",
         sender_hex);
     if (http_post_json(host, port, req, resp, sizeof(resp)) < 0) {
-        fprintf(stderr, "send: account_get failed\n"); return 1;
+        fprintf(stderr, "%s: account_get failed\n", action); return 1;
     }
-    body = http_body(resp);
-    if (!body) return 1;
+    resp_body = http_body(resp);
+    if (!resp_body) return 1;
     uint64_t nonce = 0;
-    json_get_uint64(body, "nonce", &nonce);
+    json_get_uint64(resp_body, "nonce", &nonce);
 
-    /* Build tx. */
     ac_tx_t tx;
     memset(&tx, 0, sizeof(tx));
     tx.version    = AC_TX_VERSION;
     tx.chain_id   = chain_id;
-    tx.kind       = AC_TX_TRANSFER;
+    tx.kind       = kind;
     memcpy(tx.sender.b, kp.pk, AC_PUBKEY_SIZE);
     tx.nonce      = nonce;
-    tx.gas_limit  = 1000;
-    tx.tip        = tip_s ? strtoull(tip_s, NULL, 10) : 0;
+    tx.gas_limit  = gas_limit;
+    tx.tip        = opts->tip_s ? strtoull(opts->tip_s, NULL, 10) : 0;
     uint64_t current_slot = (ac_now_ms() - genesis_ts) / AC_SLOT_DURATION_MS;
-    uint64_t valid_window = valid_s ? strtoull(valid_s, NULL, 10) : 600; /* ~20 min */
+    uint64_t valid_window = opts->valid_s ? strtoull(opts->valid_s, NULL, 10) : 600;
     tx.valid_until = current_slot + valid_window;
 
-    /* body: recipient (32) + amount (8). */
-    ac_body_transfer_t bt;
-    if (ac_hex_decode(bt.recipient.b, AC_PUBKEY_SIZE, to_hex) != 0) {
-        fprintf(stderr, "send: bad recipient hex\n"); return 2;
+    if (body_len > 0) {
+        if (body_len > AC_TX_BODY_MAX) {
+            fprintf(stderr, "%s: body too large\n", action); return 1;
+        }
+        memcpy(tx.body, body, body_len);
+        tx.body_len = body_len;
     }
-    bt.amount = strtoull(amount_s, NULL, 10);
-    int bn = ac_body_transfer_encode(tx.body, AC_TX_BODY_MAX, &bt);
-    if (bn < 0) return 1;
-    tx.body_len = (uint32_t)bn;
-
-    if (memo) {
-        size_t ml = strlen(memo);
+    if (opts->memo) {
+        size_t ml = strlen(opts->memo);
         if (ml > AC_MEMO_MAX) ml = AC_MEMO_MAX;
-        memcpy(tx.memo, memo, ml);
+        memcpy(tx.memo, opts->memo, ml);
         tx.memo_len = (uint32_t)ml;
     }
 
-    if (ac_tx_sign(&tx, &kp) != 0) { fprintf(stderr, "send: signing failed\n"); return 1; }
+    if (ac_tx_sign(&tx, &kp) != 0) {
+        fprintf(stderr, "%s: signing failed\n", action); return 1;
+    }
 
     uint8_t bin[AC_TX_MAX_BYTES];
     int n = ac_tx_encode(bin, sizeof(bin), &tx);
-    if (n < 0) { fprintf(stderr, "send: tx encode failed\n"); return 1; }
+    if (n < 0) { fprintf(stderr, "%s: tx encode failed\n", action); return 1; }
     char tx_hex[2 * AC_TX_MAX_BYTES + 1];
     ac_hex_encode(tx_hex, bin, (size_t)n);
 
@@ -391,12 +404,84 @@ static int cmd_send(int argc, char **argv) {
         tx_hex);
     int rc = http_post_json(host, port, req2, resp, sizeof(resp));
     free(req2);
-    if (rc < 0) { fprintf(stderr, "send: tx_submit failed\n"); return 1; }
-    body = http_body(resp);
-    if (!body) return 1;
-    (void)height;
-    puts(body);
+    if (rc < 0) { fprintf(stderr, "%s: tx_submit failed\n", action); return 1; }
+    resp_body = http_body(resp);
+    if (!resp_body) return 1;
+    puts(resp_body);
     return 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/* `send` — TRANSFER.                                                         */
+/* -------------------------------------------------------------------------- */
+
+static int cmd_send(int argc, char **argv) {
+    tx_submit_opts_t opts = parse_submit_opts(argc, argv);
+    const char *to_hex    = get_opt(argc, argv, "--to");
+    const char *amount_s  = get_opt(argc, argv, "--amount");
+
+    if (!to_hex || !amount_s) {
+        fprintf(stderr, "send: --from-key FILE --to HEX --amount UCRD required\n");
+        return 2;
+    }
+
+    ac_body_transfer_t bt;
+    if (ac_hex_decode(bt.recipient.b, AC_PUBKEY_SIZE, to_hex) != 0) {
+        fprintf(stderr, "send: bad recipient hex\n"); return 2;
+    }
+    bt.amount = strtoull(amount_s, NULL, 10);
+    uint8_t body[AC_TX_BODY_MAX];
+    int bn = ac_body_transfer_encode(body, sizeof(body), &bt);
+    if (bn < 0) { fprintf(stderr, "send: body encode failed\n"); return 1; }
+
+    return submit_tx("send", &opts, AC_TX_TRANSFER, body, (uint32_t)bn, /*gas_limit*/ 1000);
+}
+
+/* -------------------------------------------------------------------------- */
+/* `stake` — STAKE_BOND. Moves CRD from balance into validator stake.         */
+/* -------------------------------------------------------------------------- */
+
+static int cmd_stake(int argc, char **argv) {
+    tx_submit_opts_t opts = parse_submit_opts(argc, argv);
+    const char *amount_s  = get_opt(argc, argv, "--amount");
+    if (!amount_s) {
+        fprintf(stderr, "stake: --from-key FILE --amount UCRD required\n"
+                        "  Bonds the given micro-CRD amount from your balance into stake.\n"
+                        "  You become a validator the next time sortition selects your key.\n");
+        return 2;
+    }
+
+    ac_body_stake_t b;
+    b.amount = strtoull(amount_s, NULL, 10);
+    uint8_t body[AC_TX_BODY_MAX];
+    int bn = ac_body_stake_encode(body, sizeof(body), &b);
+    if (bn < 0) { fprintf(stderr, "stake: body encode failed\n"); return 1; }
+
+    return submit_tx("stake", &opts, AC_TX_STAKE_BOND, body, (uint32_t)bn, /*gas_limit*/ 1000);
+}
+
+/* -------------------------------------------------------------------------- */
+/* `unbond` — STAKE_UNBOND. Returns staked CRD to balance.                    */
+/* -------------------------------------------------------------------------- */
+
+static int cmd_unbond(int argc, char **argv) {
+    tx_submit_opts_t opts = parse_submit_opts(argc, argv);
+    const char *amount_s  = get_opt(argc, argv, "--amount");
+    if (!amount_s) {
+        fprintf(stderr, "unbond: --from-key FILE --amount UCRD required\n"
+                        "  Releases the given micro-CRD amount from your stake back to balance.\n"
+                        "  PROTOCOL § 5.2 prescribes a 24-hour cooldown; in v1.0.x the unbond\n"
+                        "  is instant — see TECHNICAL-IMPLEMENTATION § 9.4.\n");
+        return 2;
+    }
+
+    ac_body_stake_t b;
+    b.amount = strtoull(amount_s, NULL, 10);
+    uint8_t body[AC_TX_BODY_MAX];
+    int bn = ac_body_stake_encode(body, sizeof(body), &b);
+    if (bn < 0) { fprintf(stderr, "unbond: body encode failed\n"); return 1; }
+
+    return submit_tx("unbond", &opts, AC_TX_STAKE_UNBOND, body, (uint32_t)bn, /*gas_limit*/ 1000);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -489,6 +574,8 @@ int main(int argc, char **argv) {
     else if (strcmp(cmd, "pubkey") == 0)  rc = cmd_pubkey(argc - 1, argv + 1);
     else if (strcmp(cmd, "genesis") == 0) rc = cmd_genesis(argc - 1, argv + 1);
     else if (strcmp(cmd, "send") == 0)    rc = cmd_send(argc - 1, argv + 1);
+    else if (strcmp(cmd, "stake") == 0)   rc = cmd_stake(argc - 1, argv + 1);
+    else if (strcmp(cmd, "unbond") == 0)  rc = cmd_unbond(argc - 1, argv + 1);
     else if (strcmp(cmd, "balance") == 0) rc = cmd_balance(argc - 1, argv + 1);
     else if (strcmp(cmd, "info") == 0)    rc = cmd_info(argc - 1, argv + 1);
     else if (strcmp(cmd, "--help") == 0 || strcmp(cmd, "-h") == 0) {

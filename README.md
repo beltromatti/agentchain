@@ -145,6 +145,8 @@ agentchain genesis    --chain-id N --out genesis.txt
 
 agentchain send       --rpc URL --from-key node.key
                        --to HEX --amount UCRD [--tip N] [--memo TEXT]
+agentchain stake      --rpc URL --from-key node.key --amount UCRD [--tip N]
+agentchain unbond     --rpc URL --from-key node.key --amount UCRD [--tip N]
 agentchain balance    --rpc URL --address HEX
 agentchain info       --rpc URL
 ```
