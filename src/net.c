@@ -5,10 +5,15 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define AC_MAX_PEERS         64
-#define AC_DEDUP_CAP         256
-#define AC_RECONNECT_BASE_MS 2000
-#define AC_PEER_IDLE_MS      30000
+#define AC_MAX_PEERS              64
+#define AC_DEDUP_CAP              256
+#define AC_RECONNECT_BASE_MS      2000
+#define AC_PEER_IDLE_MS           30000
+
+/* Per-peer outbound queue: bound the memory we will spend buffering for a
+ * single slow peer. When the queue exceeds this, the peer is shut down. */
+#define AC_OUT_QUEUE_MAX_BYTES    (4 * 1024 * 1024)   /* 4 MB */
+#define AC_OUT_QUEUE_MAX_MSGS     2048
 
 /* -------------------------------------------------------------------------- */
 /* Frame I/O.                                                                 */
@@ -76,12 +81,20 @@ static uint8_t *frame_recv(int fd, uint8_t *out_type, size_t *out_len) {
 /* Peer slot.                                                                 */
 /* -------------------------------------------------------------------------- */
 
+typedef struct outbox_msg {
+    uint8_t  type;
+    uint8_t *payload;
+    size_t   len;
+    struct outbox_msg *next;
+} outbox_msg_t;
+
 typedef struct {
     bool        in_use;
-    bool        thread_started;
+    bool        reader_started;
+    bool        writer_started;
     int         fd;
-    pthread_t   thread;
-    pthread_mutex_t write_mu;
+    pthread_t   reader;
+    pthread_t   writer;
     ac_addr_t   peer_id;
     bool        peer_id_known;
     bool        inbound;
@@ -89,6 +102,16 @@ typedef struct {
     uint16_t    port;
     uint64_t    last_seen_ms;
     ac_net_t   *net;
+
+    /* Outbound write queue. The writer thread drains it into the socket;
+     * the consensus thread enqueues without blocking. */
+    pthread_mutex_t  out_mu;
+    pthread_cond_t   out_cv;
+    outbox_msg_t    *out_head;
+    outbox_msg_t    *out_tail;
+    size_t           out_msgs;
+    size_t           out_bytes;
+    bool             out_closing;       /* writer should drain + exit */
 } peer_t;
 
 struct ac_net_s {
@@ -137,16 +160,110 @@ static peer_t *peer_alloc(ac_net_t *n) {
     pthread_mutex_lock(&n->peers_mu);
     for (size_t i = 0; i < AC_MAX_PEERS; ++i) {
         if (!n->peers[i].in_use) {
-            memset(&n->peers[i], 0, sizeof(n->peers[i]));
-            n->peers[i].in_use = true;
-            n->peers[i].fd = -1;
-            n->peers[i].net = n;
-            pthread_mutex_init(&n->peers[i].write_mu, NULL);
+            peer_t *p = &n->peers[i];
+            memset(p, 0, sizeof(*p));
+            p->in_use = true;
+            p->fd = -1;
+            p->net = n;
+            pthread_mutex_init(&p->out_mu, NULL);
+            pthread_cond_init (&p->out_cv, NULL);
             pthread_mutex_unlock(&n->peers_mu);
-            return &n->peers[i];
+            return p;
         }
     }
     pthread_mutex_unlock(&n->peers_mu);
+    return NULL;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Per-peer outbound queue + writer thread.                                   */
+/*                                                                            */
+/* The consensus, network, and RPC threads enqueue messages here. A dedicated */
+/* writer thread per peer drains the queue into the socket. This decouples    */
+/* the producers from a slow peer: a high-latency or wedged peer fills up its */
+/* own queue without blocking the rest of the engine. If the queue exceeds    */
+/* AC_OUT_QUEUE_MAX_BYTES, the peer is shut down by the enqueue side.         */
+/* -------------------------------------------------------------------------- */
+
+static void out_drop_all_locked(peer_t *p) {
+    outbox_msg_t *m = p->out_head;
+    while (m) {
+        outbox_msg_t *next = m->next;
+        free(m->payload);
+        free(m);
+        m = next;
+    }
+    p->out_head = p->out_tail = NULL;
+    p->out_msgs = p->out_bytes = 0;
+}
+
+/* Returns 0 on success, -1 if queue is full (peer too slow) or peer is
+ * closing. On failure the caller should shut the peer down. */
+static int peer_enqueue(peer_t *p, uint8_t type,
+                        const uint8_t *payload, size_t len) {
+    if (len > AC_FRAME_MAX_BYTES - 2) return -1;
+    pthread_mutex_lock(&p->out_mu);
+    if (p->out_closing) {
+        pthread_mutex_unlock(&p->out_mu);
+        return -1;
+    }
+    if (p->out_msgs + 1 > AC_OUT_QUEUE_MAX_MSGS ||
+        p->out_bytes + len > AC_OUT_QUEUE_MAX_BYTES) {
+        pthread_mutex_unlock(&p->out_mu);
+        return -1;
+    }
+    outbox_msg_t *m = (outbox_msg_t *)malloc(sizeof(*m));
+    if (!m) { pthread_mutex_unlock(&p->out_mu); return -1; }
+    m->payload = (uint8_t *)malloc(len > 0 ? len : 1);
+    if (!m->payload) { free(m); pthread_mutex_unlock(&p->out_mu); return -1; }
+    m->type = type;
+    if (len > 0) memcpy(m->payload, payload, len);
+    m->len = len;
+    m->next = NULL;
+    if (p->out_tail) p->out_tail->next = m;
+    else             p->out_head = m;
+    p->out_tail = m;
+    p->out_msgs++;
+    p->out_bytes += len;
+    pthread_cond_signal(&p->out_cv);
+    pthread_mutex_unlock(&p->out_mu);
+    return 0;
+}
+
+static void *writer_loop(void *arg) {
+    peer_t   *p = (peer_t *)arg;
+    ac_net_t *n = p->net;
+    while (n->running) {
+        outbox_msg_t *m = NULL;
+        pthread_mutex_lock(&p->out_mu);
+        while (n->running && !p->out_closing && !p->out_head) {
+            pthread_cond_wait(&p->out_cv, &p->out_mu);
+        }
+        if (!n->running || p->out_closing) {
+            pthread_mutex_unlock(&p->out_mu);
+            break;
+        }
+        m = p->out_head;
+        p->out_head = m->next;
+        if (!p->out_head) p->out_tail = NULL;
+        p->out_msgs--;
+        p->out_bytes -= m->len;
+        pthread_mutex_unlock(&p->out_mu);
+
+        int fd = p->fd;
+        if (fd < 0 || frame_send(fd, m->type, m->payload, m->len) < 0) {
+            /* Wedged or closed peer. Signal the reader to exit. */
+            if (p->fd >= 0) ac_sock_shutdown(p->fd, SHUT_RDWR);
+            free(m->payload); free(m);
+            break;
+        }
+        free(m->payload); free(m);
+    }
+    /* On exit, drop any remaining messages so memory is reclaimed. */
+    pthread_mutex_lock(&p->out_mu);
+    p->out_closing = true;
+    out_drop_all_locked(p);
+    pthread_mutex_unlock(&p->out_mu);
     return NULL;
 }
 
@@ -283,10 +400,8 @@ static void dispatch_message(peer_t *p, uint8_t type, const uint8_t *buf, size_t
         break;
     }
     case AC_MSG_PING: {
-        /* Echo as PONG. */
-        pthread_mutex_lock(&p->write_mu);
-        frame_send(p->fd, AC_MSG_PONG, buf, len);
-        pthread_mutex_unlock(&p->write_mu);
+        /* Echo as PONG via the queue (still non-blocking on producer side). */
+        peer_enqueue(p, AC_MSG_PONG, buf, len);
         break;
     }
     default:
@@ -435,11 +550,15 @@ static void *listen_loop(void *arg) {
         snprintf(p->host, sizeof(p->host), "%s", host);
         p->port = port;
 
-        /* We send HELLO first, then start reader. */
+        /* We send HELLO first (inline, synchronous, while the queue's writer
+         * hasn't taken over the socket), then start the writer + reader. */
         send_hello(n, fd);
 
-        if (pthread_create(&p->thread, NULL, reader_loop, p) == 0) {
-            p->thread_started = true;
+        if (pthread_create(&p->writer, NULL, writer_loop, p) == 0) {
+            p->writer_started = true;
+        }
+        if (pthread_create(&p->reader, NULL, reader_loop, p) == 0) {
+            p->reader_started = true;
         }
     }
     return NULL;
@@ -513,10 +632,16 @@ static int dial_peer(ac_net_t *n, const char *hp) {
     snprintf(peer->host, sizeof(peer->host), "%s", host);
     peer->port = (uint16_t)port;
 
-    /* We initiate HELLO. */
+    /* We initiate HELLO inline (the writer thread hasn't taken over the
+     * socket yet) and then spawn writer + reader. Both are joined by
+     * reap_dead_peers / ac_net_stop — never detached, so we always reap. */
     send_hello(n, fd);
-    pthread_create(&peer->thread, NULL, reader_loop, peer);
-    pthread_detach(peer->thread);
+    if (pthread_create(&peer->writer, NULL, writer_loop, peer) == 0) {
+        peer->writer_started = true;
+    }
+    if (pthread_create(&peer->reader, NULL, reader_loop, peer) == 0) {
+        peer->reader_started = true;
+    }
     return 0;
 }
 
@@ -526,21 +651,35 @@ static int dial_peer(ac_net_t *n, const char *hp) {
 static void reap_dead_peers(ac_net_t *n) {
     for (size_t i = 0; i < AC_MAX_PEERS; ++i) {
         peer_t *p;
-        pthread_t th;
-        bool need_join = false;
+        bool need_join_reader = false;
+        bool need_join_writer = false;
+        pthread_t reader_th = 0, writer_th = 0;
         pthread_mutex_lock(&n->peers_mu);
         p = &n->peers[i];
-        if (p->in_use && p->fd < 0 && p->thread_started) {
-            th = p->thread;
-            need_join = true;
+        if (p->in_use && p->fd < 0) {
+            if (p->reader_started) { reader_th = p->reader; need_join_reader = true; }
+            if (p->writer_started) { writer_th = p->writer; need_join_writer = true; }
         }
         pthread_mutex_unlock(&n->peers_mu);
-        if (need_join) {
-            pthread_join(th, NULL); /* fast: reader_loop already returned */
+
+        if (need_join_writer) {
+            /* Wake the writer so it observes out_closing and exits. */
+            pthread_mutex_lock(&p->out_mu);
+            p->out_closing = true;
+            pthread_cond_broadcast(&p->out_cv);
+            pthread_mutex_unlock(&p->out_mu);
+            pthread_join(writer_th, NULL);
+        }
+        if (need_join_reader) {
+            pthread_join(reader_th, NULL);
+        }
+        if (need_join_reader || need_join_writer) {
             pthread_mutex_lock(&n->peers_mu);
             if (p->in_use && p->fd < 0) {
-                p->thread_started = false;
-                pthread_mutex_destroy(&p->write_mu);
+                p->reader_started = false;
+                p->writer_started = false;
+                pthread_mutex_destroy(&p->out_mu);
+                pthread_cond_destroy (&p->out_cv);
                 p->in_use = false;
             }
             pthread_mutex_unlock(&n->peers_mu);
@@ -674,16 +813,25 @@ void ac_net_stop(ac_net_t *n) {
         }
     }
     pthread_mutex_unlock(&n->peers_mu);
-    /* Join every started reader thread and release the slot. */
+    /* Wake every writer so it observes out_closing and exits. */
     for (size_t i = 0; i < AC_MAX_PEERS; ++i) {
-        if (n->peers[i].thread_started) {
-            pthread_join(n->peers[i].thread, NULL);
-            n->peers[i].thread_started = false;
-        }
-        if (n->peers[i].in_use) {
-            pthread_mutex_destroy(&n->peers[i].write_mu);
-            if (n->peers[i].fd >= 0) { ac_sock_close(n->peers[i].fd); n->peers[i].fd = -1; }
-            n->peers[i].in_use = false;
+        peer_t *p = &n->peers[i];
+        if (!p->in_use) continue;
+        pthread_mutex_lock(&p->out_mu);
+        p->out_closing = true;
+        pthread_cond_broadcast(&p->out_cv);
+        pthread_mutex_unlock(&p->out_mu);
+    }
+    /* Join every started reader + writer thread and release the slot. */
+    for (size_t i = 0; i < AC_MAX_PEERS; ++i) {
+        peer_t *p = &n->peers[i];
+        if (p->reader_started) { pthread_join(p->reader, NULL); p->reader_started = false; }
+        if (p->writer_started) { pthread_join(p->writer, NULL); p->writer_started = false; }
+        if (p->in_use) {
+            pthread_mutex_destroy(&p->out_mu);
+            pthread_cond_destroy (&p->out_cv);
+            if (p->fd >= 0) { ac_sock_close(p->fd); p->fd = -1; }
+            p->in_use = false;
         }
     }
 }
@@ -696,14 +844,11 @@ void ac_net_broadcast(ac_net_t *n, uint8_t msg_type,
         peer_t *p = &n->peers[i];
         if (!p->in_use || !p->peer_id_known || p->fd < 0) continue;
         if (exclude_peer_id && ac_addr_eq(&p->peer_id, exclude_peer_id)) continue;
-        pthread_mutex_lock(&p->write_mu);
-        int wr = frame_send(p->fd, msg_type, payload, len);
-        pthread_mutex_unlock(&p->write_mu);
-        if (wr < 0 && p->fd >= 0) {
-            /* Wedged peer: shutdown so the reader thread exits and the slot
-             * is reaped. The consensus thread cannot be stalled by a slow or
-             * dead peer beyond a single SO_SNDTIMEO interval. */
-            ac_sock_shutdown(p->fd, SHUT_RDWR);
+        /* Non-blocking enqueue. If the queue is full (peer too slow), drop
+         * the message and shut down the peer's connection; its reader thread
+         * will exit and the slot is reaped on the next connector tick. */
+        if (peer_enqueue(p, msg_type, payload, len) < 0) {
+            if (p->fd >= 0) ac_sock_shutdown(p->fd, SHUT_RDWR);
         }
     }
     pthread_mutex_unlock(&n->peers_mu);
@@ -717,9 +862,7 @@ int ac_net_send_to(ac_net_t *n, const ac_addr_t *peer_id,
         peer_t *p = &n->peers[i];
         if (!p->in_use || !p->peer_id_known || p->fd < 0) continue;
         if (!ac_addr_eq(&p->peer_id, peer_id)) continue;
-        pthread_mutex_lock(&p->write_mu);
-        rc = frame_send(p->fd, msg_type, payload, len);
-        pthread_mutex_unlock(&p->write_mu);
+        rc = peer_enqueue(p, msg_type, payload, len);
         if (rc < 0 && p->fd >= 0) ac_sock_shutdown(p->fd, SHUT_RDWR);
         break;
     }
