@@ -1,6 +1,6 @@
-# AgentChain Security Audit — v1.0.5
+# AgentChain Security Audit — v1.0.7
 
-**Audited release:** AgentChain Engine v1.0.5 (`commit 208e45d`)
+**Audited release:** AgentChain Engine v1.0.7 (`commit 2b84a05`)
 **Audit date:** 2026-05-19
 **Auditor:** Noesis AI — internal review
 **Scope:** Reference C client + AgentChain Protocol v1, including the live mainnet (`chain_id=1`) bootstrap operated by Noesis AI on Google Cloud.
@@ -99,6 +99,8 @@ The codebase is ~5,200 lines of C11 against POSIX. We audited every `malloc`/`fr
 | F-8 | Connector opens N redundant connections to the same seed (broadcast amplification) | Medium | **Resolved (v1.0.3).** `dial_peer` deduplicates by `host:port`; `reader_loop` drops duplicate `peer_id` at the HELLO stage. Outbound target capped at `min(target_outbound, seed_count)`. |
 | F-9 | Peer slot leak after disconnect (`in_use=true, fd=-1` permanent) | Medium | **Resolved (v1.0.4).** `connector_loop` calls `reap_dead_peers` each tick, joining the reader thread of any slot whose fd has been closed and releasing the slot. |
 | F-10 | `HEADERS_REQ` storm from a gossip-lagging peer | Medium | **Resolved (v1.0.5).** Local rate-limits `HEADERS_REQ` to at most one per 4 s (or when the tip gap grows by >64); per-request batch raised from 64 to 256 blocks. |
+| F-11 | Synchronous broadcast can stall consensus thread on a slow peer | High | **Resolved (v1.0.6).** Each peer slot owns a non-blocking outbound queue + a dedicated writer thread; producers (`ac_net_broadcast`, `ac_net_send_to`) enqueue and return immediately. A peer that overflows its 4 MB queue is shut down. |
+| F-12 | `ac_block_decode` reads `body_len` at the wrong offset for transactions; first block containing a tx halts catch-up sync | Critical | **Resolved (v1.0.7).** Corrected offset (70 instead of 66) in the tx-length walker; reject `body_len > AC_TX_BODY_MAX` and `memo_len > AC_MEMO_MAX` before consuming the cursor. Regression test added (`tests/test_codec.c::test_full_block_with_tx_roundtrip`). |
 
 **Tools applied:** GCC and Clang at `-Wall -Wextra -Wpedantic -Wshadow -Wstrict-prototypes -Wmissing-prototypes -Wpointer-arith -Wcast-align -Wwrite-strings -Wunreachable-code -Wformat=2 -Wformat-security -Wundef`, treated as errors in CI on the `build.yml` workflow. The current `main` builds with `-Werror` clean across Ubuntu 22.04 (GCC 11), Ubuntu 24.04 ARM (GCC 13), macOS 14 (Apple Clang), and Windows 2022 (MinGW64 GCC 14). *[evidence: `.github/workflows/build.yml`]*
 
@@ -203,7 +205,11 @@ Honestly enumerated; tracked for v1.1:
 - O-5. **Instant unbonding.** `STAKE_UNBOND` releases funds immediately rather than after the 24-hour cooldown specified in the protocol. Cooldown queue is on the v1.1 roadmap.
 - O-6. **No real-time equivocation watcher.** The protocol defines a slashable `SLASH_EVIDENCE` transaction; the engine verifies submitted evidence but does not yet proactively scan for double-signing.
 - O-7. **State-format rewriter for SMT.** v1 rewrites the full state file every block, which is fine at current scale but does not scale linearly with account count. v1.1 plans a sparse-Merkle-tree state with incremental writes.
-- O-8. **Gossip-driven steady-state sync is not yet robust under high WAN latency.** Live testing of v1.0.5 on the Iowa↔Italy link reproducibly synchronises ~50–65 blocks then stalls; the underlying cause is the synchronous broadcast path holding the per-peer write mutex, which under residential RTT can starve subsequent writes for the SO_SNDTIMEO window. Initial bulk sync via `HEADERS_REQ` works correctly. The workaround for v1.0.x peers that fall behind is to restart the client; that triggers a fresh `HEADERS_REQ` burst which catches up the next 256 blocks. v1.1 will replace the synchronous broadcast path with a per-peer non-blocking write queue.
+- O-8. *(Closed in v1.0.6 + v1.0.7.)* The original report — "gossip-driven steady-state sync stalls at ~50–65 blocks under high WAN latency" — turned out to be **two distinct bugs**, both now fixed and proven against the live Iowa↔Italy mainnet:
+  - v1.0.6 introduced a per-peer asynchronous outbound queue so a slow link can no longer back-pressure the consensus thread (F-11).
+  - v1.0.7 fixed a long-latent off-by-4 in `ac_block_decode`'s transaction-length walker (F-12) that made the first block containing a tx undecodable. Every prior version exhibited the same stall *at the same height* (the height of the first non-empty block); the symptom looked network-related but was a wire-format decode bug.
+
+  Live evidence (Iowa seed at chain_id=1, ~27k blocks at the time of test): a fresh peer connected from Italy catches up at ~50 blocks/s; drift to tip shrinks monotonically and reaches single-digit blocks in a few minutes. Full sync is now functional.
 
 ---
 
