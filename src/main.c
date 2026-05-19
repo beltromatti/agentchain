@@ -27,6 +27,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#ifndef _WIN32
+#  include <sys/wait.h>
+#  include <unistd.h>
+#endif
 
 /* -------------------------------------------------------------------------- */
 /* argv helpers.                                                              */
@@ -242,15 +246,15 @@ static int rpc_call(const char *url, const char *body, char *resp, size_t resp_c
         url += 7;
     }
     /* host[:port] form. */
-    char host[128]; uint16_t port;
-    char hp[160];
-    snprintf(hp, sizeof(hp), "%s", url);
+    char host[256]; uint16_t port;
+    char hp[256];
+    snprintf(hp, sizeof(hp), "%.*s", (int)(sizeof(hp) - 1), url);
     /* Strip trailing path. */
     char *slash = strchr(hp, '/');
     if (slash) *slash = '\0';
     if (parse_host_port(hp, host, sizeof(host), &port) < 0) {
         /* Maybe no port — default to 30304. */
-        snprintf(host, sizeof(host), "%s", hp);
+        snprintf(host, sizeof(host), "%.*s", (int)(sizeof(host) - 1), hp);
         port = 30304;
     }
     return http_post_native(host, port, body, resp, resp_cap);
@@ -830,13 +834,18 @@ static int cmd_node(int argc, char **argv) {
 
     ac_log_init(verbose ? AC_LOG_DEBUG : AC_LOG_INFO);
 
-    snprintf(cfg.data_dir,     sizeof(cfg.data_dir),     "%s", dd);
-    snprintf(cfg.genesis_path, sizeof(cfg.genesis_path), "%s", gen);
-    snprintf(cfg.listen_host,  sizeof(cfg.listen_host),  "%s", host ? host : "0.0.0.0");
+    snprintf(cfg.data_dir,     sizeof(cfg.data_dir),     "%.*s",
+             (int)(sizeof(cfg.data_dir)     - 1), dd);
+    snprintf(cfg.genesis_path, sizeof(cfg.genesis_path), "%.*s",
+             (int)(sizeof(cfg.genesis_path) - 1), gen);
+    snprintf(cfg.listen_host,  sizeof(cfg.listen_host),  "%.*s",
+             (int)(sizeof(cfg.listen_host)  - 1), host ? host : "0.0.0.0");
     cfg.listen_port = (uint16_t)(port_s     ? atoi(port_s)     : 30303);
-    snprintf(cfg.rpc_host,     sizeof(cfg.rpc_host),     "%s", rpc_host ? rpc_host : "127.0.0.1");
+    snprintf(cfg.rpc_host,     sizeof(cfg.rpc_host),     "%.*s",
+             (int)(sizeof(cfg.rpc_host)     - 1), rpc_host ? rpc_host : "127.0.0.1");
     cfg.rpc_port    = (uint16_t)(rpc_port_s ? atoi(rpc_port_s) : 30304);
-    if (ext) snprintf(cfg.external_host, sizeof(cfg.external_host), "%s", ext);
+    if (ext) snprintf(cfg.external_host, sizeof(cfg.external_host), "%.*s",
+                      (int)(sizeof(cfg.external_host) - 1), ext);
     cfg.validator = validator;
 
     /* Seeds: explicit override wins, otherwise fall back to mainnet seeds. */
