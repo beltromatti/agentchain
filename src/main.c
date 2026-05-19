@@ -1,9 +1,21 @@
-/* AgentChain Engine — CLI entry point. */
+/* AgentChain Engine — CLI entry point.
+ *
+ * Defaults aim to make the common path one-liner-short:
+ *   - No --rpc           → talk to the mainnet public endpoint over HTTPS.
+ *   - No --from-key / --key → use ~/.agentchain/node.key.
+ *   - No --data-dir      → use ~/.agentchain.
+ *   - No --genesis       → use the mainnet genesis embedded in this binary.
+ *   - No --seeds         → use the mainnet bootstrap seed.
+ *
+ * Every default is overridable via the obvious flag. Operators running
+ * testnets or air-gapped clusters keep the same command surface.
+ */
 
 #include "chain.h"
 #include "codec.h"
 #include "common.h"
 #include "crypto.h"
+#include "mainnet.h"
 #include "node.h"
 #include "portable.h"
 #include "version.h"
@@ -14,34 +26,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 /* -------------------------------------------------------------------------- */
-/* Usage banner.                                                              */
-/* -------------------------------------------------------------------------- */
-
-static void print_usage(const char *argv0) {
-    fprintf(stderr,
-        "AgentChain Engine %s (%s)\n"
-        "Usage: %s <command> [options]\n"
-        "\n"
-        "Commands:\n"
-        "  node       Run a node (consensus + p2p + RPC)\n"
-        "  keygen     Generate a new Ed25519 keypair to a file\n"
-        "  pubkey     Print this node's public key\n"
-        "  genesis    Write a genesis configuration file\n"
-        "  send       Submit a TRANSFER transaction via JSON-RPC\n"
-        "  stake      Submit a STAKE_BOND   transaction (become / top-up a validator)\n"
-        "  unbond     Submit a STAKE_UNBOND transaction (release stake to balance)\n"
-        "  balance    Query an account balance via JSON-RPC\n"
-        "  info       Print chain info via JSON-RPC\n"
-        "  version    Print version and exit\n"
-        "\n"
-        "Use 'agentchain <command> --help' for command-specific options.\n",
-        AGENTCHAIN_VERSION, AGENTCHAIN_GIT_COMMIT, argv0);
-}
-
-/* -------------------------------------------------------------------------- */
-/* Tiny argv parser helpers.                                                  */
+/* argv helpers.                                                              */
 /* -------------------------------------------------------------------------- */
 
 static const char *get_opt(int argc, char **argv, const char *name) {
@@ -58,6 +46,57 @@ static bool has_flag(int argc, char **argv, const char *name) {
 }
 
 /* -------------------------------------------------------------------------- */
+/* Default paths under $HOME/.agentchain.                                     */
+/* -------------------------------------------------------------------------- */
+
+static const char *home_dir(void) {
+    const char *h = getenv("HOME");
+#ifdef _WIN32
+    if (!h || !*h) h = getenv("USERPROFILE");
+#endif
+    return (h && *h) ? h : ".";
+}
+
+/* Fill `out` with $HOME/.agentchain (or just .agentchain if HOME is unset). */
+static void default_data_dir(char *out, size_t cap) {
+    snprintf(out, cap, "%s/.agentchain", home_dir());
+}
+static void default_key_path(char *out, size_t cap) {
+    snprintf(out, cap, "%s/.agentchain/node.key", home_dir());
+}
+
+/* -------------------------------------------------------------------------- */
+/* Usage banner.                                                              */
+/* -------------------------------------------------------------------------- */
+
+static void print_usage(const char *argv0) {
+    fprintf(stderr,
+        "AgentChain Engine %s (%s)\n"
+        "Usage: %s <command> [options]\n"
+        "\n"
+        "Wallet & queries\n"
+        "  keygen     Create a new keypair (defaults to ~/.agentchain/node.key)\n"
+        "  pubkey     Print your public address (hex)\n"
+        "  balance    Look up an account on the chain\n"
+        "  info       Print current chain state\n"
+        "\n"
+        "Transactions (signed locally, broadcast via JSON-RPC)\n"
+        "  send       Transfer CRD to another address\n"
+        "  stake      Bond CRD to become / top-up a validator\n"
+        "  unbond     Release stake back to balance\n"
+        "\n"
+        "Operating a node\n"
+        "  node       Join the network (sync). Add --validator to propose blocks.\n"
+        "  genesis    Write a genesis file (advanced; for new testnets)\n"
+        "\n"
+        "  version    Print version and exit\n"
+        "  help       Show this banner; 'agentchain <cmd> --help' for details\n"
+        "\n"
+        "Defaults: RPC = %s   key = ~/.agentchain/node.key   data = ~/.agentchain\n",
+        AGENTCHAIN_VERSION, AGENTCHAIN_GIT_COMMIT, argv0, AC_MAINNET_RPC);
+}
+
+/* -------------------------------------------------------------------------- */
 /* `version`.                                                                 */
 /* -------------------------------------------------------------------------- */
 
@@ -68,27 +107,240 @@ static int cmd_version(void) {
 }
 
 /* -------------------------------------------------------------------------- */
+/* RPC client — supports http:// and https://.                                */
+/*                                                                            */
+/* For https:// we shell out to `curl` (universally available on the          */
+/* platforms we ship binaries for). For http:// or bare host:port we use a    */
+/* small native client to keep loopback queries dependency-free.              */
+/* -------------------------------------------------------------------------- */
+
+static int parse_host_port(const char *hp, char *host, size_t host_cap, uint16_t *port) {
+    const char *colon = strrchr(hp, ':');
+    if (!colon) return -1;
+    size_t hl = (size_t)(colon - hp);
+    if (hl >= host_cap) return -1;
+    memcpy(host, hp, hl); host[hl] = '\0';
+    int p = atoi(colon + 1);
+    if (p <= 0 || p > 65535) return -1;
+    *port = (uint16_t)p;
+    return 0;
+}
+
+static int http_post_native(const char *host, uint16_t port,
+                            const char *body, char *resp, size_t resp_cap) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    char pstr[8]; snprintf(pstr, sizeof(pstr), "%u", port);
+    if (getaddrinfo(host, pstr, &hints, &res) != 0) { ac_sock_close(fd); return -1; }
+    int rc = connect(fd, res->ai_addr, res->ai_addrlen);
+    freeaddrinfo(res);
+    if (rc < 0) { ac_sock_close(fd); return -1; }
+
+    char header[256];
+    int hn = snprintf(header, sizeof(header),
+        "POST / HTTP/1.1\r\nHost: %s\r\nContent-Type: application/json\r\n"
+        "User-Agent: %s\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
+        host, AGENTCHAIN_USER_AGENT, strlen(body));
+    if (ac_sock_send(fd, header, (size_t)hn) < 0) { ac_sock_close(fd); return -1; }
+    if (ac_sock_send(fd, body, strlen(body)) < 0) { ac_sock_close(fd); return -1; }
+
+    size_t total = 0;
+    while (total + 1 < resp_cap) {
+        ssize_t n = ac_sock_recv(fd, resp + total, resp_cap - 1 - total);
+        if (n <= 0) break;
+        total += (size_t)n;
+    }
+    resp[total] = '\0';
+    ac_sock_close(fd);
+
+    /* Strip HTTP headers — caller only wants the body. */
+    const char *p = strstr(resp, "\r\n\r\n");
+    if (p) {
+        size_t body_len = total - (size_t)(p + 4 - resp);
+        memmove(resp, p + 4, body_len);
+        resp[body_len] = '\0';
+        return (int)body_len;
+    }
+    return (int)total;
+}
+
+/* Shell-out via curl for HTTPS. We bind to a fixed argv list so caller-
+ * supplied URLs cannot inject extra args. The body is passed via stdin to
+ * avoid command-line length limits and quoting bugs. */
+static int https_post_curl(const char *url, const char *body, char *resp, size_t resp_cap) {
+#ifdef _WIN32
+    (void)url; (void)body; (void)resp; (void)resp_cap;
+    fprintf(stderr, "https client requires `curl` on the system PATH.\n");
+    return -1;
+#else
+    int in_pipe[2], out_pipe[2];
+    if (pipe(in_pipe) < 0)  return -1;
+    if (pipe(out_pipe) < 0) { close(in_pipe[0]); close(in_pipe[1]); return -1; }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(in_pipe[0]); close(in_pipe[1]);
+        close(out_pipe[0]); close(out_pipe[1]);
+        return -1;
+    }
+    if (pid == 0) {
+        /* Child: wire stdin from in_pipe, stdout to out_pipe. */
+        dup2(in_pipe[0], 0);
+        dup2(out_pipe[1], 1);
+        close(in_pipe[1]); close(out_pipe[0]);
+        execlp("curl", "curl",
+               "-sS",                            /* silent on success, error on stderr */
+               "-X", "POST",
+               "-H", "Content-Type: application/json",
+               "-H", "User-Agent: " AGENTCHAIN_USER_AGENT,
+               "--max-time", "20",
+               "--data-binary", "@-",            /* read body from stdin */
+               url,
+               (char *)NULL);
+        fprintf(stderr, "exec curl failed: %s\n", strerror(errno));
+        _exit(127);
+    }
+    /* Parent: write body, read response. */
+    close(in_pipe[0]); close(out_pipe[1]);
+    size_t blen = strlen(body), written = 0;
+    while (written < blen) {
+        ssize_t n = write(in_pipe[1], body + written, blen - written);
+        if (n <= 0) break;
+        written += (size_t)n;
+    }
+    close(in_pipe[1]);
+    size_t total = 0;
+    while (total + 1 < resp_cap) {
+        ssize_t n = read(out_pipe[0], resp + total, resp_cap - 1 - total);
+        if (n <= 0) break;
+        total += (size_t)n;
+    }
+    resp[total] = '\0';
+    close(out_pipe[0]);
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+    if (WIFEXITED(status) && WEXITSTATUS(status) != 0) {
+        /* curl printed its error on stderr (inherited from parent). */
+        return -1;
+    }
+    return (int)total;
+#endif
+}
+
+/* Top-level RPC call. Picks transport from URL scheme. */
+static int rpc_call(const char *url, const char *body, char *resp, size_t resp_cap) {
+    if (strncmp(url, "https://", 8) == 0) {
+        return https_post_curl(url, body, resp, resp_cap);
+    }
+    if (strncmp(url, "http://", 7) == 0) {
+        url += 7;
+    }
+    /* host[:port] form. */
+    char host[128]; uint16_t port;
+    char hp[160];
+    snprintf(hp, sizeof(hp), "%s", url);
+    /* Strip trailing path. */
+    char *slash = strchr(hp, '/');
+    if (slash) *slash = '\0';
+    if (parse_host_port(hp, host, sizeof(host), &port) < 0) {
+        /* Maybe no port — default to 30304. */
+        snprintf(host, sizeof(host), "%s", hp);
+        port = 30304;
+    }
+    return http_post_native(host, port, body, resp, resp_cap);
+}
+
+/* JSON helper: extract a uint64 next to a "key":… occurrence. */
+static int json_get_uint64(const char *body, const char *key, uint64_t *out) {
+    char pattern[64];
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    const char *p = strstr(body, pattern);
+    if (!p) return -1;
+    p += strlen(pattern);
+    while (*p == ' ' || *p == '\t' || *p == ':') p++;
+    if (!isdigit((unsigned char)*p)) return -1;
+    *out = strtoull(p, NULL, 10);
+    return 0;
+}
+
+/* Pretty-print: extract a hex string field, e.g. "hash":"…". Returns
+ * 0 on success and fills `out` (null-terminated). */
+static int json_get_hex(const char *body, const char *key, char *out, size_t cap) {
+    char pattern[64];
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    const char *p = strstr(body, pattern);
+    if (!p) return -1;
+    p += strlen(pattern);
+    while (*p == ' ' || *p == '\t' || *p == ':' || *p == '"') p++;
+    size_t n = 0;
+    while (*p && *p != '"' && n + 1 < cap) out[n++] = *p++;
+    out[n] = '\0';
+    return 0;
+}
+
+/* -------------------------------------------------------------------------- */
 /* `keygen`.                                                                  */
 /* -------------------------------------------------------------------------- */
 
 static int cmd_keygen(int argc, char **argv) {
+    if (has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
+        fprintf(stderr,
+            "Usage: agentchain keygen [--out FILE]\n"
+            "\n"
+            "Create a fresh Ed25519 keypair. The private seed is written 0600 to\n"
+            "the path you choose (default: ~/.agentchain/node.key). The public\n"
+            "key (= your AgentChain address) is printed on stdout.\n"
+            "\n"
+            "Existing files are NEVER overwritten — this is a destructive op for\n"
+            "your wallet. Use `--out` to pick a different path if the default is\n"
+            "taken.\n");
+        return 0;
+    }
+
     const char *out = get_opt(argc, argv, "--out");
-    if (!out) { fprintf(stderr, "keygen: --out FILE required\n"); return 2; }
-    if (ac_crypto_init() != 0) return 1;
-    if (ac_file_exists(out)) {
-        fprintf(stderr, "keygen: refusing to overwrite existing file %s\n", out);
+    char default_path[1024];
+    if (!out) {
+        default_key_path(default_path, sizeof(default_path));
+        out = default_path;
+    }
+
+    if (ac_crypto_init() != 0) {
+        fprintf(stderr, "keygen: libsodium init failed\n");
         return 1;
     }
+    if (ac_file_exists(out)) {
+        fprintf(stderr,
+            "keygen: refusing to overwrite existing file %s\n"
+            "        (move it aside or pass --out to write elsewhere)\n", out);
+        return 1;
+    }
+    /* Ensure the parent dir exists. */
+    {
+        char dir[1024];
+        snprintf(dir, sizeof(dir), "%s", out);
+        char *last = strrchr(dir, '/');
+        if (last) { *last = '\0'; if (dir[0]) ac_mkdir_p(dir); }
+    }
+
     ac_keypair_t kp;
     bool created = false;
     if (ac_node_keypair_load_or_create(out, &kp, &created) != 0) {
-        fprintf(stderr, "keygen: failed to write %s\n", out);
+        fprintf(stderr, "keygen: failed to write %s: %s\n", out, strerror(errno));
         return 1;
     }
     char hex[2 * AC_PUBKEY_SIZE + 1];
     ac_hex_encode(hex, kp.pk, AC_PUBKEY_SIZE);
-    printf("pubkey: %s\n", hex);
-    printf("wrote:  %s (mode 0600)\n", out);
+    printf("address: %s\n", hex);
+    printf("wrote:   %s (mode 0600)\n", out);
+    fprintf(stderr,
+        "\nKeep this file safe. Anyone with it can spend your balance and sign\n"
+        "blocks under your validator key. Back it up offline.\n");
     return 0;
 }
 
@@ -97,6 +349,14 @@ static int cmd_keygen(int argc, char **argv) {
 /* -------------------------------------------------------------------------- */
 
 static int cmd_pubkey(int argc, char **argv) {
+    if (has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
+        fprintf(stderr,
+            "Usage: agentchain pubkey [--key FILE | --data-dir DIR]\n"
+            "\n"
+            "Print the public address of the key file. With no arguments, reads\n"
+            "~/.agentchain/node.key.\n");
+        return 0;
+    }
     const char *dd = get_opt(argc, argv, "--data-dir");
     const char *kp = get_opt(argc, argv, "--key");
     char path[1024];
@@ -105,10 +365,14 @@ static int cmd_pubkey(int argc, char **argv) {
     } else if (dd) {
         ac_join_path(path, sizeof(path), dd, "node.key");
     } else {
-        fprintf(stderr, "pubkey: --data-dir DIR or --key FILE required\n");
-        return 2;
+        default_key_path(path, sizeof(path));
     }
-    if (!ac_file_exists(path)) { fprintf(stderr, "pubkey: %s not found\n", path); return 1; }
+    if (!ac_file_exists(path)) {
+        fprintf(stderr,
+            "pubkey: %s not found.\n"
+            "        Run 'agentchain keygen' to create a key.\n", path);
+        return 1;
+    }
     if (ac_crypto_init() != 0) return 1;
     ac_keypair_t k;
     if (ac_node_keypair_load_or_create(path, &k, NULL) != 0) {
@@ -124,11 +388,19 @@ static int cmd_pubkey(int argc, char **argv) {
 /* -------------------------------------------------------------------------- */
 /* `genesis`.                                                                 */
 /* -------------------------------------------------------------------------- */
-/* Usage:
- *   agentchain genesis --chain-id N [--timestamp-ms N] --out FILE
- *                       --account hex:bal:stake [--account ...]
- */
+
 static int cmd_genesis(int argc, char **argv) {
+    if (has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
+        fprintf(stderr,
+            "Usage: agentchain genesis --chain-id N --out FILE\n"
+            "                          [--timestamp-ms N] [--account HEX:BAL:STAKE ...]\n"
+            "\n"
+            "Write a fresh genesis configuration file. Used to bootstrap testnets\n"
+            "(joining mainnet does not require this — the mainnet genesis is\n"
+            "embedded in the binary and used automatically when no --genesis is\n"
+            "passed to `agentchain node`).\n");
+        return 0;
+    }
     const char *cid_s = get_opt(argc, argv, "--chain-id");
     const char *ts_s  = get_opt(argc, argv, "--timestamp-ms");
     const char *out   = get_opt(argc, argv, "--out");
@@ -164,103 +436,45 @@ static int cmd_genesis(int argc, char **argv) {
 }
 
 /* -------------------------------------------------------------------------- */
-/* HTTP client for `send`/`balance`/`info`.                                   */
-/* -------------------------------------------------------------------------- */
-
-static int http_post_json(const char *host, uint16_t port,
-                          const char *body, char *resp, size_t resp_cap) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
-    struct sockaddr_in sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sin_family = AF_INET;
-    sa.sin_port   = htons(port);
-
-    /* Resolve host. */
-    struct addrinfo hints, *res = NULL;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    char pstr[8]; snprintf(pstr, sizeof(pstr), "%u", port);
-    if (getaddrinfo(host, pstr, &hints, &res) != 0) { ac_sock_close(fd); return -1; }
-    int rc = connect(fd, res->ai_addr, res->ai_addrlen);
-    freeaddrinfo(res);
-    if (rc < 0) { ac_sock_close(fd); return -1; }
-
-    char header[256];
-    int hn = snprintf(header, sizeof(header),
-        "POST / HTTP/1.1\r\nHost: %s\r\nContent-Type: application/json\r\n"
-        "Content-Length: %zu\r\nConnection: close\r\n\r\n",
-        host, strlen(body));
-    if (ac_sock_send(fd, header, (size_t)hn) < 0) { ac_sock_close(fd); return -1; }
-    if (ac_sock_send(fd, body, strlen(body)) < 0) { ac_sock_close(fd); return -1; }
-
-    /* Read response. */
-    size_t total = 0;
-    while (total + 1 < resp_cap) {
-        ssize_t n = ac_sock_recv(fd, resp + total, resp_cap - 1 - total);
-        if (n <= 0) break;
-        total += (size_t)n;
-    }
-    resp[total] = '\0';
-    ac_sock_close(fd);
-    return (int)total;
-}
-
-/* Returns pointer to start of HTTP body, or NULL. */
-static const char *http_body(const char *resp) {
-    const char *p = strstr(resp, "\r\n\r\n");
-    return p ? p + 4 : NULL;
-}
-
-/* Parse a numeric JSON field. */
-static int json_get_uint64(const char *body, const char *key, uint64_t *out) {
-    char pattern[64];
-    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
-    const char *p = strstr(body, pattern);
-    if (!p) return -1;
-    p += strlen(pattern);
-    while (*p == ' ' || *p == '\t' || *p == ':') p++;
-    if (!isdigit((unsigned char)*p)) return -1;
-    *out = strtoull(p, NULL, 10);
-    return 0;
-}
-
-/* Reserved for future RPC commands that need to parse string fields. */
-
-/* Parse host:port. */
-static int split_host_port(const char *rpc, char *host, size_t host_cap, uint16_t *port) {
-    const char *colon = strrchr(rpc, ':');
-    if (!colon) return -1;
-    size_t hl = (size_t)(colon - rpc);
-    if (hl >= host_cap) return -1;
-    memcpy(host, rpc, hl); host[hl] = '\0';
-    int p = atoi(colon + 1);
-    if (p <= 0 || p > 65535) return -1;
-    *port = (uint16_t)p;
-    return 0;
-}
-
-/* -------------------------------------------------------------------------- */
 /* `info`.                                                                    */
 /* -------------------------------------------------------------------------- */
 
 static int cmd_info(int argc, char **argv) {
+    if (has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
+        fprintf(stderr,
+            "Usage: agentchain info [--rpc URL]\n"
+            "\n"
+            "Print the current chain state (height, tip hash, base fee, …).\n"
+            "Defaults to %s.\n", AC_MAINNET_RPC);
+        return 0;
+    }
     const char *rpc = get_opt(argc, argv, "--rpc");
-    if (!rpc) rpc = "127.0.0.1:30304";
-    char host[64]; uint16_t port;
-    if (split_host_port(rpc, host, sizeof(host), &port) < 0) {
-        fprintf(stderr, "info: bad --rpc URL\n"); return 2;
-    }
+    if (!rpc) rpc = AC_MAINNET_RPC;
+
     char resp[8192];
-    if (http_post_json(host, port,
-            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"chain_info\"}",
-            resp, sizeof(resp)) < 0) {
-        fprintf(stderr, "info: RPC connect failed\n"); return 1;
+    int rc = rpc_call(rpc, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"chain_info\"}",
+                      resp, sizeof(resp));
+    if (rc < 0) {
+        fprintf(stderr, "info: cannot reach %s\n", rpc);
+        return 1;
     }
-    const char *body = http_body(resp);
-    if (!body) { fprintf(stderr, "info: bad response\n"); return 1; }
-    puts(body);
+    /* Try to pretty-print the well-known fields; fall back to raw on parse fail. */
+    uint64_t cid = 0, height = 0, base_fee = 0, genesis_ts = 0;
+    if (json_get_uint64(resp, "chain_id", &cid) == 0 &&
+        json_get_uint64(resp, "height",   &height) == 0) {
+        char tip[128] = {0};
+        json_get_hex(resp, "tip_hash", tip, sizeof(tip));
+        json_get_uint64(resp, "base_fee", &base_fee);
+        json_get_uint64(resp, "genesis_timestamp_ms", &genesis_ts);
+        printf("rpc:       %s\n", rpc);
+        printf("chain_id:  %" PRIu64 "\n", cid);
+        printf("height:    %" PRIu64 "\n", height);
+        printf("tip_hash:  %s\n", tip);
+        printf("base_fee:  %" PRIu64 " µCRD/gas\n", base_fee);
+        printf("genesis:   %" PRIu64 " ms\n", genesis_ts);
+        return 0;
+    }
+    puts(resp);
     return 0;
 }
 
@@ -269,23 +483,63 @@ static int cmd_info(int argc, char **argv) {
 /* -------------------------------------------------------------------------- */
 
 static int cmd_balance(int argc, char **argv) {
+    if (has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
+        fprintf(stderr,
+            "Usage: agentchain balance [--address HEX] [--rpc URL] [--key FILE]\n"
+            "\n"
+            "Look up an account's balance, nonce, and bonded stake. With no\n"
+            "--address, queries your default wallet key (~/.agentchain/node.key).\n"
+            "Defaults RPC to %s.\n", AC_MAINNET_RPC);
+        return 0;
+    }
     const char *rpc  = get_opt(argc, argv, "--rpc");
     const char *addr = get_opt(argc, argv, "--address");
-    if (!addr) { fprintf(stderr, "balance: --address HEX required\n"); return 2; }
-    if (!rpc) rpc = "127.0.0.1:30304";
-    char host[64]; uint16_t port;
-    if (split_host_port(rpc, host, sizeof(host), &port) < 0) return 2;
+    const char *keyf = get_opt(argc, argv, "--key");
+    if (!rpc) rpc = AC_MAINNET_RPC;
+
+    /* If no --address, derive it from the local key. */
+    char addr_buf[2 * AC_PUBKEY_SIZE + 1];
+    if (!addr) {
+        char path[1024];
+        if (keyf) snprintf(path, sizeof(path), "%s", keyf);
+        else      default_key_path(path, sizeof(path));
+        if (!ac_file_exists(path)) {
+            fprintf(stderr,
+                "balance: no --address given and %s does not exist.\n"
+                "         Pass --address HEX, or run 'agentchain keygen' first.\n", path);
+            return 2;
+        }
+        if (ac_crypto_init() != 0) return 1;
+        ac_keypair_t kp;
+        if (ac_node_keypair_load_or_create(path, &kp, NULL) != 0) {
+            fprintf(stderr, "balance: cannot read %s\n", path); return 1;
+        }
+        ac_hex_encode(addr_buf, kp.pk, AC_PUBKEY_SIZE);
+        addr = addr_buf;
+    }
+
     char req[256];
     snprintf(req, sizeof(req),
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"account_get\",\"params\":{\"address\":\"%s\"}}",
         addr);
     char resp[4096];
-    if (http_post_json(host, port, req, resp, sizeof(resp)) < 0) {
-        fprintf(stderr, "balance: RPC connect failed\n"); return 1;
+    if (rpc_call(rpc, req, resp, sizeof(resp)) < 0) {
+        fprintf(stderr, "balance: cannot reach %s\n", rpc); return 1;
     }
-    const char *body = http_body(resp);
-    if (!body) { fprintf(stderr, "balance: bad response\n"); return 1; }
-    puts(body);
+    uint64_t bal = 0, nonce = 0, stake = 0, unbond_at = 0;
+    if (json_get_uint64(resp, "balance",   &bal)       == 0 &&
+        json_get_uint64(resp, "nonce",     &nonce)     == 0 &&
+        json_get_uint64(resp, "stake",     &stake)     == 0) {
+        json_get_uint64(resp, "unbond_at", &unbond_at);
+        printf("address: %s\n", addr);
+        printf("balance: %" PRIu64 " µCRD\n", bal);
+        printf("nonce:   %" PRIu64 "\n", nonce);
+        printf("stake:   %" PRIu64 " µCRD%s\n", stake,
+               stake >= AC_MIN_STAKE_UCRD ? " (active validator)" : "");
+        if (unbond_at) printf("unbond_at: slot %" PRIu64 "\n", unbond_at);
+        return 0;
+    }
+    puts(resp);
     return 0;
 }
 
@@ -311,40 +565,42 @@ static tx_submit_opts_t parse_submit_opts(int argc, char **argv) {
     return o;
 }
 
-/* Submit a signed transaction via JSON-RPC. The caller fills in `kind`,
- * `body` and `body_len`; this routine fills in chain_id/nonce/sender from
- * the network, signs, encodes, posts, and prints the response. */
 static int submit_tx(const char *action,
                      const tx_submit_opts_t *opts,
                      uint8_t kind,
                      const uint8_t *body, uint32_t body_len,
                      uint32_t gas_limit) {
-    if (!opts->key_file) {
-        fprintf(stderr, "%s: --from-key FILE required\n", action);
+    const char *rpc = opts->rpc ? opts->rpc : AC_MAINNET_RPC;
+    char key_default[1024];
+    const char *key = opts->key_file;
+    if (!key) {
+        default_key_path(key_default, sizeof(key_default));
+        key = key_default;
+    }
+    if (!ac_file_exists(key)) {
+        fprintf(stderr,
+            "%s: %s does not exist.\n"
+            "    Create one with `agentchain keygen`, or pass --from-key FILE.\n",
+            action, key);
         return 2;
     }
-    const char *rpc = opts->rpc ? opts->rpc : "127.0.0.1:30304";
-    char host[64]; uint16_t port;
-    if (split_host_port(rpc, host, sizeof(host), &port) < 0) return 2;
 
     if (ac_crypto_init() != 0) return 1;
 
     ac_keypair_t kp;
-    if (ac_node_keypair_load_or_create(opts->key_file, &kp, NULL) != 0) {
-        fprintf(stderr, "%s: cannot load %s\n", action, opts->key_file); return 1;
+    if (ac_node_keypair_load_or_create(key, &kp, NULL) != 0) {
+        fprintf(stderr, "%s: cannot load %s\n", action, key); return 1;
     }
 
     char resp[8192];
-    if (http_post_json(host, port,
+    if (rpc_call(rpc,
             "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"chain_info\"}",
             resp, sizeof(resp)) < 0) {
-        fprintf(stderr, "%s: chain_info RPC failed\n", action); return 1;
+        fprintf(stderr, "%s: cannot reach %s\n", action, rpc); return 1;
     }
-    const char *resp_body = http_body(resp);
-    if (!resp_body) return 1;
     uint64_t chain_id = 0, genesis_ts = 0;
-    json_get_uint64(resp_body, "chain_id",             &chain_id);
-    json_get_uint64(resp_body, "genesis_timestamp_ms", &genesis_ts);
+    json_get_uint64(resp, "chain_id",             &chain_id);
+    json_get_uint64(resp, "genesis_timestamp_ms", &genesis_ts);
 
     char sender_hex[2 * AC_PUBKEY_SIZE + 1];
     ac_hex_encode(sender_hex, kp.pk, AC_PUBKEY_SIZE);
@@ -352,13 +608,11 @@ static int submit_tx(const char *action,
     snprintf(req, sizeof(req),
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"account_get\",\"params\":{\"address\":\"%s\"}}",
         sender_hex);
-    if (http_post_json(host, port, req, resp, sizeof(resp)) < 0) {
+    if (rpc_call(rpc, req, resp, sizeof(resp)) < 0) {
         fprintf(stderr, "%s: account_get failed\n", action); return 1;
     }
-    resp_body = http_body(resp);
-    if (!resp_body) return 1;
     uint64_t nonce = 0;
-    json_get_uint64(resp_body, "nonce", &nonce);
+    json_get_uint64(resp, "nonce", &nonce);
 
     ac_tx_t tx;
     memset(&tx, 0, sizeof(tx));
@@ -402,32 +656,51 @@ static int submit_tx(const char *action,
     snprintf(req2, strlen(tx_hex) + 256,
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tx_submit\",\"params\":{\"tx_hex\":\"%s\"}}",
         tx_hex);
-    int rc = http_post_json(host, port, req2, resp, sizeof(resp));
+    int rc = rpc_call(rpc, req2, resp, sizeof(resp));
     free(req2);
     if (rc < 0) { fprintf(stderr, "%s: tx_submit failed\n", action); return 1; }
-    resp_body = http_body(resp);
-    if (!resp_body) return 1;
-    puts(resp_body);
-    return 0;
+
+    /* Friendly output: pull out the tx hash if the RPC returned one. */
+    char hash[2 * AC_HASH_SIZE + 1] = {0};
+    if (json_get_hex(resp, "hash", hash, sizeof(hash)) == 0 && hash[0]) {
+        printf("submitted %s tx\n", action);
+        printf("hash: %s\n", hash);
+        printf("rpc:  %s\n", rpc);
+        return 0;
+    }
+    /* On error the server returns a JSON-RPC error object; just print it. */
+    puts(resp);
+    return 1;
 }
 
 /* -------------------------------------------------------------------------- */
-/* `send` — TRANSFER.                                                         */
+/* `send`, `stake`, `unbond`.                                                 */
 /* -------------------------------------------------------------------------- */
 
 static int cmd_send(int argc, char **argv) {
+    if (has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
+        fprintf(stderr,
+            "Usage: agentchain send --to HEX --amount UCRD\n"
+            "                       [--from-key FILE] [--rpc URL]\n"
+            "                       [--tip N] [--memo TEXT] [--valid-slots N]\n"
+            "\n"
+            "Transfer `amount` µCRD (= amount × 10⁻⁶ CRD) from your wallet to\n"
+            "the recipient address. Signs locally, broadcasts via JSON-RPC.\n"
+            "\n"
+            "Defaults: from-key = ~/.agentchain/node.key, rpc = %s\n", AC_MAINNET_RPC);
+        return 0;
+    }
     tx_submit_opts_t opts = parse_submit_opts(argc, argv);
     const char *to_hex    = get_opt(argc, argv, "--to");
     const char *amount_s  = get_opt(argc, argv, "--amount");
-
     if (!to_hex || !amount_s) {
-        fprintf(stderr, "send: --from-key FILE --to HEX --amount UCRD required\n");
+        fprintf(stderr, "send: --to HEX --amount UCRD required (run with --help for details)\n");
         return 2;
     }
 
     ac_body_transfer_t bt;
     if (ac_hex_decode(bt.recipient.b, AC_PUBKEY_SIZE, to_hex) != 0) {
-        fprintf(stderr, "send: bad recipient hex\n"); return 2;
+        fprintf(stderr, "send: bad recipient hex (need 64-char address)\n"); return 2;
     }
     bt.amount = strtoull(amount_s, NULL, 10);
     uint8_t body[AC_TX_BODY_MAX];
@@ -437,50 +710,54 @@ static int cmd_send(int argc, char **argv) {
     return submit_tx("send", &opts, AC_TX_TRANSFER, body, (uint32_t)bn, /*gas_limit*/ 1000);
 }
 
-/* -------------------------------------------------------------------------- */
-/* `stake` — STAKE_BOND. Moves CRD from balance into validator stake.         */
-/* -------------------------------------------------------------------------- */
-
 static int cmd_stake(int argc, char **argv) {
+    if (has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
+        fprintf(stderr,
+            "Usage: agentchain stake --amount UCRD\n"
+            "                        [--from-key FILE] [--rpc URL] [--tip N]\n"
+            "\n"
+            "Bond `amount` µCRD from your balance into stake. Once stake ≥ %llu µCRD\n"
+            "(= 100 CRD), your key becomes eligible for validator sortition. You\n"
+            "still need to run `agentchain node --validator` to actually propose.\n",
+            (unsigned long long)AC_MIN_STAKE_UCRD);
+        return 0;
+    }
     tx_submit_opts_t opts = parse_submit_opts(argc, argv);
     const char *amount_s  = get_opt(argc, argv, "--amount");
     if (!amount_s) {
-        fprintf(stderr, "stake: --from-key FILE --amount UCRD required\n"
-                        "  Bonds the given micro-CRD amount from your balance into stake.\n"
-                        "  You become a validator the next time sortition selects your key.\n");
+        fprintf(stderr, "stake: --amount UCRD required\n");
         return 2;
     }
-
     ac_body_stake_t b;
     b.amount = strtoull(amount_s, NULL, 10);
     uint8_t body[AC_TX_BODY_MAX];
     int bn = ac_body_stake_encode(body, sizeof(body), &b);
     if (bn < 0) { fprintf(stderr, "stake: body encode failed\n"); return 1; }
-
     return submit_tx("stake", &opts, AC_TX_STAKE_BOND, body, (uint32_t)bn, /*gas_limit*/ 1000);
 }
 
-/* -------------------------------------------------------------------------- */
-/* `unbond` — STAKE_UNBOND. Returns staked CRD to balance.                    */
-/* -------------------------------------------------------------------------- */
-
 static int cmd_unbond(int argc, char **argv) {
+    if (has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
+        fprintf(stderr,
+            "Usage: agentchain unbond --amount UCRD\n"
+            "                         [--from-key FILE] [--rpc URL] [--tip N]\n"
+            "\n"
+            "Release `amount` µCRD from stake back to balance. The protocol\n"
+            "specifies a 24-hour cooldown (PROTOCOL.md § 5.2); v1.0.x releases\n"
+            "early — see TECHNICAL-IMPLEMENTATION.md § 9.4.\n");
+        return 0;
+    }
     tx_submit_opts_t opts = parse_submit_opts(argc, argv);
     const char *amount_s  = get_opt(argc, argv, "--amount");
     if (!amount_s) {
-        fprintf(stderr, "unbond: --from-key FILE --amount UCRD required\n"
-                        "  Releases the given micro-CRD amount from your stake back to balance.\n"
-                        "  PROTOCOL § 5.2 prescribes a 24-hour cooldown; in v1.0.x the unbond\n"
-                        "  is instant — see TECHNICAL-IMPLEMENTATION § 9.4.\n");
+        fprintf(stderr, "unbond: --amount UCRD required\n");
         return 2;
     }
-
     ac_body_stake_t b;
     b.amount = strtoull(amount_s, NULL, 10);
     uint8_t body[AC_TX_BODY_MAX];
     int bn = ac_body_stake_encode(body, sizeof(body), &b);
     if (bn < 0) { fprintf(stderr, "unbond: body encode failed\n"); return 1; }
-
     return submit_tx("unbond", &opts, AC_TX_STAKE_UNBOND, body, (uint32_t)bn, /*gas_limit*/ 1000);
 }
 
@@ -488,7 +765,33 @@ static int cmd_unbond(int argc, char **argv) {
 /* `node`.                                                                    */
 /* -------------------------------------------------------------------------- */
 
+static int write_embedded_mainnet_genesis(const char *path) {
+    return ac_file_write_atomic(path, (const uint8_t *)AC_MAINNET_GENESIS,
+                                strlen(AC_MAINNET_GENESIS), 0644);
+}
+
 static int cmd_node(int argc, char **argv) {
+    if (has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
+        fprintf(stderr,
+            "Usage: agentchain node [--validator] [-v]\n"
+            "                       [--data-dir DIR] [--genesis FILE] [--seeds H:P,…]\n"
+            "                       [--port N] [--rpc-port N]\n"
+            "                       [--host BIND] [--rpc-host BIND]\n"
+            "                       [--external-host H]\n"
+            "\n"
+            "Run a node. With no arguments this joins AgentChain mainnet:\n"
+            "  data-dir   ~/.agentchain\n"
+            "  genesis    embedded mainnet (chain_id=1)\n"
+            "  seeds      %s\n"
+            "  port       30303 (p2p)\n"
+            "  rpc-port   30304 (loopback only)\n"
+            "\n"
+            "Add --validator to participate in consensus (requires ≥ %llu µCRD bonded).\n"
+            "Expose --rpc-host 0.0.0.0 only if you want to serve RPC publicly.\n",
+            AC_MAINNET_SEEDS, (unsigned long long)AC_MIN_STAKE_UCRD);
+        return 0;
+    }
+
     ac_node_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
 
@@ -503,15 +806,32 @@ static int cmd_node(int argc, char **argv) {
     bool validator  = has_flag(argc, argv, "--validator");
     bool verbose    = has_flag(argc, argv, "-v");
 
+    char default_dd[1024];
     if (!dd) {
-        fprintf(stderr, "node: --data-dir DIR required\n");
-        return 2;
+        default_data_dir(default_dd, sizeof(default_dd));
+        dd = default_dd;
+    }
+
+    /* Make sure data-dir exists, then resolve a genesis to feed the chain. */
+    ac_mkdir_p(dd);
+
+    char gen_path[1024];
+    if (!gen) {
+        ac_join_path(gen_path, sizeof(gen_path), dd, "genesis.txt");
+        if (!ac_file_exists(gen_path)) {
+            if (write_embedded_mainnet_genesis(gen_path) < 0) {
+                fprintf(stderr,
+                    "node: failed to materialise embedded mainnet genesis at %s\n", gen_path);
+                return 1;
+            }
+        }
+        gen = gen_path;
     }
 
     ac_log_init(verbose ? AC_LOG_DEBUG : AC_LOG_INFO);
 
     snprintf(cfg.data_dir,     sizeof(cfg.data_dir),     "%s", dd);
-    if (gen) snprintf(cfg.genesis_path, sizeof(cfg.genesis_path), "%s", gen);
+    snprintf(cfg.genesis_path, sizeof(cfg.genesis_path), "%s", gen);
     snprintf(cfg.listen_host,  sizeof(cfg.listen_host),  "%s", host ? host : "0.0.0.0");
     cfg.listen_port = (uint16_t)(port_s     ? atoi(port_s)     : 30303);
     snprintf(cfg.rpc_host,     sizeof(cfg.rpc_host),     "%s", rpc_host ? rpc_host : "127.0.0.1");
@@ -519,9 +839,10 @@ static int cmd_node(int argc, char **argv) {
     if (ext) snprintf(cfg.external_host, sizeof(cfg.external_host), "%s", ext);
     cfg.validator = validator;
 
-    /* Seeds (comma-separated). */
-    if (seeds_s && *seeds_s) {
-        char *copy = strdup(seeds_s);
+    /* Seeds: explicit override wins, otherwise fall back to mainnet seeds. */
+    const char *seeds_eff = seeds_s && *seeds_s ? seeds_s : AC_MAINNET_SEEDS;
+    {
+        char *copy = strdup(seeds_eff);
         size_t cap = 8;
         cfg.seed_peers = (char **)calloc(cap, sizeof(char *));
         char *tok = strtok(copy, ",");
@@ -563,25 +884,23 @@ int main(int argc, char **argv) {
     if (argc < 2) { print_usage(argv[0]); return 2; }
     const char *cmd = argv[1];
 
-    /* Winsock needs to be initialised before any socket call; on POSIX this
-     * is a no-op. `node` re-initialises but that is safe. */
     ac_net_init();
 
     int rc = 2;
     if      (strcmp(cmd, "version") == 0 || strcmp(cmd, "--version") == 0) rc = cmd_version();
-    else if (strcmp(cmd, "node") == 0)    rc = cmd_node(argc - 1, argv + 1);
-    else if (strcmp(cmd, "keygen") == 0)  rc = cmd_keygen(argc - 1, argv + 1);
-    else if (strcmp(cmd, "pubkey") == 0)  rc = cmd_pubkey(argc - 1, argv + 1);
+    else if (strcmp(cmd, "node")    == 0) rc = cmd_node(argc - 1, argv + 1);
+    else if (strcmp(cmd, "keygen")  == 0) rc = cmd_keygen(argc - 1, argv + 1);
+    else if (strcmp(cmd, "pubkey")  == 0) rc = cmd_pubkey(argc - 1, argv + 1);
     else if (strcmp(cmd, "genesis") == 0) rc = cmd_genesis(argc - 1, argv + 1);
-    else if (strcmp(cmd, "send") == 0)    rc = cmd_send(argc - 1, argv + 1);
-    else if (strcmp(cmd, "stake") == 0)   rc = cmd_stake(argc - 1, argv + 1);
-    else if (strcmp(cmd, "unbond") == 0)  rc = cmd_unbond(argc - 1, argv + 1);
+    else if (strcmp(cmd, "send")    == 0) rc = cmd_send(argc - 1, argv + 1);
+    else if (strcmp(cmd, "stake")   == 0) rc = cmd_stake(argc - 1, argv + 1);
+    else if (strcmp(cmd, "unbond")  == 0) rc = cmd_unbond(argc - 1, argv + 1);
     else if (strcmp(cmd, "balance") == 0) rc = cmd_balance(argc - 1, argv + 1);
-    else if (strcmp(cmd, "info") == 0)    rc = cmd_info(argc - 1, argv + 1);
-    else if (strcmp(cmd, "--help") == 0 || strcmp(cmd, "-h") == 0) {
+    else if (strcmp(cmd, "info")    == 0) rc = cmd_info(argc - 1, argv + 1);
+    else if (strcmp(cmd, "--help") == 0 || strcmp(cmd, "-h") == 0 || strcmp(cmd, "help") == 0) {
         print_usage(argv[0]); rc = 0;
     } else {
-        fprintf(stderr, "Unknown command: %s\n", cmd);
+        fprintf(stderr, "Unknown command: %s\n\n", cmd);
         print_usage(argv[0]);
     }
     ac_net_cleanup();
