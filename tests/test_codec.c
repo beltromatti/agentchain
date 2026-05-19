@@ -4,6 +4,7 @@
 
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static void test_transfer_tx(void) {
@@ -85,10 +86,69 @@ static void test_header_roundtrip(void) {
     assert(memcmp(&h, &h2, sizeof(h)) == 0);
 }
 
+static void test_full_block_with_tx_roundtrip(void) {
+    /* Regression test for the ac_block_decode bug where the tx-length
+     * walker read body_len at the wrong offset, so any committed block
+     * containing a transaction failed to deserialise (blocking sync). */
+    ac_keypair_t kp;
+    assert(ac_keypair_random(&kp) == 0);
+
+    ac_tx_t tx;
+    memset(&tx, 0, sizeof(tx));
+    tx.version    = AC_TX_VERSION;
+    tx.chain_id   = 1;
+    tx.kind       = AC_TX_TRANSFER;
+    memcpy(tx.sender.b, kp.pk, AC_PUBKEY_SIZE);
+    tx.nonce      = 0;
+    tx.gas_limit  = 200;
+    tx.tip        = 1;
+    tx.valid_until = 1000000;
+    ac_body_transfer_t bt;
+    memset(&bt, 0xAA, sizeof(bt));
+    bt.amount = 7;
+    int bn = ac_body_transfer_encode(tx.body, AC_TX_BODY_MAX, &bt);
+    assert(bn > 0);
+    tx.body_len = (uint32_t)bn;
+    const char memo[] = "hello mainnet";
+    memcpy(tx.memo, memo, sizeof(memo) - 1);
+    tx.memo_len = sizeof(memo) - 1;
+    assert(ac_tx_sign(&tx, &kp) == 0);
+    assert(ac_tx_verify(&tx) == 1);
+
+    ac_block_t blk;
+    memset(&blk, 0, sizeof(blk));
+    blk.header.version  = AC_BLOCK_VERSION;
+    blk.header.height   = 65;
+    blk.header.slot     = 100;
+    blk.header.gas_limit = AC_BLOCK_GAS_LIMIT;
+    blk.header.tx_count  = 1;
+    blk.header.base_fee  = 1;
+    blk.txs = &tx;
+    blk.tx_count = 1;
+    /* No commit cert for the encode test. */
+
+    uint8_t *enc = NULL;
+    size_t   enc_len = 0;
+    assert(ac_block_encode(&enc, &enc_len, &blk) > 0);
+
+    ac_block_t back;
+    int rc = ac_block_decode(&back, enc, enc_len);
+    assert(rc > 0);
+    assert(back.tx_count == 1);
+    assert(back.txs[0].nonce == 0);
+    assert(back.txs[0].memo_len == sizeof(memo) - 1);
+    assert(memcmp(back.txs[0].memo, memo, sizeof(memo) - 1) == 0);
+    assert(ac_tx_verify(&back.txs[0]) == 1);
+
+    free(enc);
+    ac_block_free(&back);
+}
+
 int main(void) {
     if (ac_crypto_init() != 0) { fprintf(stderr, "crypto init failed\n"); return 1; }
     test_transfer_tx();
     test_header_roundtrip();
+    test_full_block_with_tx_roundtrip();
     printf("test_codec OK\n");
     return 0;
 }

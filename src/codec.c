@@ -362,18 +362,29 @@ int ac_block_decode(ac_block_t *out, const uint8_t *buf, size_t len) {
         out->tx_count = out->header.tx_count;
         for (uint32_t i = 0; i < out->header.tx_count; ++i) {
             /* Peek length: scan forward through fields up to memo, then add 64. */
-            /* Simpler: try decoding from increasing-size windows. We know each
-             * tx is at most AC_TX_MAX_BYTES. Compute exact length from the
-             * encoded layout. */
+            /* Compute the exact byte length of this transaction by walking
+             * its TLV layout once, so ac_tx_decode receives the correct
+             * window.  Fixed prefix is:
+             *   u8(version)      1
+             *   u64(chain_id)    8
+             *   u8(kind)         1
+             *   sender           32
+             *   u64(nonce)       8
+             *   u32(gas_limit)   4
+             *   u64(tip)         8
+             *   u64(valid_until) 8
+             *                  = 70 bytes
+             * followed by u32(body_len) || body || u32(memo_len) || memo
+             * || sig[64]. */
             size_t remaining = c.cap - c.pos;
             const uint8_t *p = c.p + c.pos;
-            /* Walk fixed prefix: 1+8+1+32+8+4+8+8 = 70 bytes. */
-            if (remaining < 70) { ac_block_free(out); return -1; }
-            uint32_t body_len = ac_rd32(p + 70 - 4);
-            size_t pos = 70;
-            pos += body_len;
+            if (remaining < 70 + 4) { ac_block_free(out); return -1; }
+            uint32_t body_len = ac_rd32(p + 70);
+            if (body_len > AC_TX_BODY_MAX) { ac_block_free(out); return -1; }
+            size_t pos = 70 + 4 + body_len;
             if (remaining < pos + 4) { ac_block_free(out); return -1; }
             uint32_t memo_len = ac_rd32(p + pos);
+            if (memo_len > AC_MEMO_MAX) { ac_block_free(out); return -1; }
             pos += 4 + memo_len + AC_SIG_SIZE;
             if (remaining < pos) { ac_block_free(out); return -1; }
             int tn = ac_tx_decode(&out->txs[i], p, pos);
