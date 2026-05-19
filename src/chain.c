@@ -530,12 +530,43 @@ static bool validate_proposer_vrf(ac_chain_t *c, const ac_block_header_t *h) {
     return true;
 }
 
-static int validate_commit(ac_chain_t *c, const ac_block_t *b, const ac_hash_t *block_hash) {
+/* File-scope helper used by accept_block when validating the commit
+ * certificate against the *pre-block* validator set. The context carries
+ * a small parallel array (signer address -> pre-block stake). */
+struct ac_pre_lookup_ctx {
+    const ac_addr_t *addrs;
+    const uint64_t  *stakes;
+    uint32_t         n;
+};
+
+static uint64_t ac_chain__pre_stake_lookup(const ac_addr_t *signer, void *ctx) {
+    const struct ac_pre_lookup_ctx *c = (const struct ac_pre_lookup_ctx *)ctx;
+    for (uint32_t i = 0; i < c->n; ++i) {
+        if (ac_addr_eq(&c->addrs[i], signer)) return c->stakes[i];
+    }
+    return 0;
+}
+
+/* Validate the commit certificate using the *pre-block* validator set.
+ * This matters because a STAKE_BOND/STAKE_UNBOND transaction in the same
+ * block changes which keys are eligible to sign: if we used the post-block
+ * set, a block that introduces a brand-new validator could never reach the
+ * 2/3 threshold (the new validator wasn't yet in the committee), making
+ * stake changes uncommittable. The fix is to pin the threshold to the
+ * stake table the committee was actually sampled from.
+ *
+ * `pre_total_sqrt` is the sum of sqrt_stake across active validators *before*
+ * any tx in this block has been applied. `pre_stake_of` maps signer address
+ * to their pre-block stake (used to compute sqrt-weight per signer). */
+typedef uint64_t (*signer_stake_lookup_fn)(const ac_addr_t *signer, void *ctx);
+
+static int validate_commit(ac_chain_t *c, const ac_block_t *b, const ac_hash_t *block_hash,
+                           uint64_t pre_total_sqrt,
+                           signer_stake_lookup_fn pre_stake_of, void *lookup_ctx) {
     if (b->nsigners == 0) {
         return -1; /* commit required for non-genesis */
     }
-    uint64_t total_sqrt = ac_chain_total_sqrt_stake(c);
-    if (total_sqrt == 0) return -1;
+    if (pre_total_sqrt == 0) return -1;
 
     /* Each signer must be an active validator, have a valid VRF proof for the
      * committee, and a valid commit signature on the vote message. */
@@ -551,34 +582,25 @@ static int validate_commit(ac_chain_t *c, const ac_block_t *b, const ac_hash_t *
     uint64_t signed_sqrt = 0;
 
     for (uint32_t i = 0; i < b->nsigners; ++i) {
-        ac_account_t acc;
-        if (!ac_state_get(c->state, &b->signers[i].signer, &acc)) return -1;
-        if (acc.stake < AC_MIN_STAKE_UCRD) return -1;
-        uint64_t sqrt_st = ac_isqrt_u64(acc.stake);
+        uint64_t pre_stake = pre_stake_of(&b->signers[i].signer, lookup_ctx);
+        if (pre_stake < AC_MIN_STAKE_UCRD) return -1;
+        uint64_t sqrt_st = ac_isqrt_u64(pre_stake);
 
         ac_vrf_proof_t proof;
         memcpy(proof.b, b->signers[i].vrf_proof, AC_VRF_PROOF_SIZE);
         ac_vrf_out_t beta;
         if (!ac_vrf_verify(&beta, &proof, calpha, (size_t)can, b->signers[i].signer.b)) return -1;
         uint64_t draw = ac_rd64(beta.b);
-        if (!committee_eligible(draw, sqrt_st, total_sqrt)) return -1;
+        if (!committee_eligible(draw, sqrt_st, pre_total_sqrt)) return -1;
 
         if (!ac_verify(&b->signers[i].sig, vmsg, (size_t)vn, b->signers[i].signer.b)) return -1;
 
         signed_sqrt += sqrt_st;
     }
 
-    /* Expected committee weight = sqrt-stake fraction × COMMITTEE_TARGET on
-     * average. We use a simpler check: require signed_sqrt * 3 > 2 * total_sqrt
-     * scaled by COMMITTEE_TARGET / total_sqrt. The PROTOCOL specifies > 2/3 of
-     * expected committee weight; in expectation that's > (2/3) × total_sqrt ×
-     * (COMMITTEE_TARGET / total_sqrt) = (2/3) × COMMITTEE_TARGET. We approximate
-     * by requiring signed validators' total sqrt-stake to be at least 2/3 of
-     * the threshold-implied weight, equivalent to signed_sqrt * 3 > 2 *
-     * (committee_target × total_sqrt / total_sqrt). For practical bootstrap
-     * the rule simplifies to: signers exist and their cumulative sqrt-stake
-     * is at least 2/3 of total network sqrt-stake. */
-    if (signed_sqrt * 3 < total_sqrt * 2) return -1;
+    /* The 2/3 threshold: cumulative signed sqrt-stake must strictly exceed
+     * two-thirds of the network's pre-block sqrt-stake. */
+    if (signed_sqrt * 3 < pre_total_sqrt * 2) return -1;
     return 0;
 }
 
@@ -641,6 +663,22 @@ ac_accept_t ac_chain_accept_block(ac_chain_t *c, const ac_block_t *b) {
         return AC_ACCEPT_REJECT_BAD_HEADER;
     }
 
+    /* Capture pre-block validator metrics for commit validation. A
+     * STAKE_BOND / STAKE_UNBOND tx in this block can shift the active set;
+     * the committee that signed this block was sampled against the
+     * pre-block set, so the 2/3 threshold must be evaluated against the
+     * same pre-block table. */
+    uint64_t pre_total_sqrt = ac_chain_total_sqrt_stake(c);
+    ac_addr_t pre_signer_addrs[AC_COMMITTEE_MAX];
+    uint64_t  pre_signer_stake[AC_COMMITTEE_MAX];
+    uint32_t  pre_signer_n = b->nsigners;
+    for (uint32_t i = 0; i < b->nsigners && i < AC_COMMITTEE_MAX; ++i) {
+        ac_account_t acc;
+        ac_state_get(c->state, &b->signers[i].signer, &acc);
+        pre_signer_addrs[i] = b->signers[i].signer;
+        pre_signer_stake[i] = acc.stake;
+    }
+
     /* Apply transactions. We work on a temporary state by serializing and
      * restoring on failure. */
     size_t snap_len = 0;
@@ -689,12 +727,19 @@ ac_accept_t ac_chain_accept_block(ac_chain_t *c, const ac_block_t *b) {
         return AC_ACCEPT_REJECT_BAD_STATE_ROOT;
     }
 
-    /* Validate the commit certificate AFTER state apply (signers' stake still
-     * valid pre-block per protocol; here we accept post-block which is a v1
-     * approximation). */
+    /* Validate the commit certificate against the pre-block validator set
+     * (so a STAKE_BOND in this very block does not break self-referentially
+     * the threshold the committee was meant to clear). */
     ac_hash_t block_hash;
     ac_block_hash(&block_hash, &b->header);
-    if (validate_commit(c, b, &block_hash) < 0) {
+
+    struct ac_pre_lookup_ctx pre_ctx = {
+        .addrs  = pre_signer_addrs,
+        .stakes = pre_signer_stake,
+        .n      = pre_signer_n,
+    };
+    if (validate_commit(c, b, &block_hash, pre_total_sqrt,
+                        ac_chain__pre_stake_lookup, &pre_ctx) < 0) {
         ac_state_deserialize(c->state, snap, snap_len);
         free(snap);
         return AC_ACCEPT_REJECT_BAD_COMMIT;
