@@ -199,6 +199,13 @@ static void handle_tx_submit(ac_rpc_t *r, int fd, const char *id, const char *pa
         send_rpc_error(fd, id, -32000, ac_mp_result_str(rs));
         return;
     }
+    /* Gossip the accepted transaction to every connected peer so it lands
+     * in the next leader's mempool, regardless of whether this node is
+     * itself a validator. The callback is optional so unit tests can
+     * exercise the RPC without spinning up a real net layer. */
+    if (r->cfg.broadcast_tx) {
+        r->cfg.broadcast_tx(bin, bin_len, r->cfg.broadcast_tx_ctx);
+    }
     ac_hash_t h;
     ac_tx_hash(&h, &tx);
     char hhex[2 * AC_HASH_SIZE + 1];

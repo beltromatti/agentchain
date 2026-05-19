@@ -19,6 +19,14 @@ typedef struct {
     char          host[64];      /* default 127.0.0.1 */
     ac_chain_t   *chain;
     ac_mempool_t *mempool;
+
+    /* Optional. When tx_submit accepts a transaction, the RPC invokes this
+     * callback so the engine can gossip the tx to its peers via TX_ANN.
+     * Without it, RPC-submitted txs sit in the local mempool until this
+     * node itself proposes a block — useless for non-validator clients
+     * submitting through any random node. */
+    void (*broadcast_tx)(const uint8_t *tx_bytes, size_t tx_len, void *ctx);
+    void *broadcast_tx_ctx;
 } ac_rpc_config_t;
 
 ac_rpc_t *ac_rpc_new (const ac_rpc_config_t *cfg);

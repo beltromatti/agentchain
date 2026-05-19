@@ -238,6 +238,12 @@ static void consensus_broadcast_cb(uint8_t type, const uint8_t *payload, size_t 
     ac_net_broadcast(n->net, type, payload, len, NULL);
 }
 
+/* Broadcast callback for rpc.tx_submit → net (gossip an RPC-submitted tx). */
+static void rpc_broadcast_tx_cb(const uint8_t *tx_bytes, size_t tx_len, void *ctx) {
+    ac_node_t *n = (ac_node_t *)ctx;
+    ac_net_broadcast(n->net, AC_MSG_TX_ANN, tx_bytes, tx_len, NULL);
+}
+
 /* -------------------------------------------------------------------------- */
 /* Lifecycle.                                                                 */
 /* -------------------------------------------------------------------------- */
@@ -348,6 +354,8 @@ int ac_node_start(ac_node_t *n) {
              n->cfg.rpc_host[0] ? n->cfg.rpc_host : "127.0.0.1");
     rcfg.chain = n->chain;
     rcfg.mempool = n->mempool;
+    rcfg.broadcast_tx = rpc_broadcast_tx_cb;
+    rcfg.broadcast_tx_ctx = n;
     n->rpc = ac_rpc_new(&rcfg);
     if (!n->rpc) goto fail;
     if (ac_rpc_start(n->rpc) != 0) goto fail;
