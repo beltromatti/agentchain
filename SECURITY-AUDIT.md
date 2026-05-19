@@ -1,7 +1,7 @@
-# AgentChain Security Audit — v1.0.11
+# AgentChain Security Audit — v1.0.13
 
-**Audited release:** AgentChain Engine v1.0.11 (`commit 0740c16`)
-**Audit date:** 2026-05-19
+**Audited release:** AgentChain Engine v1.0.13 (`commit 8e0c291`)
+**Audit date:** 2026-05-20
 **Auditor:** Noesis AI — internal review
 **Scope:** Reference C client + AgentChain Protocol v1, including the live mainnet (`chain_id=1`) bootstrap operated by Noesis AI on Google Cloud.
 **Status:** Completed — findings and mitigations recorded below
@@ -165,10 +165,34 @@ The HTTP parser is a strict line-oriented reader with a 64 KB request cap; overs
 
 ## 6. Operational Surface (mainnet seed)
 
-The current mainnet seed is documented in `deploy/mainnet-seeds.txt`. It runs on a GCP Always-Free `e2-micro` in `us-central1-a` (Iowa), operated by Noesis AI, behind a static IPv4 with two open ports:
+The current mainnet seed is documented in `deploy/mainnet-seeds.txt`. It runs on a GCP Always-Free `e2-micro` in `us-central1-a` (Iowa), operated by Noesis AI, behind a static IPv4 with these public ports:
 
-- `TCP 30303` — P2P gossip (public).
-- `TCP 30304` — JSON-RPC over HTTP (public, read-mostly, signature-verified writes).
+- `TCP 30303` — P2P gossip.
+- `TCP 30304` — JSON-RPC over HTTP. **Direct exposure of this port to the internet is now superseded by the HTTPS reverse-proxy below**; the port remains open for legacy clients and for direct-IP diagnostics, but new clients should use `https://api.agentchain.noesisai.it`.
+- `TCP 80`, `TCP 443` — Caddy reverse proxy + Let's Encrypt ACME challenges.
+
+### 6.1 Public RPC reverse-proxy topology (v1.0.13)
+
+```
+   client ──HTTPS──▶  Caddy (LE cert) ──HTTP loopback──▶  agentchain :30304
+              ▲                                                ▲
+       nftables: 300 new TCP conns / minute, burst 50, per IP   |
+              ▲                                                |
+   DNS at Cloudflare (grey cloud) → A api.agentchain.noesisai.it → 34.61.207.49
+```
+
+The configuration files are checked into the repo (`deploy/Caddyfile`, `deploy/nftables-agentchain-rl.conf`) and version-controlled alongside the engine.
+
+**Caddy hardening:**
+- Method allowlist: only `GET`, `POST`, `OPTIONS` reach the upstream; anything else is `405`'d at the proxy (in the first hour live, this caught ~60 scanner probes for `.env`, `.git/HEAD`, and similar).
+- Request body cap at `64 KB` — every v1 JSON-RPC method's payload fits comfortably below.
+- Per-server read/write/idle timeouts (`read_body 10s`, `read_header 5s`, `write 30s`, `idle 60s`).
+- CORS headers permissive (`*`), `X-Robots-Tag: noindex, nofollow`, default `Server` header removed.
+- Access log JSON, rolled at 10 MB × 5 generations.
+
+**nftables hardening:** dynamic IPv4/IPv6 sets, 300 new TCP connections/minute with a burst of 50 per source IP. Loopback bypassed. Persistent across reboots via `agentchain-ratelimit.service`. *[evidence: `deploy/nftables-agentchain-rl.conf`, `/etc/systemd/system/agentchain-ratelimit.service` on the seed]*
+
+**Edge plan trade-off acknowledged.** Cloudflare zone `noesisai.it` is on the Free plan, which provisions Universal SSL only for the apex and one wildcard level (`*.noesisai.it`). The 4-label hostname `api.agentchain.noesisai.it` falls outside that range, so DNS is in "grey cloud" (DNS-only) mode and TLS terminates on the origin instead of at the CF edge. The trade is no CF DDoS scrubbing for that hostname, in exchange for a valid Let's Encrypt cert at the requested URL on a free plan. When traffic justifies it, switching to ACM (`$10/mo`) re-enables CF proxy mode without any client-side change.
 
 **Hardening applied:**
 - Non-root systemd unit (`User=agentchain`, `NoNewPrivileges=true`, `ProtectSystem=strict`, `ProtectHome=true`, `PrivateTmp=true`, `ReadWritePaths=/var/lib/agentchain`).
@@ -253,12 +277,14 @@ Release artefacts ship with reproducible SHA-256 sums published alongside each t
 
 ## 10. Conclusion
 
-AgentChain Engine **v1.0.11** is judged **safe for alpha-mainnet operation** subject to the open items in `§ 8` and the operator-trust caveats in `§ 6`. The cryptographic core rests on a single audited dependency (`libsodium`) and a small surface of domain-tagged compositions. The implementation has no known memory-safety, integer-overflow, or threading-deadlock bugs at the time of writing.
+AgentChain Engine **v1.0.13** is judged **safe for alpha-mainnet operation** subject to the open items in `§ 8` and the operator-trust caveats in `§ 6`. The cryptographic core rests on a single audited dependency (`libsodium`) and a small surface of domain-tagged compositions. The implementation has no known memory-safety, integer-overflow, or threading-deadlock bugs at the time of writing.
 
-Two structural defects discovered post-launch are now closed: the post-apply validator-set bug (F-14, v1.0.10) and the simultaneously-eligible-leader fork window (F-15, v1.0.11). Both required protocol-level reasoning rather than spot fixes; both were verified against real-WAN mainnet traffic on 2026-05-19. The chain has since produced an uninterrupted single-tip history under v1.0.11.
+Two structural defects discovered post-launch are now closed: the post-apply validator-set bug (F-14, v1.0.10) and the simultaneously-eligible-leader fork window (F-15, v1.0.11). Both required protocol-level reasoning rather than spot fixes; both were verified against real-WAN mainnet traffic on 2026-05-19. The chain has since produced an uninterrupted single-tip history under v1.0.11 and the v1.0.12 + v1.0.13 CLI-UX revisions that built on it.
+
+The public HTTPS RPC at `https://api.agentchain.noesisai.it` (§ 6.1) is live as of 2026-05-20, providing both read and write access behind layered defences (Caddy method allowlist + body cap + timeouts, kernel-level nftables rate limit). Every defence is a configuration artefact in `deploy/` — no proprietary infrastructure is in the trust path.
 
 We will publish a fresh revision of this document on every release that touches cryptography, consensus, or networking.
 
 —
-**Noesis AI** — Milano, 2026-05-19
+**Noesis AI** — Milano, 2026-05-20
 *Lead reviewer: Mattia Beltrami*

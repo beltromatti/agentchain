@@ -36,76 +36,77 @@ The native asset is **Credit (CRD)**. The smallest unit is the micro-Credit (`µ
 
 **AgentChain mainnet is live.**
 
-- **`chain_id`** : `1`
-- **Public bootstrap seed:** `34.61.207.49:30303` (Iowa, US — operated by Noesis AI)
-- **Public read-only RPC:** `http://34.61.207.49:30304`
-- **Genesis file** (canonical, bit-for-bit reproducible): [`deploy/mainnet-genesis.txt`](deploy/mainnet-genesis.txt)
-- **Block time:** 2 s · **2-block finality:** ~4 s
-- **Engine release:** [`v1.0.11`](https://github.com/beltromatti/agentchain/releases/tag/v1.0.11)
+| | |
+| --- | --- |
+| `chain_id` | `1` |
+| **Public RPC** | `https://api.agentchain.noesisai.it` (HTTPS, JSON-RPC 2.0 — read + write) |
+| **Bootstrap seed (P2P)** | `34.61.207.49:30303` (Iowa, US — operated by Noesis AI) |
+| **Genesis** | embedded in the binary; also at [`deploy/mainnet-genesis.txt`](deploy/mainnet-genesis.txt) |
+| **Block time** | 2 s · **2-block finality** ≈ 4 s |
+| **Engine release** | [`v1.0.13`](https://github.com/beltromatti/agentchain/releases/latest) |
 
-The first seed is operated by Noesis AI on a Google Cloud Always-Free `e2-micro` instance. We are honest about what this means: until other independent validators bond stake and bring up their own nodes, Noesis AI is the dominant operator. The protocol is designed to make that transition trivial — see [Run your own node](#run-your-own-node) below. The chain accepts new validators the moment they bond `STAKE_BOND`; no central coordination is required.
+The public RPC is a Caddy reverse proxy in front of the seed's local JSON-RPC port, with Let's Encrypt TLS and kernel-level (nftables) rate limiting. It is the same `agentchain` daemon any operator runs; the proxy layer just provides HTTPS, request shaping, and a stable hostname. Both reads and writes are public — anyone can call `tx_submit`, the signature is verified on the way in. See [`SECURITY-AUDIT.md` § 6](SECURITY-AUDIT.md) for the hardening detail.
 
-Live status from your terminal:
+Equivalent to `https://api.mainnet-beta.solana.com` for Solana, or `https://bitcoin-rpc.publicnode.com` for Bitcoin: a foundation-operated public good, best-effort, no SLA, free. Production deployments should run their own node (see [Run your own node](#run-your-own-node)) and treat the public RPC as a fallback.
 
 ```sh
-curl -s -X POST -H 'content-type: application/json' \
+curl -sS -X POST -H 'content-type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"chain_info"}' \
-  http://34.61.207.49:30304/
+  https://api.agentchain.noesisai.it/
 ```
 
 ## Try it in 60 seconds
 
-Download the pre-built binary for your OS — Linux x86_64/arm64, macOS x86_64/arm64, Windows x86_64 — from the [latest release](https://github.com/beltromatti/agentchain/releases/latest):
+Download the binary for your OS from the [latest release](https://github.com/beltromatti/agentchain/releases/latest) — Linux x86_64/arm64, macOS x86_64/arm64, Windows x86_64 are all built on every tag.
 
 ```sh
 # macOS arm64 example
-curl -L https://github.com/beltromatti/agentchain/releases/latest/download/agentchain-v1.0.11-macos-arm64.tar.gz | tar xz
-cd agentchain-v1.0.11-*
-./agentchain version
-./agentchain info --rpc 34.61.207.49:30304
+curl -L https://github.com/beltromatti/agentchain/releases/latest/download/agentchain-v1.0.13-macos-arm64.tar.gz | tar xz
+cd agentchain-v1.0.13-*
+./agentchain info                           # queries mainnet by default
 ```
 
-Send a transaction (you'll need a balance — see "Get test Credits" below):
+That's it — `info`, `balance`, `send`, `stake`, `unbond` all default to the public RPC. Run any command with `--help` for its full options.
+
+### Send a transaction in three commands
 
 ```sh
-./agentchain keygen --out my.key
-./agentchain pubkey --key my.key                                   # your address
-./agentchain send  --rpc 34.61.207.49:30304 \
-                   --from-key my.key \
-                   --to     <recipient_hex_pubkey> \
-                   --amount 1000000 --tip 1
+./agentchain keygen                                    # writes ~/.agentchain/node.key, prints your address
+./agentchain balance                                   # checks your own balance on mainnet
+./agentchain send --to <recipient_address> --amount 1000000   # 1 CRD = 1,000,000 µCRD
 ```
+
+Getting CRD to spend: this is mainnet, there is no faucet. Receive CRD from someone who has it. The Noesis AI founder allocation is open to early contributors and projects building on AgentChain — open a GitHub issue or write to `info@noesis.ai` with a brief description of what you're going to do.
 
 ## Run your own node
 
-A full node — or a validator — joins mainnet by pointing at the same genesis file and the same seed.
+The same binary that is a CLI is also the daemon. With no flags, `agentchain node` joins mainnet as a syncing peer (data goes to `~/.agentchain`, genesis is embedded, seeds are baked in):
 
 ```sh
-# 1) Get the binary (see above).
-# 2) Pick a data directory. The first run generates a node key.
-mkdir -p ~/agentchain-data
-
-# 3) Run as a syncing node (read-only):
-./agentchain node \
-    --data-dir ~/agentchain-data \
-    --genesis  deploy/mainnet-genesis.txt \
-    --seeds    34.61.207.49:30303
-
-# 4) Or run as a validator (adds --validator):
-./agentchain node \
-    --data-dir ~/agentchain-data \
-    --genesis  deploy/mainnet-genesis.txt \
-    --seeds    34.61.207.49:30303 \
-    --validator
+./agentchain node                            # join mainnet, sync only
+./agentchain node --validator                # also propose & vote on blocks
 ```
 
-To actually produce blocks you need bonded stake (`≥ 100 CRD`). The path is:
+Becoming a validator requires bonded stake (`≥ 100 CRD = 100,000,000 µCRD`). The full path is:
 
-1. Run the node to generate your `node.key` and get your address (`agentchain pubkey`).
-2. Receive `CRD` from the founder allocation (`info@noesis.ai`) or any community member.
-3. Submit `STAKE_BOND` with that address — you become eligible for sortition immediately.
+1. `agentchain keygen` — generates your wallet at `~/.agentchain/node.key` (the same key is used for both transactions and block signing). Print the address with `agentchain pubkey`.
+2. Acquire CRD (see above).
+3. `agentchain stake --amount 100000000` — bond 100 CRD. Your key becomes eligible for sortition immediately.
+4. Run `agentchain node --validator`. The node starts proposing blocks the next slot in which sortition selects it.
 
-The protocol is forgiving about uptime — being offline costs you potential block rewards but nothing else. Only cryptographically-provable double-signing is slashable. See [`PROTOCOL.md`](PROTOCOL.md) § 6.6.
+Going offline is **never** slashed — the protocol is deliberately forgiving about uptime. You lose potential block rewards while offline but nothing else. The only slashable behaviour is cryptographically-provable double-signing; see [`PROTOCOL.md` § 6.6](PROTOCOL.md). Block reward economics are in [`PROTOCOL.md` § 8](PROTOCOL.md).
+
+To unbond, `agentchain unbond --amount …`. In v1.0.x the funds return to your balance immediately; the protocol-specified 24-hour cooldown queue is a v1.1 item (see [`TECHNICAL-IMPLEMENTATION.md` § 9.4](TECHNICAL-IMPLEMENTATION.md)).
+
+### Run your own public RPC
+
+If you want to provide an RPC endpoint to others (free, paid, or rate-limited), do exactly what the foundation seed does:
+
+1. Run `agentchain node --rpc-host 0.0.0.0` — exposes the JSON-RPC port on all interfaces.
+2. Put it behind your own reverse proxy with TLS + rate limiting (Caddy + nftables, or nginx, or Cloudflare — see [`deploy/`](deploy/) for the reference setup).
+3. Point your own DNS at it.
+
+The protocol does not gate on any centralised registry: every public RPC is just a node someone decided to expose. The Noesis-operated `api.agentchain.noesisai.it` is the first; more are welcome.
 
 ## How the consensus works (in 60 seconds)
 
@@ -135,21 +136,30 @@ N=4 RUN_S=30 testnet/run.sh    # 4-node local testnet smoke
 
 ## CLI quick reference
 
+Every command defaults to mainnet over HTTPS. Override with `--rpc URL` (any host:port or http(s):// URL).
+
 ```sh
-agentchain node       --data-dir DIR [--genesis FILE] [--port 30303]
-                       [--rpc-port 30304] [--seeds host:port,…] [--validator]
+# Wallet & queries
+agentchain keygen     [--out FILE]                                # default: ~/.agentchain/node.key
+agentchain pubkey     [--key FILE | --data-dir DIR]               # print your address
+agentchain balance    [--address HEX] [--rpc URL] [--key FILE]    # check an account
+agentchain info       [--rpc URL]                                 # chain state
 
-agentchain keygen     --out node.key
-agentchain pubkey     --data-dir DIR
-agentchain genesis    --chain-id N --out genesis.txt
-                       --account HEX:BAL:STAKE [--account …]
+# Transactions (signed locally, broadcast via JSON-RPC)
+agentchain send       --to HEX --amount UCRD
+                      [--from-key FILE] [--rpc URL] [--tip N] [--memo TEXT]
+agentchain stake      --amount UCRD  [--from-key FILE] [--rpc URL] [--tip N]
+agentchain unbond     --amount UCRD  [--from-key FILE] [--rpc URL] [--tip N]
 
-agentchain send       --rpc URL --from-key node.key
-                       --to HEX --amount UCRD [--tip N] [--memo TEXT]
-agentchain stake      --rpc URL --from-key node.key --amount UCRD [--tip N]
-agentchain unbond     --rpc URL --from-key node.key --amount UCRD [--tip N]
-agentchain balance    --rpc URL --address HEX
-agentchain info       --rpc URL
+# Operating a node
+agentchain node       [--validator] [-v]
+                      [--data-dir DIR] [--genesis FILE] [--seeds H:P,…]
+                      [--port N] [--rpc-port N] [--rpc-host BIND]
+agentchain genesis    --chain-id N --out FILE [--timestamp-ms N]
+                      [--account HEX:BAL:STAKE …]                 # for testnets
+
+agentchain version
+agentchain help                                                   # plus `--help` per command
 ```
 
 ## Architecture, in one diagram

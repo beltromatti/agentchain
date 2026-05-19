@@ -1,6 +1,6 @@
 # AgentChain Engine — Technical Implementation Notes
 
-This document describes how **AgentChain Engine v1.0.11**, the reference C client, realises the protocol specified in `PROTOCOL.md`. Read the protocol first; this document is a companion. Where the implementation deviates from the spec, the deviation is called out explicitly under `§ 9 Spec Deviations`.
+This document describes how **AgentChain Engine v1.0.13**, the reference C client, realises the protocol specified in `PROTOCOL.md`. Read the protocol first; this document is a companion. Where the implementation deviates from the spec, the deviation is called out explicitly under `§ 9 Spec Deviations`.
 
 ---
 
@@ -50,7 +50,7 @@ The reference binary statically links its own modules into `libagentchain_engine
 
 ## 3. Mapping: Protocol → Source
 
-The following table is the authoritative cross-reference. If a feature is in the protocol but not in this table, it is unimplemented in v1.0.11 (see `§ 9`).
+The following table is the authoritative cross-reference. If a feature is in the protocol but not in this table, it is unimplemented in v1.0.13 (see `§ 9`).
 
 | Protocol section                          | Implemented in                                       |
 | ----------------------------------------- | ---------------------------------------------------- |
@@ -224,24 +224,37 @@ The RPC defaults to listening on `127.0.0.1:30304`. Exposing it over the network
 `main.c` implements subcommands:
 
 ```
-agentchain node       --data-dir DIR [--genesis FILE] [--port N] [--rpc-port N]
-                      [--seeds host:port,…] [--validator] [--external-host H]
-agentchain keygen     --out FILE
-agentchain pubkey     {--data-dir DIR | --key FILE}
-agentchain genesis    --chain-id N [--timestamp-ms N] --out FILE
-                      --account HEX:BAL:STAKE [--account …]
-agentchain send       --rpc URL --from-key FILE --to HEX --amount UCRD
-                      [--tip N] [--memo TEXT] [--valid-slots N]
-agentchain stake      --rpc URL --from-key FILE --amount UCRD
-                      [--tip N] [--valid-slots N]
-agentchain unbond     --rpc URL --from-key FILE --amount UCRD
-                      [--tip N] [--valid-slots N]
-agentchain balance    --rpc URL --address HEX
-agentchain info       --rpc URL
+agentchain node       [--validator] [-v]
+                      [--data-dir DIR] [--genesis FILE] [--seeds H:P,…]
+                      [--port N] [--rpc-port N]
+                      [--host BIND] [--rpc-host BIND] [--external-host H]
+agentchain keygen     [--out FILE]
+agentchain pubkey     [--key FILE | --data-dir DIR]
+agentchain genesis    --chain-id N --out FILE [--timestamp-ms N]
+                      [--account HEX:BAL:STAKE …]
+agentchain send       --to HEX --amount UCRD
+                      [--from-key FILE] [--rpc URL] [--tip N] [--memo TEXT] [--valid-slots N]
+agentchain stake      --amount UCRD  [--from-key FILE] [--rpc URL] [--tip N] [--valid-slots N]
+agentchain unbond     --amount UCRD  [--from-key FILE] [--rpc URL] [--tip N] [--valid-slots N]
+agentchain balance    [--address HEX] [--rpc URL] [--key FILE]
+agentchain info       [--rpc URL]
 agentchain version
+agentchain help
 ```
 
+Defaults (defined in `src/mainnet.h`):
+
+- `--rpc` → `https://api.agentchain.noesisai.it` (the Noesis-operated public RPC).
+- `--from-key` / `--key` → `~/.agentchain/node.key`.
+- `--data-dir` → `~/.agentchain`.
+- `--genesis` → mainnet genesis embedded as a C string and materialised to `<data-dir>/genesis.txt` on first run when no file is present.
+- `--seeds` → `34.61.207.49:30303` (the Iowa bootstrap seed).
+
+Every default is overridable. Each subcommand supports `--help` with its own usage block and links to the relevant protocol section where v1.0.x behaviour deviates from the spec.
+
 `send`, `stake`, and `unbond` share a common client-side path: each queries `chain_info` for `chain_id`, `account_get` for the sender's `nonce`, builds the body for the appropriate `kind` (`TRANSFER`, `STAKE_BOND`, `STAKE_UNBOND`), signs it, hex-encodes, and submits via `tx_submit`. A successful submission returns the transaction hash, and the RPC server gossips the transaction over `TX_ANN` so non-validator clients can still broadcast.
+
+**HTTPS transport.** The CLI selects transport from the URL scheme: `http://` and bare `host:port` use a small native HTTP client; `https://…` shells out to the system `curl` with the request body piped via stdin (no URL or body bytes ever touch the shell, so injection is impossible). The daemon itself remains TLS-free — RPC is plain HTTP on the loopback interface, and any operator that wants a public endpoint pairs it with a reverse proxy (`§ 7.4`).
 
 ---
 
@@ -311,7 +324,28 @@ All five targets ship binaries on every `v*` release.
 
 `deploy/systemd/agentchain.service` runs the daemon as a non-root user, restarts on failure, and writes state to `/var/lib/agentchain`. `deploy/docker/Dockerfile` builds a multi-stage image weighing under 20 MB.
 
-For mainnet, the seed list is shipped in `deploy/mainnet-seeds.txt`. Validators bring their own genesis via the official `genesis.txt` distributed in the release.
+For mainnet, the seed list is shipped in `deploy/mainnet-seeds.txt`. Validators bring their own genesis via the official `genesis.txt` distributed in the release (or the copy embedded in the binary at `src/mainnet.h`).
+
+### 7.4 Public RPC reverse-proxy topology
+
+The Noesis-operated public RPC at `https://api.agentchain.noesisai.it` runs on the same Iowa `e2-micro` as the validator seed. It is layered:
+
+```
+   client ──HTTPS──▶  Caddy (Let's Encrypt cert) ──HTTP loopback──▶  agentchain
+        ▲                    ▲                                            ▲
+        │             nftables: 300/min burst 50 per IP                   │
+        │                                                                 │
+   DNS @ Cloudflare (DNS-only / grey cloud, A → 34.61.207.49)        --rpc-host 0.0.0.0
+```
+
+Why this shape:
+
+- **DNS at Cloudflare, grey cloud**: free, fast, and gives us API-driven record management. Orange cloud (CF as proxy) would require Advanced Certificate Manager (`$10/mo`) for the 4-label hostname; on Free plan it provides only `*.zone` and `zone`. When the network outgrows the e2-micro we will revisit.
+- **Caddy as origin proxy** ([`deploy/Caddyfile`](deploy/Caddyfile)): one-line `reverse_proxy 127.0.0.1:30304`, automatic Let's Encrypt cert via HTTP-01, 64 KB request body cap, method allowlist (`GET POST OPTIONS`), CORS for browser callers, gzip/zstd encoding, JSON access log rolled at 10 MB.
+- **nftables rate limit** ([`deploy/nftables-agentchain-rl.conf`](deploy/nftables-agentchain-rl.conf)): kernel-level, dynamic set keyed on source IP, 300 new connections per minute with a burst of 50. Hits the wire before Caddy parses a single byte; in the first hour the rule dropped 60+ packets from automated `.env` / `.git/HEAD` scanners.
+- **No write-side auth on the RPC**: the chain only accepts signature-verified transactions, so `tx_submit` is safe to leave public. An attacker can flood the mempool with valid but expensive transactions; rate-limit + mempool capacity (`8192` entries) bound that exposure.
+
+This is exactly the architecture every other public RPC provider needs to operate — the daemon doesn't gain anything by knowing it's behind a proxy. To stand up a second provider (`api.foo.example`), copy [`deploy/Caddyfile`](deploy/Caddyfile), point a DNS record at your origin, and you're done.
 
 ---
 
@@ -351,7 +385,7 @@ These deviations are deliberate and documented. Each is annotated with the proto
 
 **Protocol § 6.6** specifies that double-signing is slashable. v1.0.x implements the `SLASH_EVIDENCE` transaction, verifies the two signatures, and burns the validator's stake. What v1.0.x does **not** do automatically is detect equivocations in real time — a slasher must construct and submit the evidence transaction. A built-in equivocation watcher is on the v1.1 roadmap.
 
-### 9.6 Patch-release history (v1.0.1 → v1.0.11)
+### 9.6 Patch-release history (v1.0.1 → v1.0.13)
 
 The 1.0.x line has been amended several times since the initial mainnet launch. Each fix is recorded here for traceability; the corresponding security finding ID is in `SECURITY-AUDIT.md`.
 
@@ -362,8 +396,10 @@ The 1.0.x line has been amended several times since the initial mainnet launch. 
 5. **v1.0.9** — RPC `tx_submit` previously inserted into the mempool but did not gossip; a non-validator RPC client could submit a transaction that no validator ever saw. A `broadcast_tx` callback now wires the RPC into `ac_net_broadcast(TX_ANN, …)` (F-13).
 6. **v1.0.10** — `validate_commit` previously evaluated the committee threshold against the *post-apply* validator set, so a block that itself added a validator (`STAKE_BOND`) could never meet the threshold. `ac_chain_accept_block` now snapshots the *pre-block* validator metrics (total `sqrt_stake` plus a per-signer stake lookup) and passes them through; the threshold is computed against the set that signed (F-14).
 7. **v1.0.11** — committee members no longer vote immediately on the first proposal they see. They wait `AC_VOTE_DELAY_MS` (900 ms) after slot start, then sign exactly one `COMMIT_VOTE` for the proposal with the lowest VRF-derived leader priority. The change is normative on the spec side as well (`PROTOCOL.md § 6.5.1`). Without it, two leader-eligible validators in the same slot could each accumulate ≥2/3 committee weight on distinct proposals — the exact failure observed on mainnet at h=28699 under v1.0.10 (F-15).
+8. **v1.0.12** — CLI UX overhaul. Every client command (`info`, `balance`, `send`, `stake`, `unbond`) defaults to `https://api.agentchain.noesisai.it` over HTTPS instead of `127.0.0.1:30304`. `--from-key` / `--key` defaults to `~/.agentchain/node.key`; `--data-dir` to `~/.agentchain`. The mainnet genesis is embedded in the binary (`src/mainnet.h`, byte-identical to `deploy/mainnet-genesis.txt`) and materialised on first run when no override is provided. HTTPS support is via a stdin-fed `curl` shell-out — the daemon's transport stays plain HTTP on the loopback interface, with the public-facing TLS terminated by the reverse proxy described in `§ 7.4`. Per-command `--help` was added, and `send/stake/unbond` now surface a human-readable summary (tx hash + RPC) instead of the raw JSON-RPC envelope. No protocol change.
+9. **v1.0.13** — CI-gate cleanup: missing `<sys/wait.h>`/`<unistd.h>` includes for the v1.0.12 `https_post_curl` fork path, and `-Wformat-truncation` warnings on the `snprintf` calls that copy CLI flags into `ac_node_config_t` fields. Functionally identical to v1.0.12 (release artefacts there did not enable `-Werror`); only required to make the strict `build.yml` matrix green on Ubuntu 24.04 arm64.
 
-End-to-end verification of v1.0.11 ran on the live mainnet on 2026-05-19 with two validators (an Iowa seed and a residential macOS host). The chain transitioned through four phases — both validators active, seed alone, both alive again, validator alone — without forks, without missed slots, and with the expected `signers={1,2}` shape on every commit. The associated mainnet `chain_id=1` history starts at the v1.0.11 genesis (`timestamp_ms=1779201674000`); the pre-v1.0.11 chain was abandoned during the coordinated reset described in the v1.0.11 release notes.
+End-to-end verification of v1.0.11 ran on the live mainnet on 2026-05-19 with two validators (an Iowa seed and a residential macOS host). The chain transitioned through four phases — both validators active, seed alone, both alive again, validator alone — without forks, without missed slots, and with the expected `signers={1,2}` shape on every commit. The associated mainnet `chain_id=1` history starts at the v1.0.11 genesis (`timestamp_ms=1779201674000`); the pre-v1.0.11 chain was abandoned during the coordinated reset described in the v1.0.11 release notes. Read + write through the public HTTPS RPC was verified on 2026-05-20 alongside the v1.0.13 deployment (chain_info → 200; `send` from a remote wallet → tx mined → recipient balance +1 µCRD; sender nonce 2 → 3).
 
 ### 9.7 Bootstrap genesis simplification
 
