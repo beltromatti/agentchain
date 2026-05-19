@@ -1,6 +1,6 @@
 # AgentChain Engine — Technical Implementation Notes
 
-This document describes how **AgentChain Engine v1.0.0**, the reference C client, realises the protocol specified in `PROTOCOL.md`. Read the protocol first; this document is a companion. Where the implementation deviates from the spec, the deviation is called out explicitly under `§ Spec Deviations`.
+This document describes how **AgentChain Engine v1.0.11**, the reference C client, realises the protocol specified in `PROTOCOL.md`. Read the protocol first; this document is a companion. Where the implementation deviates from the spec, the deviation is called out explicitly under `§ 9 Spec Deviations`.
 
 ---
 
@@ -50,7 +50,7 @@ The reference binary statically links its own modules into `libagentchain_engine
 
 ## 3. Mapping: Protocol → Source
 
-The following table is the authoritative cross-reference. If a feature is in the protocol but not in this table, it is unimplemented in v1.0.0 (see `§ 9`).
+The following table is the authoritative cross-reference. If a feature is in the protocol but not in this table, it is unimplemented in v1.0.11 (see `§ 9`).
 
 | Protocol section                          | Implemented in                                       |
 | ----------------------------------------- | ---------------------------------------------------- |
@@ -68,6 +68,7 @@ The following table is the authoritative cross-reference. If a feature is in the
 | § 6.3 Leader sortition                    | `consensus.c` — `am_i_leader`; `chain.c` — `validate_proposer_vrf` |
 | § 6.4 Committee sortition                 | `consensus.c` — `am_i_committee`, `committee_eligible` |
 | § 6.5 Commit rule                         | `consensus.c` — `try_commit`; `chain.c` — `validate_commit` |
+| § 6.5.1 Vote convergence under multiple proposers | `consensus.c` — `vote_phase`, `compute_priority`, `slot_vote_for`, `our_vote_now` |
 | § 6.6 Equivocation                        | `state.c` — `AC_TX_SLASH_EVIDENCE` handler           |
 | § 7 Fork choice                           | `chain.c` — accept rule rejects non-extensions (v1 is single-tip; see `§ 9`) |
 | § 8 Adaptive Equilibrium                  | `chain.c` — `ac_chain_block_reward`, `ac_chain_next_base_fee` |
@@ -231,12 +232,16 @@ agentchain genesis    --chain-id N [--timestamp-ms N] --out FILE
                       --account HEX:BAL:STAKE [--account …]
 agentchain send       --rpc URL --from-key FILE --to HEX --amount UCRD
                       [--tip N] [--memo TEXT] [--valid-slots N]
+agentchain stake      --rpc URL --from-key FILE --amount UCRD
+                      [--tip N] [--valid-slots N]
+agentchain unbond     --rpc URL --from-key FILE --amount UCRD
+                      [--tip N] [--valid-slots N]
 agentchain balance    --rpc URL --address HEX
 agentchain info       --rpc URL
 agentchain version
 ```
 
-The `send` subcommand performs a full client-side build of a transfer transaction: it queries `chain_info` for `chain_id`, `account_get` for the sender's `nonce`, builds the body, signs it, hex-encodes, and submits via `tx_submit`. A successful submission returns the transaction hash.
+`send`, `stake`, and `unbond` share a common client-side path: each queries `chain_info` for `chain_id`, `account_get` for the sender's `nonce`, builds the body for the appropriate `kind` (`TRANSFER`, `STAKE_BOND`, `STAKE_UNBOND`), signs it, hex-encodes, and submits via `tx_submit`. A successful submission returns the transaction hash, and the RPC server gossips the transaction over `TX_ANN` so non-validator clients can still broadcast.
 
 ---
 
@@ -280,25 +285,27 @@ cmake --build build -j
 
 ### 7.2 Continuous integration
 
-`.github/workflows/build.yml` runs on every push/PR: it builds on `ubuntu-22.04` and `macos-latest`, runs the local testnet harness for 30 seconds, and uploads logs as an artefact on failure.
+`.github/workflows/build.yml` runs on every push/PR. It builds the binary and runs the unit-test suite across `ubuntu-22.04`, `ubuntu-24.04-arm`, `macos-14`, and `windows-2022` (msys2). Failures upload the test logs as artefacts.
 
 `.github/workflows/release.yml` runs when a `v*` tag is pushed. For each target it:
 
 1. Builds in `Release` mode against a statically-linked libsodium (built in-CI).
 2. Strips the binary.
 3. Tars the binary, the seed list, the systemd unit, this file, and `PROTOCOL.md`.
-4. Uploads the tarball as a GitHub Release asset.
+4. Computes a SHA-256 digest of the tarball.
+5. Uploads both the tarball and its `.sha256` companion as GitHub Release assets.
 
 Target matrix:
 
-| OS          | Architecture | Toolchain         |
-| ----------- | ------------ | ----------------- |
-| Linux       | x86_64       | GCC 11, glibc 2.35 |
-| Linux       | aarch64      | GCC 11 cross      |
-| macOS       | x86_64       | clang             |
-| macOS       | arm64        | clang             |
+| OS          | Architecture | Runner               | Toolchain                          |
+| ----------- | ------------ | -------------------- | ---------------------------------- |
+| Linux       | x86_64       | `ubuntu-22.04`       | GCC, glibc 2.35                    |
+| Linux       | arm64        | `ubuntu-24.04-arm`   | GCC native arm64                   |
+| macOS       | arm64        | `macos-14` (M-series)| AppleClang, native                 |
+| macOS       | x86_64       | `macos-14` (M-series)| AppleClang, `-arch x86_64` cross   |
+| Windows     | x86_64       | `windows-2022`       | msys2 / mingw-w64                  |
 
-Windows is supported in principle (POSIX sockets are abstracted into `net.c`) but not part of the v1.0.0 CI matrix.
+All five targets ship binaries on every `v*` release.
 
 ### 7.3 Deployment
 
@@ -320,17 +327,17 @@ Modules: `node`, `chain`, `consen.`, `net`, `rpc`. Level controlled by `-v` (deb
 
 ---
 
-## 9. Spec Deviations in v1.0.0
+## 9. Spec Deviations in v1.0.x
 
 These deviations are deliberate and documented. Each is annotated with the protocol section it relaxes and the reason the relaxation is acceptable for a bootstrapping network.
 
 ### 9.1 Active-set delay collapse
 
-**Protocol § 6.3** specifies that the active validator set for epoch `e` is the set with `stake ≥ MIN_STAKE` at the end of epoch `e-2`. v1.0.0 instead uses the active set as of the current chain tip. This shortens the time before a newly-bonded validator becomes eligible from two epochs (~8 hours) to zero, at the cost of a theoretical attack where an adversary times their bond to influence a single slot's leader sortition. The trade-off is acceptable for a bootstrap network whose initial validator set is controlled, and will be reverted in v1.1 once a stake-set snapshot per epoch is journaled.
+**Protocol § 6.3** specifies that the active validator set for epoch `e` is the set with `stake ≥ MIN_STAKE` at the end of epoch `e-2`. The v1.0.x reference client instead uses the active set as of the current chain tip. This shortens the time before a newly-bonded validator becomes eligible from two epochs (~8 hours) to zero, at the cost of a theoretical attack where an adversary times their bond to influence a single slot's leader sortition. The trade-off is acceptable for a bootstrap network whose initial validator set is controlled, and will be reverted in v1.1 once a stake-set snapshot per epoch is journaled. The validator-handover demonstration described in `§ 9.6` (Phases A→D) relies on this immediate-activation behaviour.
 
 ### 9.2 Single-tip fork choice
 
-**Protocol § 7** describes a heaviest-chain fork-choice rule. v1.0.0 simply rejects any block whose parent does not match the current tip. This means a node that diverges from the canonical chain by accepting a block that the rest of the network later abandons will need manual intervention (`rm -rf <data_dir>/blocks` and resync) to recover. In practice this does not happen because PoSA's `2/3 committee weight` rule guarantees safety: there is never more than one finalised tip in an honest-majority network. The proper heaviest-chain implementation is on the v1.1 roadmap and will only matter under a Byzantine attack scenario.
+**Protocol § 7** describes a heaviest-chain fork-choice rule. v1.0.x simply rejects any block whose parent does not match the current tip. This means a node that diverges from the canonical chain by accepting a block that the rest of the network later abandons will need manual intervention (`rm -rf <data_dir>/blocks` and resync) to recover. In practice this does not happen because PoSA's vote-convergence rule (Protocol § 6.5.1, implemented in v1.0.11) guarantees safety even with multiple simultaneous proposers. The proper heaviest-chain implementation is on the v1.1 roadmap and will only matter under a Byzantine attack scenario.
 
 ### 9.3 Reward concentrated at the leader
 
@@ -338,24 +345,33 @@ These deviations are deliberate and documented. Each is annotated with the proto
 
 ### 9.4 Instant-release unbonding
 
-**Protocol § 5.2** specifies a 24-hour cooldown for `STAKE_UNBOND`. v1.0.0 instead instantly transfers from `stake` back to `balance` while recording the would-be unlock slot in `unbond_at`. Operators of v1 testnets do not lose security from this simplification; the cooldown enforcement is on the v1.1 roadmap.
+**Protocol § 5.2** specifies a 24-hour cooldown for `STAKE_UNBOND`. The v1.0.x reference client instead instantly transfers from `stake` back to `balance` while recording the would-be unlock slot in `unbond_at`. Operators of v1 testnets do not lose security from this simplification; the cooldown enforcement is on the v1.1 roadmap.
 
 ### 9.5 Equivocation enforcement
 
-**Protocol § 6.6** specifies that double-signing is slashable. v1.0.0 implements the `SLASH_EVIDENCE` transaction, verifies the two signatures, and burns the validator's stake. What v1.0.0 does **not** do automatically is detect equivocations in real time — a slasher must construct and submit the evidence transaction. A built-in equivocation watcher is on the v1.1 roadmap.
+**Protocol § 6.6** specifies that double-signing is slashable. v1.0.x implements the `SLASH_EVIDENCE` transaction, verifies the two signatures, and burns the validator's stake. What v1.0.x does **not** do automatically is detect equivocations in real time — a slasher must construct and submit the evidence transaction. A built-in equivocation watcher is on the v1.1 roadmap.
 
-### 9.6 Catch-up sync over high-latency WAN — *(resolved in v1.0.6 + v1.0.7)*
+### 9.6 Patch-release history (v1.0.1 → v1.0.11)
 
-Earlier 1.0.x releases (1.0.1 through 1.0.5) stalled at ~50–65 blocks during initial sync from a transatlantic peer. Two independent issues were responsible, and both are now fixed:
+The 1.0.x line has been amended several times since the initial mainnet launch. Each fix is recorded here for traceability; the corresponding security finding ID is in `SECURITY-AUDIT.md`.
 
-1. **v1.0.6** — `ac_net_broadcast` and `ac_net_send_to` used to write to peers synchronously under a per-peer mutex. A slow peer could starve the consensus thread for the full `SO_SNDTIMEO` window. The fix gives each peer slot a non-blocking outbound queue plus a dedicated writer thread: producers append in microseconds and return; the writer drains into the socket at whatever rate the peer can sustain. Overflow is bounded at 4 MB per peer and triggers a clean disconnect.
-2. **v1.0.7** — `ac_block_decode`'s transaction-length walker read `body_len` at byte offset 66 instead of 70 (the actual position after the 70-byte fixed prefix). Every block containing a transaction failed to deserialise, so a peer requesting blocks via `HEADERS_REQ` stopped at the first block with a tx — on mainnet that was the foundation's initial transfer at height 65. The symptom mimicked a networking stall, which is why earlier hotfixes only partially helped. The walker now reads at the correct offset and rejects malformed `body_len`/`memo_len` values before consuming the cursor. `tests/test_codec.c::test_full_block_with_tx_roundtrip` is the regression.
+1. **v1.0.1 → v1.0.5** — incremental sync ergonomics under WAN latency: `SO_SNDTIMEO` per socket (F-7), seed-dedup at `dial_peer`/HELLO stage (F-8), dead-peer reaping (F-9), `HEADERS_REQ` rate limit (F-10).
+2. **v1.0.6** — `ac_net_broadcast` / `ac_net_send_to` moved to per-peer non-blocking write queues with a dedicated writer thread; producers no longer stall the consensus thread on slow peers (F-11).
+3. **v1.0.7** — `ac_block_decode`'s tx-length walker read `body_len` at byte offset 66 instead of 70. Every block containing a transaction failed to deserialise, so `HEADERS_REQ` stalled at the first tx-bearing block. Offset corrected; regression covered by `tests/test_codec.c::test_full_block_with_tx_roundtrip` (F-12).
+4. **v1.0.8** — `agentchain stake` and `agentchain unbond` promoted from raw-tx flows to first-class CLI subcommands (see `§ 5.10`). No protocol change.
+5. **v1.0.9** — RPC `tx_submit` previously inserted into the mempool but did not gossip; a non-validator RPC client could submit a transaction that no validator ever saw. A `broadcast_tx` callback now wires the RPC into `ac_net_broadcast(TX_ANN, …)` (F-13).
+6. **v1.0.10** — `validate_commit` previously evaluated the committee threshold against the *post-apply* validator set, so a block that itself added a validator (`STAKE_BOND`) could never meet the threshold. `ac_chain_accept_block` now snapshots the *pre-block* validator metrics (total `sqrt_stake` plus a per-signer stake lookup) and passes them through; the threshold is computed against the set that signed (F-14).
+7. **v1.0.11** — committee members no longer vote immediately on the first proposal they see. They wait `AC_VOTE_DELAY_MS` (900 ms) after slot start, then sign exactly one `COMMIT_VOTE` for the proposal with the lowest VRF-derived leader priority. The change is normative on the spec side as well (`PROTOCOL.md § 6.5.1`). Without it, two leader-eligible validators in the same slot could each accumulate ≥2/3 committee weight on distinct proposals — the exact failure observed on mainnet at h=28699 under v1.0.10 (F-15).
 
-With both fixes in place, a fresh peer connecting from a residential link in Europe to the Iowa seed catches up at ~50 blocks/s; drift to tip shrinks monotonically and reaches single-digit blocks within a few minutes of connection. Tx submission via RPC and validator block production were unaffected throughout; only initial-sync ergonomics were degraded in the earlier 1.0.x line.
+End-to-end verification of v1.0.11 ran on the live mainnet on 2026-05-19 with two validators (an Iowa seed and a residential macOS host). The chain transitioned through four phases — both validators active, seed alone, both alive again, validator alone — without forks, without missed slots, and with the expected `signers={1,2}` shape on every commit. The associated mainnet `chain_id=1` history starts at the v1.0.11 genesis (`timestamp_ms=1779201674000`); the pre-v1.0.11 chain was abandoned during the coordinated reset described in the v1.0.11 release notes.
+
+### 9.7 Bootstrap genesis simplification
+
+**Protocol § 10** specifies a four-bucket 100M CRD distribution: a 60M validator reward pool, a 20M ecosystem-and-grants pool, a 12M foundation vest, and 8M across the initial validator set. The currently-deployed mainnet genesis at `deploy/mainnet-genesis.txt` ships a single allocation of ~40M CRD (39,999,999.8 balance + 200 stake) to the bootstrap validator. This is deliberately below the protocol's intended supply and uses a one-account structure pending the formal multi-bucket distribution: the foundation vesting account, ecosystem multisig, and reward pool's non-spendable system account are not yet implemented in v1.0.x state-apply logic. Migrating the genesis to the protocol-specified shape is part of the v1.1 work; until then, the deployed total supply and account topology are operator state, not normative.
 
 ---
 
-## 10. Performance Envelope (v1.0.0)
+## 10. Performance Envelope (v1.0.x)
 
 These are measured numbers from the local 4-node testnet (Apple M-series, single host). They are not extrapolations.
 

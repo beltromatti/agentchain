@@ -1,9 +1,11 @@
 # AgentChain Protocol Specification
 
-**Version:** 1.0.0
+**Version:** 1.0.0 — amended 2026-05-19
 **Status:** Stable
 **Author:** Noesis AI — Mattia Beltrami (Politecnico di Milano)
 **License:** Apache-2.0
+
+> **Amendments to v1.0.0.** § 6.5.1 (Vote convergence under multiple proposers) was added on 2026-05-19 alongside reference-client release v1.0.11. The wire format is unchanged; the change is normative on *when* and *how* committee members vote, not on what they sign. See `TECHNICAL-IMPLEMENTATION.md § 9.6` for the rollout record.
 
 ---
 

@@ -111,13 +111,14 @@ The protocol is forgiving about uptime — being offline costs you potential blo
 
 Every 2 seconds is a slot. In every slot:
 
-1. Each validator privately computes a VRF over `(epoch_seed, slot_number)` using its private key. The VRF output tells the validator whether *it* is eligible to propose this slot, and whether *it* is in this slot's 64-member committee. The two roles are sampled independently.
-2. Validators that are leader-eligible produce a block and broadcast it. Validators that are committee-eligible sign the block they see and broadcast their signature.
-3. When more than two thirds of the committee's `sqrt(stake)` has signed the same block, every node accepts it. Two blocks later, it is irreversible.
+1. Each validator privately computes a VRF over `(epoch_seed, slot_number)` using its private key. The output decides whether *it* is leader-eligible this slot and whether *it* sits in this slot's 64-member committee. The two roles are sampled independently.
+2. Leader-eligible validators build a block and broadcast it. The leader threshold is permissive on purpose (~2 candidates per slot) so a single offline leader does not stall the slot.
+3. **At slot start + 900 ms**, every committee member picks the proposal with the lowest VRF-derived leader priority it has seen and signs *exactly one* commit vote for it. Priority is a deterministic function of the proposer's VRF output and `sqrt(stake)`, so every honest committee member chooses the same winner. The deferred-vote window is what lets two simultaneous proposers coexist without forking the chain.
+4. When committee signers carrying more than two thirds of the slot's expected `sqrt(stake)` weight have signed the same block, every node accepts it. Two blocks later it is irreversible.
 
-The mechanism is a faithful synthesis of well-understood building blocks: VRF sortition (originally Algorand), square-root vote weighting (public-choice literature), single-round BFT commits, and EIP-1559 fee burning. No individual component is novel. The contribution is the combination, tuned for an audience that historical PoS designs have been quietly excluding.
+The mechanism is a faithful synthesis of well-understood building blocks: VRF sortition (originally Algorand), square-root vote weighting (public-choice literature), single-round BFT commits, EIP-1559 fee burning, and a deferred priority-based vote convergence step that makes the protocol safe for any number of validators from 1 to 10⁶. No individual component is novel. The contribution is the combination, tuned for an audience that historical PoS designs have been quietly excluding.
 
-The mechanism has a name: **Proof of Sustained Availability**. The full design is in [PROTOCOL.md](PROTOCOL.md).
+The mechanism has a name: **Proof of Sustained Availability**. The full design is in [PROTOCOL.md](PROTOCOL.md); the vote-convergence rule is normative under § 6.5.1.
 
 ## Build from source
 
@@ -174,7 +175,7 @@ agentchain info       --rpc URL
    └──────────────┘       └──────────────┘
 ```
 
-All eleven files compile into a single binary. The whole codebase is under 6,000 lines of C, by design.
+Ten modules plus `main.c` compile into a single binary. The whole codebase is around 6,600 lines of C, by design.
 
 ## Security
 
