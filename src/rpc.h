@@ -11,6 +11,7 @@
 #include "chain.h"
 #include "common.h"
 #include "mempool.h"
+#include "net.h"
 
 typedef struct ac_rpc_s ac_rpc_t;
 
@@ -19,6 +20,11 @@ typedef struct {
     char          host[64];      /* default 127.0.0.1 */
     ac_chain_t   *chain;
     ac_mempool_t *mempool;
+
+    /* Optional. The RPC reads peer state via ac_net_each_peer when the
+     * caller provides a net handle. peers_list returns "not configured"
+     * if this is NULL. */
+    ac_net_t     *net;
 
     /* Optional. When tx_submit accepts a transaction, the RPC invokes this
      * callback so the engine can gossip the tx to its peers via TX_ANN.

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 project(agentchain
-    VERSION 1.0.13
+    VERSION 1.0.14
     DESCRIPTION "AgentChain Engine — reference client for the AgentChain protocol"
     HOMEPAGE_URL "https://github.com/beltromatti/agentchain"
     LANGUAGES C)

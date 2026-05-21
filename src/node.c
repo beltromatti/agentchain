@@ -354,6 +354,7 @@ int ac_node_start(ac_node_t *n) {
              n->cfg.rpc_host[0] ? n->cfg.rpc_host : "127.0.0.1");
     rcfg.chain = n->chain;
     rcfg.mempool = n->mempool;
+    rcfg.net = n->net;
     rcfg.broadcast_tx = rpc_broadcast_tx_cb;
     rcfg.broadcast_tx_ctx = n;
     n->rpc = ac_rpc_new(&rcfg);

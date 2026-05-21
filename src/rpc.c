@@ -83,16 +83,21 @@ static void send_response(int fd, int status, const char *body) {
 }
 
 static void send_rpc_result(int fd, const char *id_value, const char *result_json) {
-    char body[8192];
+    /* result_json can be large (top-N lists, full blocks, peers). Allocate to
+     * fit the worst-case envelope plus the prefix. */
+    size_t need = strlen(result_json) + 128;
+    char *body = (char *)malloc(need);
+    if (!body) return;
     if (id_value && id_value[0]) {
-        snprintf(body, sizeof(body),
+        snprintf(body, need,
             "{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":%s}",
             id_value, result_json);
     } else {
-        snprintf(body, sizeof(body),
+        snprintf(body, need,
             "{\"jsonrpc\":\"2.0\",\"id\":null,\"result\":%s}", result_json);
     }
     send_response(fd, 200, body);
+    free(body);
 }
 
 static void send_rpc_error(int fd, const char *id_value, int code, const char *msg) {
@@ -255,6 +260,208 @@ static void handle_block_get(ac_rpc_t *r, int fd, const char *id, const char *pa
     send_rpc_result(fd, id, buf);
 }
 
+/* tx_get — lookup a transaction by hash. Returns the full tx fields plus
+ * the containing block height + index, or error -32004 if not found. */
+static void handle_tx_get(ac_rpc_t *r, int fd, const char *id, const char *params) {
+    char hex[2 * AC_HASH_SIZE + 1] = {0};
+    if (!json_string(params, "hash", hex, sizeof(hex))) {
+        send_rpc_error(fd, id, -32602, "missing hash"); return;
+    }
+    ac_hash_t th;
+    if (ac_hex_decode(th.b, AC_HASH_SIZE, hex) != 0) {
+        send_rpc_error(fd, id, -32602, "bad hex"); return;
+    }
+
+    ac_chain_lock(r->cfg.chain);
+    uint64_t height = 0;
+    uint32_t idx = 0;
+    int found = ac_chain_tx_find(r->cfg.chain, &th, &height, &idx);
+    if (!found) { ac_chain_unlock(r->cfg.chain); send_rpc_error(fd, id, -32004, "tx not found"); return; }
+
+    ac_block_t b;
+    if (ac_chain_get_block_by_height(r->cfg.chain, height, &b) < 0) {
+        ac_chain_unlock(r->cfg.chain); send_rpc_error(fd, id, -32004, "block missing"); return;
+    }
+    uint64_t slot = b.header.slot;
+    uint64_t ts   = b.header.timestamp_ms;
+    if (idx >= b.tx_count) { ac_block_free(&b); ac_chain_unlock(r->cfg.chain); send_rpc_error(fd, id, -32004, "tx index out of range"); return; }
+    const ac_tx_t *t = &b.txs[idx];
+
+    char sender_hex[2 * AC_PUBKEY_SIZE + 1];
+    ac_hex_encode(sender_hex, t->sender.b, AC_PUBKEY_SIZE);
+    char *body_hex = (char *)malloc(t->body_len * 2 + 1);
+    if (!body_hex) { ac_block_free(&b); ac_chain_unlock(r->cfg.chain); send_rpc_error(fd, id, -32603, "oom"); return; }
+    ac_hex_encode(body_hex, t->body, t->body_len);
+    char *memo_hex = (char *)malloc(t->memo_len * 2 + 1);
+    if (!memo_hex) { free(body_hex); ac_block_free(&b); ac_chain_unlock(r->cfg.chain); send_rpc_error(fd, id, -32603, "oom"); return; }
+    ac_hex_encode(memo_hex, t->memo, t->memo_len);
+
+    size_t need = t->body_len * 2 + t->memo_len * 2 + 1024;
+    char *out = (char *)malloc(need);
+    if (out) {
+        snprintf(out, need,
+            "{\"hash\":\"%s\",\"height\":%" PRIu64 ",\"slot\":%" PRIu64 ",\"tx_index\":%u,"
+            "\"timestamp_ms\":%" PRIu64 ",\"version\":%u,\"chain_id\":%" PRIu64 ",\"kind\":%u,"
+            "\"sender\":\"%s\",\"nonce\":%" PRIu64 ",\"gas_limit\":%u,\"tip\":%" PRIu64 ","
+            "\"valid_until\":%" PRIu64 ",\"body_hex\":\"%s\",\"memo_hex\":\"%s\"}",
+            hex, height, slot, idx, ts, t->version, t->chain_id, t->kind,
+            sender_hex, t->nonce, t->gas_limit, t->tip, t->valid_until,
+            body_hex, memo_hex);
+        send_rpc_result(fd, id, out);
+        free(out);
+    } else {
+        send_rpc_error(fd, id, -32603, "oom");
+    }
+    free(body_hex);
+    free(memo_hex);
+    ac_block_free(&b);
+    ac_chain_unlock(r->cfg.chain);
+}
+
+/* block_get_full — header + tx hashes for every transaction in the block. */
+static void handle_block_get_full(ac_rpc_t *r, int fd, const char *id, const char *params) {
+    uint64_t h = 0;
+    if (!json_uint64(params, "height", &h)) {
+        send_rpc_error(fd, id, -32602, "missing height"); return;
+    }
+    ac_chain_lock(r->cfg.chain);
+    ac_block_t b;
+    if (ac_chain_get_block_by_height(r->cfg.chain, h, &b) < 0) {
+        ac_chain_unlock(r->cfg.chain); send_rpc_error(fd, id, -32004, "block not found"); return;
+    }
+    ac_hash_t bh;
+    ac_block_hash(&bh, &b.header);
+    char hex_bh[2 * AC_HASH_SIZE + 1]; ac_hex_encode(hex_bh, bh.b, AC_HASH_SIZE);
+    char ph[2 * AC_HASH_SIZE + 1]; ac_hex_encode(ph, b.header.parent_hash.b, AC_HASH_SIZE);
+    char sr[2 * AC_HASH_SIZE + 1]; ac_hex_encode(sr, b.header.state_root.b,  AC_HASH_SIZE);
+    char tr[2 * AC_HASH_SIZE + 1]; ac_hex_encode(tr, b.header.tx_root.b,     AC_HASH_SIZE);
+    char pp[2 * AC_PUBKEY_SIZE + 1]; ac_hex_encode(pp, b.header.proposer.b,  AC_PUBKEY_SIZE);
+
+    size_t need = 1024 + b.tx_count * (2 * AC_HASH_SIZE + 4);
+    char *out = (char *)malloc(need);
+    if (!out) { ac_block_free(&b); ac_chain_unlock(r->cfg.chain); send_rpc_error(fd, id, -32603, "oom"); return; }
+    int pos = snprintf(out, need,
+        "{\"height\":%" PRIu64 ",\"hash\":\"%s\",\"slot\":%" PRIu64 ",\"timestamp_ms\":%" PRIu64
+        ",\"parent_hash\":\"%s\",\"state_root\":\"%s\",\"tx_root\":\"%s\",\"proposer\":\"%s\","
+        "\"base_fee\":%" PRIu64 ",\"gas_used\":%" PRIu64 ",\"gas_limit\":%" PRIu64
+        ",\"tx_count\":%u,\"tx_hashes\":[",
+        b.header.height, hex_bh, b.header.slot, b.header.timestamp_ms, ph, sr, tr, pp,
+        b.header.base_fee, b.header.gas_used, b.header.gas_limit, b.header.tx_count);
+    for (uint32_t i = 0; i < b.tx_count && pos > 0 && (size_t)pos + 80 < need; ++i) {
+        ac_hash_t th; ac_tx_hash(&th, &b.txs[i]);
+        char hh[2 * AC_HASH_SIZE + 1]; ac_hex_encode(hh, th.b, AC_HASH_SIZE);
+        pos += snprintf(out + pos, need - pos, "%s\"%s\"", i ? "," : "", hh);
+    }
+    if (pos > 0 && (size_t)pos + 2 < need) {
+        snprintf(out + pos, need - pos, "]}");
+    }
+    send_rpc_result(fd, id, out);
+    free(out);
+    ac_block_free(&b);
+    ac_chain_unlock(r->cfg.chain);
+}
+
+/* validators_list — active validators sorted by stake descending. */
+static void handle_validators_list(ac_rpc_t *r, int fd, const char *id, const char *params) {
+    uint64_t limit_u = 0;
+    json_uint64(params, "limit", &limit_u);
+    if (limit_u == 0) limit_u = 100;
+    if (limit_u > 1000) limit_u = 1000;
+    size_t cap = (size_t)limit_u;
+
+    ac_chain_lock(r->cfg.chain);
+    uint64_t total_sqrt = ac_chain_total_sqrt_stake(r->cfg.chain);
+    size_t total_active = ac_chain_active_count(r->cfg.chain);
+    ac_account_t *arr = (ac_account_t *)malloc(cap * sizeof(*arr));
+    if (!arr) { ac_chain_unlock(r->cfg.chain); send_rpc_error(fd, id, -32603, "oom"); return; }
+    size_t n = ac_chain_top_validators(r->cfg.chain, arr, cap);
+    ac_chain_unlock(r->cfg.chain);
+
+    size_t need = 256 + n * 200;
+    char *out = (char *)malloc(need);
+    if (!out) { free(arr); send_rpc_error(fd, id, -32603, "oom"); return; }
+    int pos = snprintf(out, need,
+        "{\"total_active\":%zu,\"total_sqrt_stake\":%" PRIu64 ",\"validators\":[",
+        total_active, total_sqrt);
+    for (size_t i = 0; i < n && pos > 0 && (size_t)pos + 200 < need; ++i) {
+        char ah[2 * AC_PUBKEY_SIZE + 1]; ac_hex_encode(ah, arr[i].addr.b, AC_PUBKEY_SIZE);
+        pos += snprintf(out + pos, need - pos,
+            "%s{\"address\":\"%s\",\"stake\":%" PRIu64 ",\"balance\":%" PRIu64 ",\"nonce\":%" PRIu64 "}",
+            i ? "," : "", ah, arr[i].stake, arr[i].balance, arr[i].nonce);
+    }
+    if (pos > 0 && (size_t)pos + 2 < need) snprintf(out + pos, need - pos, "]}");
+    send_rpc_result(fd, id, out);
+    free(out);
+    free(arr);
+}
+
+/* accounts_top — top accounts by balance descending. */
+static void handle_accounts_top(ac_rpc_t *r, int fd, const char *id, const char *params) {
+    uint64_t limit_u = 0;
+    json_uint64(params, "limit", &limit_u);
+    if (limit_u == 0) limit_u = 100;
+    if (limit_u > 1000) limit_u = 1000;
+    size_t cap = (size_t)limit_u;
+
+    ac_chain_lock(r->cfg.chain);
+    size_t total = ac_state_count(ac_chain_state(r->cfg.chain));
+    ac_account_t *arr = (ac_account_t *)malloc(cap * sizeof(*arr));
+    if (!arr) { ac_chain_unlock(r->cfg.chain); send_rpc_error(fd, id, -32603, "oom"); return; }
+    size_t n = ac_chain_top_accounts_by_balance(r->cfg.chain, arr, cap);
+    ac_chain_unlock(r->cfg.chain);
+
+    size_t need = 256 + n * 220;
+    char *out = (char *)malloc(need);
+    if (!out) { free(arr); send_rpc_error(fd, id, -32603, "oom"); return; }
+    int pos = snprintf(out, need,
+        "{\"total_accounts\":%zu,\"accounts\":[", total);
+    for (size_t i = 0; i < n && pos > 0 && (size_t)pos + 220 < need; ++i) {
+        char ah[2 * AC_PUBKEY_SIZE + 1]; ac_hex_encode(ah, arr[i].addr.b, AC_PUBKEY_SIZE);
+        pos += snprintf(out + pos, need - pos,
+            "%s{\"address\":\"%s\",\"balance\":%" PRIu64 ",\"stake\":%" PRIu64 ",\"nonce\":%" PRIu64 "}",
+            i ? "," : "", ah, arr[i].balance, arr[i].stake, arr[i].nonce);
+    }
+    if (pos > 0 && (size_t)pos + 2 < need) snprintf(out + pos, need - pos, "]}");
+    send_rpc_result(fd, id, out);
+    free(out);
+    free(arr);
+}
+
+typedef struct {
+    char  *out;
+    size_t cap;
+    size_t pos;
+    int    count;
+} peer_acc_t;
+
+static int peer_acc_cb(const ac_addr_t *id, const char *host, uint16_t port,
+                       bool inbound, void *ctx) {
+    peer_acc_t *a = (peer_acc_t *)ctx;
+    if (a->pos + 250 >= a->cap) return 1;
+    char ah[2 * AC_PUBKEY_SIZE + 1];
+    ac_hex_encode(ah, id->b, AC_PUBKEY_SIZE);
+    a->pos += (size_t)snprintf(a->out + a->pos, a->cap - a->pos,
+        "%s{\"pubkey\":\"%s\",\"host\":\"%s\",\"port\":%u,\"inbound\":%s}",
+        a->count ? "," : "", ah, host, (unsigned)port, inbound ? "true" : "false");
+    a->count++;
+    return 0;
+}
+
+/* peers_list — connected peers seen by the local net module. */
+static void handle_peers_list(ac_rpc_t *r, int fd, const char *id) {
+    if (!r->cfg.net) { send_rpc_result(fd, id, "{\"connected\":0,\"peers\":[]}"); return; }
+    size_t cap = 8192;
+    char *out = (char *)malloc(cap);
+    if (!out) { send_rpc_error(fd, id, -32603, "oom"); return; }
+    size_t pos = (size_t)snprintf(out, cap, "{\"connected\":%zu,\"peers\":[",
+                                  ac_net_peer_count(r->cfg.net));
+    peer_acc_t a = { .out = out, .cap = cap, .pos = pos, .count = 0 };
+    ac_net_each_peer(r->cfg.net, peer_acc_cb, &a);
+    if (a.pos + 2 < a.cap) snprintf(a.out + a.pos, a.cap - a.pos, "]}");
+    send_rpc_result(fd, id, out);
+    free(out);
+}
+
 /* -------------------------------------------------------------------------- */
 /* Connection handler.                                                        */
 /* -------------------------------------------------------------------------- */
@@ -349,6 +556,11 @@ static void handle_client(ac_rpc_t *r, int fd) {
     else if (strcmp(method, "tx_submit")       == 0) handle_tx_submit   (r, fd, id_lit, params);
     else if (strcmp(method, "mempool_size")    == 0) handle_mempool_size(r, fd, id_lit);
     else if (strcmp(method, "block_get")       == 0) handle_block_get   (r, fd, id_lit, params);
+    else if (strcmp(method, "block_get_full")  == 0) handle_block_get_full(r, fd, id_lit, params);
+    else if (strcmp(method, "tx_get")          == 0) handle_tx_get      (r, fd, id_lit, params);
+    else if (strcmp(method, "validators_list") == 0) handle_validators_list(r, fd, id_lit, params);
+    else if (strcmp(method, "accounts_top")    == 0) handle_accounts_top(r, fd, id_lit, params);
+    else if (strcmp(method, "peers_list")      == 0) handle_peers_list  (r, fd, id_lit);
     else send_rpc_error(fd, id_lit, -32601, "method not found");
 }
 

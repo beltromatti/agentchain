@@ -66,6 +66,19 @@ int        ac_chain_get_block_by_height(const ac_chain_t *c, uint64_t height, ac
 int        ac_chain_get_header_by_height(const ac_chain_t *c, uint64_t height, ac_block_header_t *out);
 int        ac_chain_get_block_hash      (const ac_chain_t *c, uint64_t height, ac_hash_t *out);
 
+/* Lookup a transaction by its hash. Returns 1 if found and fills the
+ * containing block height + position; 0 otherwise. The chain keeps an
+ * in-memory tx index, rebuilt from on-disk blocks at open and updated on
+ * accept. */
+int        ac_chain_tx_find(ac_chain_t *c, const ac_hash_t *tx_hash,
+                            uint64_t *out_height, uint32_t *out_tx_index);
+
+/* Snapshot the top accounts by the given field, ordered descending. Returns
+ * the number written into `out` (<= cap). Validators excludes accounts below
+ * AC_MIN_STAKE_UCRD. */
+size_t     ac_chain_top_accounts_by_balance(ac_chain_t *c, ac_account_t *out, size_t cap);
+size_t     ac_chain_top_validators         (ac_chain_t *c, ac_account_t *out, size_t cap);
+
 /* State accessor (read-only); use ac_chain_lock around it. */
 ac_state_t *ac_chain_state(ac_chain_t *c);
 

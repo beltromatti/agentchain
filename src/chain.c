@@ -17,6 +17,12 @@
 /* Internal state.                                                            */
 /* -------------------------------------------------------------------------- */
 
+typedef struct {
+    ac_hash_t  hash;
+    uint64_t   height;
+    uint32_t   tx_idx;
+} tx_index_entry_t;
+
 struct ac_chain_s {
     pthread_mutex_t mu;
 
@@ -39,6 +45,13 @@ struct ac_chain_s {
     uint64_t     cached_epoch;
     ac_hash_t    cached_seed;
     bool         cached_valid;
+
+    /* tx-hash → (height, tx_index) index. Sorted by hash; binary-search
+     * lookup. Rebuilt from on-disk blocks at open, updated on accept_block. */
+    tx_index_entry_t *tx_index;
+    size_t            tx_index_n;
+    size_t            tx_index_cap;
+    bool              tx_index_sorted;
 };
 
 /* -------------------------------------------------------------------------- */
@@ -128,6 +141,75 @@ int ac_chain_get_block_hash(const ac_chain_t *c, uint64_t h, ac_hash_t *out) {
     if (ac_chain_get_header_by_height(c, h, &hdr) < 0) return -1;
     ac_block_hash(out, &hdr);
     return 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Tx-hash index. Built at open by walking on-disk blocks; updated on accept. */
+/* -------------------------------------------------------------------------- */
+
+static int tx_index_cmp(const void *a, const void *b) {
+    const tx_index_entry_t *ea = a;
+    const tx_index_entry_t *eb = b;
+    return memcmp(ea->hash.b, eb->hash.b, AC_HASH_SIZE);
+}
+
+static int tx_index_reserve(ac_chain_t *c, size_t need) {
+    if (c->tx_index_cap >= need) return 0;
+    size_t cap = c->tx_index_cap ? c->tx_index_cap * 2 : 256;
+    while (cap < need) cap *= 2;
+    void *p = realloc(c->tx_index, cap * sizeof(*c->tx_index));
+    if (!p) return -1;
+    c->tx_index = p;
+    c->tx_index_cap = cap;
+    return 0;
+}
+
+static int tx_index_add(ac_chain_t *c, const ac_hash_t *h, uint64_t height, uint32_t idx) {
+    if (tx_index_reserve(c, c->tx_index_n + 1) < 0) return -1;
+    c->tx_index[c->tx_index_n].hash   = *h;
+    c->tx_index[c->tx_index_n].height = height;
+    c->tx_index[c->tx_index_n].tx_idx = idx;
+    c->tx_index_n++;
+    c->tx_index_sorted = false;
+    return 0;
+}
+
+static void tx_index_sort(ac_chain_t *c) {
+    if (c->tx_index_sorted) return;
+    qsort(c->tx_index, c->tx_index_n, sizeof(*c->tx_index), tx_index_cmp);
+    c->tx_index_sorted = true;
+}
+
+int ac_chain_tx_find(ac_chain_t *c, const ac_hash_t *tx_hash,
+                     uint64_t *out_height, uint32_t *out_tx_index) {
+    if (!c->tx_index_n) return 0;
+    tx_index_sort(c);
+    tx_index_entry_t key;
+    key.hash = *tx_hash;
+    tx_index_entry_t *r = bsearch(&key, c->tx_index, c->tx_index_n,
+                                   sizeof(*c->tx_index), tx_index_cmp);
+    if (!r) return 0;
+    if (out_height)   *out_height   = r->height;
+    if (out_tx_index) *out_tx_index = r->tx_idx;
+    return 1;
+}
+
+/* Walks the on-disk block range [from, c->height] and inserts every
+ * transaction hash into the in-memory index. Called from ac_chain_open after
+ * the chain has been opened (height + tip known). */
+static void tx_index_rebuild(ac_chain_t *c) {
+    if (c->height == 0) return;
+    for (uint64_t h = 1; h <= c->height; ++h) {
+        ac_block_t b;
+        if (block_read(c, h, &b) < 0) continue;
+        for (uint32_t i = 0; i < b.tx_count; ++i) {
+            ac_hash_t th;
+            ac_tx_hash(&th, &b.txs[i]);
+            tx_index_add(c, &th, h, i);
+        }
+        ac_block_free(&b);
+    }
+    tx_index_sort(c);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -242,16 +324,68 @@ ac_chain_t *ac_chain_open(const char *data_dir, const ac_genesis_t *g) {
               g->chain_id, g->timestamp_ms);
     }
 
-    LOG_I("chain", "opened: chain_id=%" PRIu64 " height=%" PRIu64 " base_fee=%" PRIu64,
-          c->chain_id, c->height, c->base_fee);
+    /* Build the in-memory tx-hash index by walking on-disk blocks. Cheap
+     * on chains where most blocks contain no transactions. */
+    tx_index_rebuild(c);
+
+    LOG_I("chain", "opened: chain_id=%" PRIu64 " height=%" PRIu64
+          " base_fee=%" PRIu64 " indexed_txs=%zu",
+          c->chain_id, c->height, c->base_fee, c->tx_index_n);
     return c;
 }
 
 void ac_chain_close(ac_chain_t *c) {
     if (!c) return;
     if (c->state) ac_state_free(c->state);
+    free(c->tx_index);
     pthread_mutex_destroy(&c->mu);
     free(c);
+}
+
+/* Top accounts by selected field. Iterates the state, copies into `out`, sorts
+ * descending. Returns the number actually written (≤ cap). */
+typedef enum { TOP_BY_BALANCE, TOP_BY_STAKE } top_field_t;
+
+static int top_cmp_balance(const void *a, const void *b) {
+    const ac_account_t *aa = a, *ab = b;
+    if (aa->balance > ab->balance) return -1;
+    if (aa->balance < ab->balance) return 1;
+    return memcmp(aa->addr.b, ab->addr.b, AC_PUBKEY_SIZE);
+}
+static int top_cmp_stake(const void *a, const void *b) {
+    const ac_account_t *aa = a, *ab = b;
+    if (aa->stake > ab->stake) return -1;
+    if (aa->stake < ab->stake) return 1;
+    return memcmp(aa->addr.b, ab->addr.b, AC_PUBKEY_SIZE);
+}
+
+static size_t chain_top_accounts(ac_chain_t *c, top_field_t f,
+                                 ac_account_t *out, size_t cap, bool active_only) {
+    if (cap == 0) return 0;
+    size_t n = ac_state_count(c->state);
+    if (n == 0) return 0;
+    ac_account_t *all = (ac_account_t *)malloc(n * sizeof(*all));
+    if (!all) return 0;
+    size_t k = 0;
+    for (size_t i = 0; i < n; ++i) {
+        ac_account_t a;
+        if (!ac_state_at(c->state, i, &a)) continue;
+        if (active_only && a.stake < AC_MIN_STAKE_UCRD) continue;
+        all[k++] = a;
+    }
+    qsort(all, k, sizeof(*all),
+          f == TOP_BY_BALANCE ? top_cmp_balance : top_cmp_stake);
+    size_t take = k < cap ? k : cap;
+    for (size_t i = 0; i < take; ++i) out[i] = all[i];
+    free(all);
+    return take;
+}
+
+size_t ac_chain_top_accounts_by_balance(ac_chain_t *c, ac_account_t *out, size_t cap) {
+    return chain_top_accounts(c, TOP_BY_BALANCE, out, cap, false);
+}
+size_t ac_chain_top_validators(ac_chain_t *c, ac_account_t *out, size_t cap) {
+    return chain_top_accounts(c, TOP_BY_STAKE, out, cap, true);
 }
 
 void ac_chain_lock  (ac_chain_t *c) { pthread_mutex_lock(&c->mu); }
@@ -757,6 +891,13 @@ ac_accept_t ac_chain_accept_block(ac_chain_t *c, const ac_block_t *b) {
     c->last_timestamp_ms = b->header.timestamp_ms;
     c->base_fee = b->header.base_fee;
     if (meta_save(c) < 0)                             return AC_ACCEPT_INTERNAL;
+
+    /* Update the tx-hash index for any transactions in this block. */
+    for (uint32_t i = 0; i < b->tx_count; ++i) {
+        ac_hash_t th;
+        ac_tx_hash(&th, &b->txs[i]);
+        tx_index_add(c, &th, b->header.height, i);
+    }
 
     /* Invalidate cached epoch seed if epoch boundary crossed. */
     c->cached_valid = false;

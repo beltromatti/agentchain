@@ -86,7 +86,7 @@ static void print_usage(const char *argv0) {
         "\n"
         "Transactions (signed locally, broadcast via JSON-RPC)\n"
         "  send       Transfer CRD to another address\n"
-        "  stake      Bond CRD to become / top-up a validator\n"
+        "  bond       Bond CRD into stake to become / top-up a validator\n"
         "  unbond     Release stake back to balance\n"
         "\n"
         "Operating a node\n"
@@ -714,30 +714,34 @@ static int cmd_send(int argc, char **argv) {
     return submit_tx("send", &opts, AC_TX_TRANSFER, body, (uint32_t)bn, /*gas_limit*/ 1000);
 }
 
-static int cmd_stake(int argc, char **argv) {
+static int cmd_bond(int argc, char **argv) {
     if (has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
         fprintf(stderr,
-            "Usage: agentchain stake --amount UCRD\n"
-            "                        [--from-key FILE] [--rpc URL] [--tip N]\n"
+            "Usage: agentchain bond --amount UCRD\n"
+            "                       [--from-key FILE] [--rpc URL] [--tip N]\n"
             "\n"
-            "Bond `amount` µCRD from your balance into stake. Once stake ≥ %llu µCRD\n"
-            "(= 100 CRD), your key becomes eligible for validator sortition. You\n"
-            "still need to run `agentchain node --validator` to actually propose.\n",
+            "Bond `amount` micro-CRD from your balance into stake. Once stake \n"
+            "reaches %llu uCRD (= 100 CRD), your key becomes eligible for validator\n"
+            "sortition. You still need to run `agentchain node --validator` to\n"
+            "actually propose blocks.\n"
+            "\n"
+            "Until v1.0.13 this command was called `stake`; the old name still\n"
+            "works as a deprecated alias.\n",
             (unsigned long long)AC_MIN_STAKE_UCRD);
         return 0;
     }
     tx_submit_opts_t opts = parse_submit_opts(argc, argv);
     const char *amount_s  = get_opt(argc, argv, "--amount");
     if (!amount_s) {
-        fprintf(stderr, "stake: --amount UCRD required\n");
+        fprintf(stderr, "bond: --amount UCRD required\n");
         return 2;
     }
     ac_body_stake_t b;
     b.amount = strtoull(amount_s, NULL, 10);
     uint8_t body[AC_TX_BODY_MAX];
     int bn = ac_body_stake_encode(body, sizeof(body), &b);
-    if (bn < 0) { fprintf(stderr, "stake: body encode failed\n"); return 1; }
-    return submit_tx("stake", &opts, AC_TX_STAKE_BOND, body, (uint32_t)bn, /*gas_limit*/ 1000);
+    if (bn < 0) { fprintf(stderr, "bond: body encode failed\n"); return 1; }
+    return submit_tx("bond", &opts, AC_TX_STAKE_BOND, body, (uint32_t)bn, /*gas_limit*/ 1000);
 }
 
 static int cmd_unbond(int argc, char **argv) {
@@ -902,7 +906,8 @@ int main(int argc, char **argv) {
     else if (strcmp(cmd, "pubkey")  == 0) rc = cmd_pubkey(argc - 1, argv + 1);
     else if (strcmp(cmd, "genesis") == 0) rc = cmd_genesis(argc - 1, argv + 1);
     else if (strcmp(cmd, "send")    == 0) rc = cmd_send(argc - 1, argv + 1);
-    else if (strcmp(cmd, "stake")   == 0) rc = cmd_stake(argc - 1, argv + 1);
+    else if (strcmp(cmd, "bond")    == 0) rc = cmd_bond  (argc - 1, argv + 1);
+    else if (strcmp(cmd, "stake")   == 0) rc = cmd_bond  (argc - 1, argv + 1);   /* deprecated alias */
     else if (strcmp(cmd, "unbond")  == 0) rc = cmd_unbond(argc - 1, argv + 1);
     else if (strcmp(cmd, "balance") == 0) rc = cmd_balance(argc - 1, argv + 1);
     else if (strcmp(cmd, "info")    == 0) rc = cmd_info(argc - 1, argv + 1);
