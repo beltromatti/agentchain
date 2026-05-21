@@ -51,8 +51,10 @@
 #define AC_MAINNET_GENESIS \
     "# AgentChain genesis configuration\n" \
     "chain_id     = 1\n" \
-    "timestamp_ms = 1779201674000\n" \
+    "timestamp_ms = 1779397200000\n" \
     "\n" \
-    "account 4bfe9fb5ea49f00bf3c78fb9e979223ee5fa630743befc5c1f5686ac923bf79a 39999999800000000 200000000\n"
+    "account 4bfe9fb5ea49f00bf3c78fb9e979223ee5fa630743befc5c1f5686ac923bf79a 39997000000000 1000000000\n" \
+    "account 69f02a87d94d8e1ba76ea4ee374b5358ea4782d6f4249fbd8731e9b4ac863a9e 500000000 500000000\n" \
+    "account 89dfe243a931659dd4f0d71b68110711262af7dcb58a053a9e9135ea454fa4fd 500000000 500000000\n"
 
 #endif /* AGENTCHAIN_MAINNET_H */

@@ -1,9 +1,18 @@
-# AgentChain mainnet seed peers — one `host:port` per line.
+# AgentChain mainnet alpha seed peers — one `host:port` per line.
 #
-# Operated by Noesis AI; see the README for the project's stance on
-# operator decentralisation and how to add your own seed to this list.
+# Operated by Noesis AI. Three regional foundation validators run as
+# equal peers (no single one is special). HELLO v2 peer-list gossip
+# (engine v1.1.0+) means dialing any one of these bootstraps the
+# full mesh.
+#
+# See the README for the project's stance on operator decentralisation
+# and how to add your own seed to this list.
 
-seed-iowa.agentchain.beltromatti.dev:30303  34.61.207.49:30303
-
-# Plain IPv4 fallback for clients that cannot resolve the hostname.
+# Iowa (GCP, us-central1-a)
 34.61.207.49:30303
+
+# Frankfurt (AWS EC2, eu-central-1)
+18.192.176.100:30303
+
+# Stockholm (AWS EC2, eu-north-1)
+16.171.43.222:30303

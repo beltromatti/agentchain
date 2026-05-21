@@ -8,7 +8,7 @@
 [![CI](https://github.com/beltromatti/agentchain/actions/workflows/build.yml/badge.svg)](https://github.com/beltromatti/agentchain/actions/workflows/build.yml)
 [![Release](https://img.shields.io/github/v/release/beltromatti/agentchain?include_prereleases&sort=semver)](https://github.com/beltromatti/agentchain/releases)
 [![Protocol](https://img.shields.io/badge/protocol-v1-informational)](PROTOCOL.md)
-[![Mainnet](https://img.shields.io/badge/mainnet-live-brightgreen)](#mainnet-status)
+[![Mainnet alpha](https://img.shields.io/badge/mainnet--alpha-live-brightgreen)](#mainnet-alpha-status)
 
 [Protocol](PROTOCOL.md) · [Implementation notes](TECHNICAL-IMPLEMENTATION.md) · [Security audit](SECURITY-AUDIT.md) · [Releases](https://github.com/beltromatti/agentchain/releases)
 
@@ -32,18 +32,23 @@ AgentChain is a single design that addresses both. It is a Layer-1 with:
 
 The native asset is **Credit (CRD)**. The smallest unit is the micro-Credit (`µCRD = 10⁻⁶ CRD`). All on-chain arithmetic is integer.
 
-## Mainnet status
+## Mainnet alpha status
 
-**AgentChain mainnet is live.**
+**AgentChain mainnet alpha is live.** Same `chain_id=1` as the production target — the
+"alpha" label is operational honesty during the period where the operator is still
+iterating on durability and the network has not yet survived a full validator
+churn under heavy real-world load.
 
 | | |
 | --- | --- |
 | `chain_id` | `1` |
+| **Network label** | `mainnet alpha` |
 | **Public RPC** | `https://api.agentchain.noesisai.it` (HTTPS, JSON-RPC 2.0 — read + write) |
-| **Bootstrap seed (P2P)** | `34.61.207.49:30303` (Iowa, US — operated by Noesis AI) |
+| **Bootstrap seeds (P2P)** | `34.61.207.49:30303` (Iowa, US), `18.192.176.100:30303` (Frankfurt), `16.171.43.222:30303` (Stockholm) — all equal peers, operated by Noesis AI |
 | **Genesis** | embedded in the binary; also at [`deploy/mainnet-genesis.txt`](deploy/mainnet-genesis.txt) |
 | **Block time** | 2 s · **2-block finality** ≈ 4 s |
-| **Engine release** | [`v1.0.13`](https://github.com/beltromatti/agentchain/releases/latest) |
+| **Engine release** | [`v1.1.0`](https://github.com/beltromatti/agentchain/releases/latest) |
+| **Total supply** | 100,000,000 CRD (60M reward pool + 40M validator allocations) |
 
 The public RPC is a Caddy reverse proxy in front of the seed's local JSON-RPC port, with Let's Encrypt TLS and kernel-level (nftables) rate limiting. It is the same `agentchain` daemon any operator runs; the proxy layer just provides HTTPS, request shaping, and a stable hostname. Both reads and writes are public — anyone can call `tx_submit`, the signature is verified on the way in. See [`SECURITY-AUDIT.md` § 6](SECURITY-AUDIT.md) for the hardening detail.
 
@@ -61,9 +66,9 @@ Download the binary for your OS from the [latest release](https://github.com/bel
 
 ```sh
 # macOS arm64 example
-curl -L https://github.com/beltromatti/agentchain/releases/latest/download/agentchain-v1.0.13-macos-arm64.tar.gz | tar xz
-cd agentchain-v1.0.13-*
-./agentchain info                           # queries mainnet by default
+curl -L https://github.com/beltromatti/agentchain/releases/latest/download/agentchain-v1.1.0-macos-arm64.tar.gz | tar xz
+cd agentchain-v1.1.0-*
+./agentchain info                           # queries mainnet alpha by default
 ```
 
 That's it — `info`, `balance`, `send`, `stake`, `unbond` all default to the public RPC. Run any command with `--help` for its full options.
@@ -72,18 +77,18 @@ That's it — `info`, `balance`, `send`, `stake`, `unbond` all default to the pu
 
 ```sh
 ./agentchain keygen                                    # writes ~/.agentchain/node.key, prints your address
-./agentchain balance                                   # checks your own balance on mainnet
+./agentchain balance                                   # checks your own balance on mainnet alpha
 ./agentchain send --to <recipient_address> --amount 1000000   # 1 CRD = 1,000,000 µCRD
 ```
 
-Getting CRD to spend: this is mainnet, there is no faucet. Receive CRD from someone who has it. The Noesis AI founder allocation is open to early contributors and projects building on AgentChain — open a GitHub issue or write to `info@noesis.ai` with a brief description of what you're going to do.
+Getting CRD to spend: the mainnet alpha exposes a public faucet at <https://agentchain.noesisai.it/faucet> (110 CRD per address, Cloudflare Turnstile gated). Beyond that, receive CRD from someone who has it. The Noesis AI founder allocation is open to early contributors and projects building on AgentChain — open a GitHub issue or write to `info@noesis.ai` with a brief description of what you're going to do.
 
 ## Run your own node
 
-The same binary that is a CLI is also the daemon. With no flags, `agentchain node` joins mainnet as a syncing peer (data goes to `~/.agentchain`, genesis is embedded, seeds are baked in):
+The same binary that is a CLI is also the daemon. With no flags, `agentchain node` joins mainnet alpha as a syncing peer (data goes to `~/.agentchain`, genesis is embedded, seeds are baked in):
 
 ```sh
-./agentchain node                            # join mainnet, sync only
+./agentchain node                            # join mainnet alpha, sync only
 ./agentchain node --validator                # also propose & vote on blocks
 ```
 
@@ -136,7 +141,7 @@ N=4 RUN_S=30 testnet/run.sh    # 4-node local testnet smoke
 
 ## CLI quick reference
 
-Every command defaults to mainnet over HTTPS. Override with `--rpc URL` (any host:port or http(s):// URL).
+Every command defaults to mainnet alpha over HTTPS. Override with `--rpc URL` (any host:port or http(s):// URL).
 
 ```sh
 # Wallet & queries
