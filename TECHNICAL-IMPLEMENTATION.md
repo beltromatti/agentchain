@@ -1,6 +1,6 @@
 # AgentChain Engine — Technical Implementation Notes
 
-This document describes how **AgentChain Engine v1.0.13**, the reference C client, realises the protocol specified in `PROTOCOL.md`. Read the protocol first; this document is a companion. Where the implementation deviates from the spec, the deviation is called out explicitly under `§ 9 Spec Deviations`.
+This document describes how **AgentChain Engine v1.1.0**, the reference C client, realises the protocol specified in `PROTOCOL.md`. Read the protocol first; this document is a companion. Where the implementation deviates from the spec, the deviation is called out explicitly under `§ 9 Spec Deviations`.
 
 ---
 
@@ -50,7 +50,7 @@ The reference binary statically links its own modules into `libagentchain_engine
 
 ## 3. Mapping: Protocol → Source
 
-The following table is the authoritative cross-reference. If a feature is in the protocol but not in this table, it is unimplemented in v1.0.13 (see `§ 9`).
+The following table is the authoritative cross-reference. If a feature is in the protocol but not in this table, it is unimplemented in v1.1.0 (see `§ 9`).
 
 | Protocol section                          | Implemented in                                       |
 | ----------------------------------------- | ---------------------------------------------------- |
@@ -385,7 +385,7 @@ These deviations are deliberate and documented. Each is annotated with the proto
 
 **Protocol § 6.6** specifies that double-signing is slashable. v1.0.x implements the `SLASH_EVIDENCE` transaction, verifies the two signatures, and burns the validator's stake. What v1.0.x does **not** do automatically is detect equivocations in real time — a slasher must construct and submit the evidence transaction. A built-in equivocation watcher is on the v1.1 roadmap.
 
-### 9.6 Patch-release history (v1.0.1 → v1.0.13)
+### 9.6 Patch-release history (v1.0.1 → v1.1.0)
 
 The 1.0.x line has been amended several times since the initial mainnet launch. Each fix is recorded here for traceability; the corresponding security finding ID is in `SECURITY-AUDIT.md`.
 
@@ -398,6 +398,14 @@ The 1.0.x line has been amended several times since the initial mainnet launch. 
 7. **v1.0.11** — committee members no longer vote immediately on the first proposal they see. They wait `AC_VOTE_DELAY_MS` (900 ms) after slot start, then sign exactly one `COMMIT_VOTE` for the proposal with the lowest VRF-derived leader priority. The change is normative on the spec side as well (`PROTOCOL.md § 6.5.1`). Without it, two leader-eligible validators in the same slot could each accumulate ≥2/3 committee weight on distinct proposals — the exact failure observed on mainnet at h=28699 under v1.0.10 (F-15).
 8. **v1.0.12** — CLI UX overhaul. Every client command (`info`, `balance`, `send`, `stake`, `unbond`) defaults to `https://api.agentchain.noesisai.it` over HTTPS instead of `127.0.0.1:30304`. `--from-key` / `--key` defaults to `~/.agentchain/node.key`; `--data-dir` to `~/.agentchain`. The mainnet genesis is embedded in the binary (`src/mainnet.h`, byte-identical to `deploy/mainnet-genesis.txt`) and materialised on first run when no override is provided. HTTPS support is via a stdin-fed `curl` shell-out — the daemon's transport stays plain HTTP on the loopback interface, with the public-facing TLS terminated by the reverse proxy described in `§ 7.4`. Per-command `--help` was added, and `send/stake/unbond` now surface a human-readable summary (tx hash + RPC) instead of the raw JSON-RPC envelope. No protocol change.
 9. **v1.0.13** — CI-gate cleanup: missing `<sys/wait.h>`/`<unistd.h>` includes for the v1.0.12 `https_post_curl` fork path, and `-Wformat-truncation` warnings on the `snprintf` calls that copy CLI flags into `ac_node_config_t` fields. Functionally identical to v1.0.12 (release artefacts there did not enable `-Werror`); only required to make the strict `build.yml` matrix green on Ubuntu 24.04 arm64.
+10. **v1.0.14** — explorer-grade RPC surface (`tx_get`, `block_get_full`, `validators_list`, `accounts_top`, `peers_list`) and a chain-side in-memory tx-by-hash index rebuilt from `blocks/` at open and updated on every accept. CLI gained the explicit `bond` subcommand (alias for `stake`) for clarity in onboarding flows.
+11. **v1.0.15** — `ac_isqrt_u64` previously returned `2^32` on inputs in `[(2^32-1)^2, 2^64-1]` because the Newton iteration overflowed at the boundary. With the v1.0.10 active-set scaling, this overflow silently inflated the total `sqrt_stake` of any large validator, breaking the leader-priority comparison in PoSA. Replaced with the textbook Newton-from-above method that stays in `[0, 2^32-1]` for every input.
+12. **v1.1.0** — four interlocking changes shipped together on top of a clean mainnet alpha rebootstrap (`timestamp_ms=1779397200000`):
+   1. **Live-set commit threshold.** `validate_commit` now compares signer weight against the *live* validator set (those that signed in the last `AC_LIVENESS_WINDOW=16` blocks), not the full bonded set. The previous behaviour froze the chain whenever a fresh validator bonded mid-sync: the threshold rose to include their stake, but they could not yet sign. The live-set rule is implemented in `chain.c` (`live_record_signer` on every accept, `ac_chain_live_sqrt_stake` queried by consensus) and rebuilt at open by replaying the last `AC_LIVENESS_WINDOW` blocks' signers.
+   2. **Vote delay + seal grace.** `AC_VOTE_DELAY_MS` bumped 900 → 1100 ms; new `AC_SEAL_GRACE_MS=300` ms holds the seal open after the threshold is first reached so late `COMMIT_VOTE`s from high-latency validators land in the certificate. The slot loop is now four-phase: propose, vote (+1100 ms), seal (+1400 ms), sleep. Stockholm→Iowa votes that previously missed the seal under v1.0.11 now make it in.
+   3. **HELLO v2 with peer-list gossip.** The HELLO frame now carries an optional peer-list trailer (cap=`AC_HELLO_PEER_MAX`=8). A new joiner that dials any one of the foundation seeds learns about the rest via gossip and dials them, so the topology stops being hub-and-spoke. v1.0.x HELLOs without the trailer are accepted unchanged.
+   4. **`address_txs` RPC.** Backed by an in-memory address tx-history index (built on accept, rebuilt at open, parallel to the tx-by-hash index). The website explorer's address view uses it to show inbound + outbound transactions on the same panel that already shows balance + stake, mirroring the wallet's History tab.
+   `mainnet.h` now lists three foundation seed peers as equals (Iowa/Frankfurt/Stockholm). CLI/help strings are relabelled "mainnet" → "mainnet alpha"; `chain_id` is unchanged at `1`. The rebootstrap discharged a unit-error in the previous genesis (seed validator's balance off by 3 orders of magnitude relative to the protocol's 100M total supply) and rotated the website faucet hot wallet (10,000 CRD funded from the seed validator post-launch).
 
 End-to-end verification of v1.0.11 ran on the live mainnet on 2026-05-19 with two validators (an Iowa seed and a residential macOS host). The chain transitioned through four phases — both validators active, seed alone, both alive again, validator alone — without forks, without missed slots, and with the expected `signers={1,2}` shape on every commit. The associated mainnet `chain_id=1` history starts at the v1.0.11 genesis (`timestamp_ms=1779201674000`); the pre-v1.0.11 chain was abandoned during the coordinated reset described in the v1.0.11 release notes. Read + write through the public HTTPS RPC was verified on 2026-05-20 alongside the v1.0.13 deployment (chain_info → 200; `send` from a remote wallet → tx mined → recipient balance +1 µCRD; sender nonce 2 → 3).
 

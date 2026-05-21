@@ -1,10 +1,12 @@
-# AgentChain Security Audit — v1.0.13
+# AgentChain Security Audit — v1.1.0
 
-**Audited release:** AgentChain Engine v1.0.13 (`commit 8e0c291`)
-**Audit date:** 2026-05-20
+**Audited release:** AgentChain Engine v1.1.0 (`commit 0d78e43`)
+**Audit date:** 2026-05-21
 **Auditor:** Noesis AI — internal review
-**Scope:** Reference C client + AgentChain Protocol v1, including the live mainnet (`chain_id=1`) bootstrap operated by Noesis AI on Google Cloud.
+**Scope:** Reference C client + AgentChain Protocol v1, including the live mainnet alpha (`chain_id=1`) network operated by Noesis AI on three regional hosts (GCP Iowa, AWS Frankfurt, AWS Stockholm).
 **Status:** Completed — findings and mitigations recorded below
+
+> **v1.1.0 delta.** This audit revision extends the v1.0.13 baseline with four engine changes that shipped on top of a clean mainnet alpha rebootstrap (2026-05-21): a live-set commit threshold (fixes the bond-while-syncing freeze observed under v1.0.15), `AC_VOTE_DELAY_MS=1100` + `AC_SEAL_GRACE_MS=300` for high-latency vote collection, HELLO v2 peer-list gossip (eliminates the topological dependence on a single Iowa seed), and the `address_txs` RPC + in-memory address tx-history index. The new total supply on `chain_id=1` is **100,000,000 CRD** (60M reward pool + 40M validator allocations) — see `deploy/mainnet-genesis.txt`. All four changes are additive; no protocol-breaking semantics were introduced.
 
 > **Disclaimer.** This is a first-party audit. We make no claim that it substitutes for an independent third-party review. Every statement below is backed by either a cryptographic guarantee from an audited dependency, an external standards document, or a reproducible test in this repository. Where we have not been able to confirm a property we say so explicitly.
 
@@ -171,7 +173,7 @@ The current mainnet seed is documented in `deploy/mainnet-seeds.txt`. It runs on
 - `TCP 30304` — JSON-RPC over HTTP. **Direct exposure of this port to the internet is now superseded by the HTTPS reverse-proxy below**; the port remains open for legacy clients and for direct-IP diagnostics, but new clients should use `https://api.agentchain.noesisai.it`.
 - `TCP 80`, `TCP 443` — Caddy reverse proxy + Let's Encrypt ACME challenges.
 
-### 6.1 Public RPC reverse-proxy topology (v1.0.13)
+### 6.1 Public RPC reverse-proxy topology (v1.1.0)
 
 ```
    client ──HTTPS──▶  Caddy (LE cert) ──HTTP loopback──▶  agentchain :30304
@@ -277,7 +279,7 @@ Release artefacts ship with reproducible SHA-256 sums published alongside each t
 
 ## 10. Conclusion
 
-AgentChain Engine **v1.0.13** is judged **safe for alpha-mainnet operation** subject to the open items in `§ 8` and the operator-trust caveats in `§ 6`. The cryptographic core rests on a single audited dependency (`libsodium`) and a small surface of domain-tagged compositions. The implementation has no known memory-safety, integer-overflow, or threading-deadlock bugs at the time of writing.
+AgentChain Engine **v1.1.0** is judged **safe for mainnet alpha operation** subject to the open items in `§ 8` and the operator-trust caveats in `§ 6`. The cryptographic core rests on a single audited dependency (`libsodium`) and a small surface of domain-tagged compositions. The implementation has no known memory-safety, integer-overflow, or threading-deadlock bugs at the time of writing.
 
 Two structural defects discovered post-launch are now closed: the post-apply validator-set bug (F-14, v1.0.10) and the simultaneously-eligible-leader fork window (F-15, v1.0.11). Both required protocol-level reasoning rather than spot fixes; both were verified against real-WAN mainnet traffic on 2026-05-19. The chain has since produced an uninterrupted single-tip history under v1.0.11 and the v1.0.12 + v1.0.13 CLI-UX revisions that built on it.
 

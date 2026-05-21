@@ -439,9 +439,9 @@ Genesis distributes the 100M CRD initial supply as follows:
 | Foundation (Noesis AI)   | 12,000,000    | 4-year linear vest, 1-year cliff. Operational and audit funding. |
 | Genesis validators       | 8,000,000     | Distributed across the initial bootstrap set. Bonded as `stake` at genesis. |
 
-Genesis validators, their pubkeys, their initial stakes, and the seed peers are recorded in `genesis.json` of each network. The `chain_id` distinguishes mainnet (`1`) from devnet (`2025`) and any local nets (`> 1000000`).
+Genesis validators, their pubkeys, their initial stakes, and the seed peers are recorded in `genesis.txt` of each network (see `deploy/mainnet-genesis.txt` for the canonical mainnet alpha file). The `chain_id` distinguishes mainnet alpha (`1`) from devnet (`2025`) and any local nets (`> 1000000`).
 
-Mainnet `chain_id` is **1**.
+Mainnet alpha `chain_id` is **1**.
 
 ---
 
