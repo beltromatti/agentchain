@@ -529,24 +529,30 @@ static void *reader_loop(void *arg) {
         peer_close_fd(p);
         return NULL;
     }
-    /* Reject a duplicate peer_id. The first connection wins; redundant ones
-     * are dropped before they can multiply broadcast write fanout. */
+    /* Duplicate peer_id: the peer reconnected — almost always because it
+     * restarted or its previous link broke — while we still hold its stale
+     * slot. The old connection's reader is blocked on recv() and won't notice
+     * the death until a write to it fails (up to SO_SNDTIMEO later), so the
+     * stale slot keeps absorbing broadcasts that never reach the peer. The
+     * old "first connection wins" rule therefore stranded a restarted
+     * validator: the seed kept shovelling blocks into the dead socket while
+     * the live one received nothing. Newest wins instead — evict the stale
+     * slot (shut its fd so its reader exits and the connector reaps it) and
+     * let this fresh connection take over delivery immediately. */
     pthread_mutex_lock(&n->peers_mu);
-    bool dup_pid = false;
     for (size_t i = 0; i < AC_MAX_PEERS; ++i) {
         peer_t *other = &n->peers[i];
         if (other == p || !other->in_use || !other->peer_id_known) continue;
         if (memcmp(other->peer_id.b, their_id.b, AC_PUBKEY_SIZE) == 0) {
-            dup_pid = true;
-            break;
+            LOG_I("net", "duplicate peer_id — evicting stale slot, newest connection wins");
+            if (other->fd >= 0) ac_sock_shutdown(other->fd, SHUT_RDWR);
+            pthread_mutex_lock(&other->out_mu);
+            other->out_closing = true;
+            pthread_cond_broadcast(&other->out_cv);
+            pthread_mutex_unlock(&other->out_mu);
         }
     }
     pthread_mutex_unlock(&n->peers_mu);
-    if (dup_pid) {
-        LOG_D("net", "duplicate peer_id, dropping new connection");
-        peer_close_fd(p);
-        return NULL;
-    }
     p->peer_id = their_id;
     p->peer_id_known = true;
     if (their_host[0]) snprintf(p->host, sizeof(p->host), "%s", their_host);
