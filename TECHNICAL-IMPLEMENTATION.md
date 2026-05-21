@@ -1,6 +1,6 @@
 # AgentChain Engine — Technical Implementation Notes
 
-This document describes how **AgentChain Engine v1.1.0**, the reference C client, realises the protocol specified in `PROTOCOL.md`. Read the protocol first; this document is a companion. Where the implementation deviates from the spec, the deviation is called out explicitly under `§ 9 Spec Deviations`.
+This document describes how **AgentChain Engine v1.1.3**, the reference C client, realises the protocol specified in `PROTOCOL.md`. Read the protocol first; this document is a companion. Where the implementation deviates from the spec, the deviation is called out explicitly under `§ 9 Spec Deviations`.
 
 ---
 
@@ -50,7 +50,7 @@ The reference binary statically links its own modules into `libagentchain_engine
 
 ## 3. Mapping: Protocol → Source
 
-The following table is the authoritative cross-reference. If a feature is in the protocol but not in this table, it is unimplemented in v1.1.0 (see `§ 9`).
+The following table is the authoritative cross-reference. If a feature is in the protocol but not in this table, it is unimplemented in v1.1.3 (see `§ 9`).
 
 | Protocol section                          | Implemented in                                       |
 | ----------------------------------------- | ---------------------------------------------------- |
@@ -385,7 +385,7 @@ These deviations are deliberate and documented. Each is annotated with the proto
 
 **Protocol § 6.6** specifies that double-signing is slashable. v1.0.x implements the `SLASH_EVIDENCE` transaction, verifies the two signatures, and burns the validator's stake. What v1.0.x does **not** do automatically is detect equivocations in real time — a slasher must construct and submit the evidence transaction. A built-in equivocation watcher is on the v1.1 roadmap.
 
-### 9.6 Patch-release history (v1.0.1 → v1.1.0)
+### 9.6 Patch-release history (v1.0.1 → v1.1.3)
 
 The 1.0.x line has been amended several times since the initial mainnet launch. Each fix is recorded here for traceability; the corresponding security finding ID is in `SECURITY-AUDIT.md`.
 
@@ -406,6 +406,8 @@ The 1.0.x line has been amended several times since the initial mainnet launch. 
    3. **HELLO v2 with peer-list gossip.** The HELLO frame now carries an optional peer-list trailer (cap=`AC_HELLO_PEER_MAX`=8). A new joiner that dials any one of the foundation seeds learns about the rest via gossip and dials them, so the topology stops being hub-and-spoke. v1.0.x HELLOs without the trailer are accepted unchanged.
    4. **`address_txs` RPC.** Backed by an in-memory address tx-history index (built on accept, rebuilt at open, parallel to the tx-by-hash index). The website explorer's address view uses it to show inbound + outbound transactions on the same panel that already shows balance + stake, mirroring the wallet's History tab.
    `mainnet.h` now lists three foundation seed peers as equals (Iowa/Frankfurt/Stockholm). CLI/help strings are relabelled "mainnet" → "mainnet alpha"; `chain_id` is unchanged at `1`. The rebootstrap discharged a unit-error in the previous genesis (seed validator's balance off by 3 orders of magnitude relative to the protocol's 100M total supply) and rotated the website faucet hot wallet (10,000 CRD funded from the seed validator post-launch).
+13. **v1.1.1** — catch-up sync throttle. The v1.1.0 `AC_SEAL_GRACE_MS` window was applied unconditionally in `try_commit_inner`, including to fully-certified blocks received via `HEADERS_REQ` during sync. A syncing node would see the 2/3 threshold already met on an arriving block but wait the 300 ms grace before sealing — and since `seal_phase` only flushes pending blocks whose slot equals the *current* wall slot (never true for historical sync blocks), each block effectively sealed only when a duplicate re-broadcast re-triggered `try_commit`. Net effect: catch-up crawled at roughly one block per slot tick, slower than the chain produces, so a node that fell behind never converged. Fix: the grace is for late `COMMIT_VOTE`s during *live* consensus; during sync the block is already past and carries a quorum cert, so when the block's slot is more than one slot behind the wall slot (`catching_up`), seal immediately. A late joiner now drains the whole `HEADERS_REQ` burst in one pass.
+14. **v1.1.2 / v1.1.3** — duplicate-peer eviction. `parse_hello`'s duplicate-`peer_id` guard kept the *first* connection and dropped the new one. That is backwards for the dominant real case — a peer presents a duplicate id because it just restarted while we still hold its previous slot, whose reader is parked in a blocking `recv()` (no RCV timeout) and won't observe the death until a write fails up to `SO_SNDTIMEO` (30 s) later. Until then every broadcast was shovelled into the dead socket and the reconnected peer received nothing: on mainnet alpha this stranded whichever validator last restarted (connected on both ends, listed in `validators_list`, but hundreds of blocks behind and earning nothing). **v1.1.2** flipped the rule to newest-wins — on a duplicate `peer_id`, shut the stale slot's fd and let the fresh connection take over. **v1.1.3** completed it: shutting the fd does *not* set `fd=-1` (only the reader does, on exit), and both `ac_net_broadcast` and `ac_net_send_to` route by `(peer_id_known && fd>=0)` with `send_to` stopping at the first match — so a lingering lower-index stale slot still swallowed the `HEADERS_REQ` *response* (sent via `send_to`) while broadcasts (sent to all) got through, leaving the peer stuck a few blocks short of the head. The eviction now also clears `peer_id_known` on the stale slot, making it instantly invisible to all routing before the reader is reaped. Restarting the *seed* used to mask the whole class of bug by clearing its slot table, which is why snapshot/reboot recovery looked like a fix while the network stayed two-of-three.
 
 End-to-end verification of v1.0.11 ran on the live mainnet on 2026-05-19 with two validators (an Iowa seed and a residential macOS host). The chain transitioned through four phases — both validators active, seed alone, both alive again, validator alone — without forks, without missed slots, and with the expected `signers={1,2}` shape on every commit. The associated mainnet `chain_id=1` history starts at the v1.0.11 genesis (`timestamp_ms=1779201674000`); the pre-v1.0.11 chain was abandoned during the coordinated reset described in the v1.0.11 release notes. Read + write through the public HTTPS RPC was verified on 2026-05-20 alongside the v1.0.13 deployment (chain_info → 200; `send` from a remote wallet → tx mined → recipient balance +1 µCRD; sender nonce 2 → 3).
 

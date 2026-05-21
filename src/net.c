@@ -537,14 +537,23 @@ static void *reader_loop(void *arg) {
      * old "first connection wins" rule therefore stranded a restarted
      * validator: the seed kept shovelling blocks into the dead socket while
      * the live one received nothing. Newest wins instead — evict the stale
-     * slot (shut its fd so its reader exits and the connector reaps it) and
-     * let this fresh connection take over delivery immediately. */
+     * slot and let this fresh connection take over delivery immediately.
+     *
+     * Clearing peer_id_known is the load-bearing step: both ac_net_broadcast
+     * and ac_net_send_to route by (peer_id_known && fd>=0), and ac_net_send_to
+     * stops at the FIRST match. ac_sock_shutdown does not set fd=-1 (only the
+     * reader does, on exit), so until the slot is reaped it would still match —
+     * and a lower-index stale slot would swallow the HEADERS_REQ response that
+     * the catching-up peer is waiting for, leaving it stuck a few blocks short
+     * of the head forever. Hiding the slot immediately makes all routing skip
+     * it; the shutdown then unblocks its reader so the connector can reap it. */
     pthread_mutex_lock(&n->peers_mu);
     for (size_t i = 0; i < AC_MAX_PEERS; ++i) {
         peer_t *other = &n->peers[i];
         if (other == p || !other->in_use || !other->peer_id_known) continue;
         if (memcmp(other->peer_id.b, their_id.b, AC_PUBKEY_SIZE) == 0) {
             LOG_I("net", "duplicate peer_id — evicting stale slot, newest connection wins");
+            other->peer_id_known = false;
             if (other->fd >= 0) ac_sock_shutdown(other->fd, SHUT_RDWR);
             pthread_mutex_lock(&other->out_mu);
             other->out_closing = true;
