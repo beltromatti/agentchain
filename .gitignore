@@ -47,3 +47,7 @@ Thumbs.db
 *.gcno
 *.gcov
 coverage/
+
+# Operational secrets that must never leave the machine: validator seeds,
+# faucet hot wallet seed, SSH-config notes. Folder name deliberately generic.
+dev/
