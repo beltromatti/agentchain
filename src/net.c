@@ -311,14 +311,31 @@ void ac_net_each_peer(ac_net_t *n, ac_net_peer_fn fn, void *ctx) {
 /* HELLO.                                                                     */
 /* -------------------------------------------------------------------------- */
 
-/* HELLO payload:
+/* HELLO payload (extended in v1.1.0 to carry peer-list gossip so a fresh
+ * node discovers the mesh from any single bootstrap seed):
+ *
  *   u64be(chain_id)
  *   pubkey(32)
  *   u16be(listen_port)
  *   u8(host_len) || host_bytes               (external_host advertised; may be empty)
- */
+ *   u8(n_peers)                              (0..AC_HELLO_PEER_MAX, optional — see below)
+ *   for each peer:
+ *       pubkey(32)
+ *       u16be(port)
+ *       u8(host_len) || host_bytes
+ *
+ * The peer-list section is appended at the end so older parsers (v1.0.x)
+ * stop after the host field and ignore the extra bytes. New parsers detect
+ * extra bytes after the host and decode the peer list. */
+#define AC_HELLO_PEER_MAX  8
+
+/* Forward declaration: HELLO gossip handlers (reader thread) want to dial
+ * back peers they learn about, but dial_peer is defined further down with
+ * the connector-loop helpers. */
+static int dial_peer(ac_net_t *n, const char *hp);
+
 static int send_hello(ac_net_t *n, int fd) {
-    uint8_t buf[256];
+    uint8_t buf[1500];
     size_t pos = 0;
     ac_be64(buf + pos, n->cfg.chain_id); pos += 8;
     memcpy(buf + pos, n->cfg.keypair.pk, AC_PUBKEY_SIZE); pos += AC_PUBKEY_SIZE;
@@ -329,12 +346,47 @@ static int send_hello(ac_net_t *n, int fd) {
     if (hl > 250) hl = 250;
     buf[pos++] = (uint8_t)hl;
     if (hl > 0) { memcpy(buf + pos, n->cfg.external_host, hl); pos += hl; }
+
+    /* Peer-list gossip: include up to AC_HELLO_PEER_MAX peers we already
+     * know about so the receiver can mesh-connect without a static seed
+     * list. We skip ourselves and any peer without an advertised host
+     * (its inbound IP is not addressable). */
+    uint8_t *npeers_at = buf + pos;
+    *npeers_at = 0;
+    pos += 1;
+    pthread_mutex_lock(&n->peers_mu);
+    for (size_t i = 0; i < AC_MAX_PEERS && *npeers_at < AC_HELLO_PEER_MAX; ++i) {
+        peer_t *q = &n->peers[i];
+        if (!q->in_use || !q->peer_id_known) continue;
+        if (q->host[0] == '\0' || q->port == 0) continue;
+        size_t qhl = strnlen(q->host, sizeof(q->host));
+        if (qhl > 250) continue;
+        if (pos + AC_PUBKEY_SIZE + 2 + 1 + qhl + 32 > sizeof(buf)) break;
+        memcpy(buf + pos, q->peer_id.b, AC_PUBKEY_SIZE); pos += AC_PUBKEY_SIZE;
+        ac_be16(pbuf, q->port);
+        memcpy(buf + pos, pbuf, 2); pos += 2;
+        buf[pos++] = (uint8_t)qhl;
+        memcpy(buf + pos, q->host, qhl); pos += qhl;
+        (*npeers_at)++;
+    }
+    pthread_mutex_unlock(&n->peers_mu);
+
     return frame_send(fd, AC_MSG_HELLO, buf, pos);
 }
 
+/* Gossiped peer reported by a HELLO sender. */
+typedef struct {
+    ac_addr_t peer_id;
+    uint16_t  port;
+    char      host[128];
+} hello_peer_t;
+
 static int parse_hello(const uint8_t *buf, size_t len,
                        uint64_t *chain_id, ac_addr_t *peer_id,
-                       uint16_t *port, char *host, size_t host_cap) {
+                       uint16_t *port, char *host, size_t host_cap,
+                       hello_peer_t *gossip_out, size_t gossip_cap,
+                       size_t *gossip_n) {
+    if (gossip_n) *gossip_n = 0;
     if (len < 8 + AC_PUBKEY_SIZE + 2 + 1) return -1;
     size_t pos = 0;
     *chain_id = ac_rd64(buf + pos); pos += 8;
@@ -346,6 +398,33 @@ static int parse_hello(const uint8_t *buf, size_t len,
     size_t copy = hl < host_cap - 1 ? hl : host_cap - 1;
     memcpy(host, buf + pos, copy);
     host[copy] = '\0';
+    pos += hl;
+
+    /* v1.1.0 extension: optional peer-list. v1.0.x senders end the payload
+     * here, so we treat any further data as the gossip section. */
+    if (pos >= len || !gossip_out || gossip_cap == 0) return 0;
+    uint8_t np = buf[pos++];
+    if (np > AC_HELLO_PEER_MAX) np = AC_HELLO_PEER_MAX;
+    size_t kept = 0;
+    for (uint8_t i = 0; i < np; ++i) {
+        if (pos + AC_PUBKEY_SIZE + 2 + 1 > len) break;
+        ac_addr_t pid;
+        memcpy(pid.b, buf + pos, AC_PUBKEY_SIZE); pos += AC_PUBKEY_SIZE;
+        uint8_t pp2[2]; memcpy(pp2, buf + pos, 2); pos += 2;
+        uint16_t pport = ((uint16_t)pp2[0] << 8) | pp2[1];
+        uint8_t phl = buf[pos++];
+        if (pos + phl > len) break;
+        if (kept < gossip_cap) {
+            gossip_out[kept].peer_id = pid;
+            gossip_out[kept].port    = pport;
+            size_t c = phl < sizeof(gossip_out[kept].host) - 1 ? phl : sizeof(gossip_out[kept].host) - 1;
+            memcpy(gossip_out[kept].host, buf + pos, c);
+            gossip_out[kept].host[c] = '\0';
+            kept++;
+        }
+        pos += phl;
+    }
+    if (gossip_n) *gossip_n = kept;
     return 0;
 }
 
@@ -428,7 +507,11 @@ static void *reader_loop(void *arg) {
     ac_addr_t their_id;
     uint16_t their_port = 0;
     char their_host[128] = {0};
-    if (parse_hello(buf, len, &their_chain_id, &their_id, &their_port, their_host, sizeof(their_host)) < 0) {
+    hello_peer_t gossip[AC_HELLO_PEER_MAX];
+    size_t gossip_n = 0;
+    if (parse_hello(buf, len, &their_chain_id, &their_id, &their_port,
+                    their_host, sizeof(their_host),
+                    gossip, AC_HELLO_PEER_MAX, &gossip_n) < 0) {
         free(buf);
         LOG_W("net", "malformed HELLO from peer");
         peer_close_fd(p);
@@ -474,6 +557,20 @@ static void *reader_loop(void *arg) {
     ac_hex_encode(hex, p->peer_id.b, 8);
     LOG_I("net", "%s peer %s @ %s:%u",
           p->inbound ? "inbound" : "outbound", hex, p->host, p->port);
+
+    /* Mesh bootstrap: dial every peer the new neighbour told us about.
+     * dial_peer is idempotent (already_dialed dedup by host:port), so it is
+     * safe to spam it. This turns the previous hub-and-spoke topology into
+     * a proper mesh as nodes learn about each other through HELLO gossip. */
+    for (size_t gi = 0; gi < gossip_n; ++gi) {
+        /* Skip if it's us, or the peer we're talking to right now. */
+        if (memcmp(gossip[gi].peer_id.b, n->cfg.keypair.pk, AC_PUBKEY_SIZE) == 0) continue;
+        if (memcmp(gossip[gi].peer_id.b, p->peer_id.b, AC_PUBKEY_SIZE) == 0) continue;
+        if (gossip[gi].host[0] == '\0' || gossip[gi].port == 0) continue;
+        char hp[160];
+        snprintf(hp, sizeof(hp), "%s:%u", gossip[gi].host, (unsigned)gossip[gi].port);
+        dial_peer(n, hp);
+    }
 
     /* Steady-state read loop. */
     while (n->running) {

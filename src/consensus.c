@@ -27,6 +27,13 @@ typedef struct {
      * the block's proposer_vrf_proof and the proposer's pre-block sqrt-
      * stake. See PROTOCOL.md § 6.3. */
     uint8_t              priority[16];
+
+    /* Wall-clock time (ms) at which this block first met the 2/3 sqrt-stake
+     * threshold. We DELAY the actual seal by AC_SEAL_GRACE_MS so late votes
+     * from high-latency validators (think Stockholm↔Iowa) make it into the
+     * commit certificate instead of getting raced out. Zero means
+     * "threshold not yet reached". */
+    uint64_t             threshold_reached_ms;
 } pending_t;
 
 /* Per-slot voting state. A validator votes at most once per slot: on the
@@ -69,9 +76,18 @@ struct ac_consensus_s {
 #define AC_HDRS_REQ_MIN_INTERVAL_MS 4000
 
 /* Vote-phase wait window: how long after slot start before we vote on the
- * best proposal we have seen. 900 ms inside a 2 s slot leaves ~1100 ms for
- * vote propagation and try_commit. */
-#define AC_VOTE_DELAY_MS 900
+ * best proposal we have seen. 1100 ms inside a 2 s slot lets a proposal
+ * from a distant proposer (Europe→US, ~150 ms RTT) propagate to every
+ * committee member before voting begins. */
+#define AC_VOTE_DELAY_MS  1100
+
+/* Seal-phase delay: after the 2/3 threshold is first reached, wait this
+ * much before persisting the block so straggler votes from high-latency
+ * validators can still be folded into the commit certificate. Without it,
+ * a validator that signs at vote_phase + RTT (e.g., 250 ms) loses the
+ * race against the first quorum-completing vote and ends up dropped from
+ * the cert even though it signed correctly. */
+#define AC_SEAL_GRACE_MS  300
 
 static void pending_init(pending_t *p) {
     if (p->occupied) ac_block_free(&p->block);
@@ -330,13 +346,32 @@ static void our_vote_now(ac_consensus_t *cs, pending_t *p) {
     if (cs->bcast) cs->bcast(0x08, wire, sizeof(wire), cs->bcast_ctx);
 }
 
-/* If the pending block now meets the commit threshold, finalise it. */
+/* If the pending block has enough signatures, finalise it. The denominator
+ * is the LIVE sqrt-stake (signers active in the last AC_LIVENESS_WINDOW
+ * blocks), not the full bonded set, so a freshly-bonded-but-still-syncing
+ * or temporarily-offline validator cannot stall the chain. Once the
+ * threshold is first crossed, we wait AC_SEAL_GRACE_MS before persisting
+ * the block so late votes from high-latency validators are still folded
+ * into the commit certificate. If `force_seal` is true we bypass the grace
+ * (used by seal_phase at the end of the slot to flush any waiters). */
+static void try_commit_inner(ac_consensus_t *cs, pending_t *p, bool force_seal);
+
+/* Default path: respect the AC_SEAL_GRACE_MS window after threshold first
+ * met. Most call sites (handle_block, handle_vote, slot_routine, vote_phase)
+ * go through here. seal_phase calls try_commit_inner with force_seal=true
+ * at the end of the slot to flush any pending block whose grace window has
+ * elapsed without a follow-up vote. */
 static void try_commit(ac_consensus_t *cs, pending_t *p) {
+    try_commit_inner(cs, p, /*force_seal=*/ false);
+}
+
+static void try_commit_inner(ac_consensus_t *cs, pending_t *p, bool force_seal) {
     if (!p->occupied || p->committed) return;
 
     ac_chain_lock(cs->chain);
-    uint64_t total_sqrt = ac_chain_total_sqrt_stake(cs->chain);
-    if (total_sqrt == 0) { ac_chain_unlock(cs->chain); return; }
+    uint64_t live_sqrt = ac_chain_live_sqrt_stake(cs->chain);
+    if (live_sqrt == 0) live_sqrt = ac_chain_total_sqrt_stake(cs->chain);
+    if (live_sqrt == 0) { ac_chain_unlock(cs->chain); return; }
 
     uint64_t sum_sqrt = 0;
     for (uint32_t i = 0; i < p->nsigners; ++i) {
@@ -345,7 +380,16 @@ static void try_commit(ac_consensus_t *cs, pending_t *p) {
         if (a.stake >= AC_MIN_STAKE_UCRD) sum_sqrt += ac_isqrt_u64(a.stake);
     }
 
-    if (sum_sqrt * 3 < total_sqrt * 2) { ac_chain_unlock(cs->chain); return; }
+    if (sum_sqrt * 3 < live_sqrt * 2) { ac_chain_unlock(cs->chain); return; }
+
+    /* Threshold reached. Wait the grace window for late votes before sealing,
+     * unless the seal_phase has explicitly forced us to flush. */
+    uint64_t now = ac_now_ms();
+    if (p->threshold_reached_ms == 0) p->threshold_reached_ms = now;
+    if (!force_seal && now - p->threshold_reached_ms < AC_SEAL_GRACE_MS) {
+        ac_chain_unlock(cs->chain);
+        return;
+    }
 
     /* Move signers into the block and try to accept. */
     p->block.signers = (ac_commit_signer_t *)calloc(p->nsigners, sizeof(ac_commit_signer_t));
@@ -672,6 +716,22 @@ static void vote_phase(ac_consensus_t *cs, uint64_t slot) {
     pthread_mutex_unlock(&cs->mu);
 }
 
+/* Seal phase: invoked at slot_start + AC_VOTE_DELAY_MS + AC_SEAL_GRACE_MS,
+ * the latest point in the slot still available before the next slot's
+ * propose phase begins. Forces any pending block whose 2/3 threshold has
+ * been reached to commit immediately, even if its grace window has not
+ * fully elapsed. This guarantees a block is sealed within ~1.4 s of slot
+ * start in every committable case. */
+static void seal_phase(ac_consensus_t *cs, uint64_t slot) {
+    pthread_mutex_lock(&cs->mu);
+    for (size_t i = 0; i < AC_PENDING_MAX; ++i) {
+        pending_t *p = &cs->pending[i];
+        if (!p->occupied || p->slot != slot || p->committed) continue;
+        try_commit_inner(cs, p, /*force_seal=*/ true);
+    }
+    pthread_mutex_unlock(&cs->mu);
+}
+
 static void *slot_loop(void *arg) {
     ac_consensus_t *cs = (ac_consensus_t *)arg;
     uint64_t genesis = ac_chain_genesis_time(cs->chain);
@@ -700,7 +760,16 @@ static void *slot_loop(void *arg) {
 
         vote_phase(cs, slot);
 
-        /* Phase 3 — sleep until next slot start, then loop. */
+        /* Phase 3 — at slot_start + AC_VOTE_DELAY_MS + AC_SEAL_GRACE_MS:
+         * force-seal any pending block whose threshold has been reached. */
+        uint64_t seal_at = slot_start + AC_VOTE_DELAY_MS + AC_SEAL_GRACE_MS;
+        now = ac_now_ms();
+        if (seal_at > now) ac_sleep_ms(seal_at - now);
+        if (!cs->running) break;
+
+        seal_phase(cs, slot);
+
+        /* Phase 4 — sleep until next slot start, then loop. */
         slot++;
         uint64_t next_start = genesis + slot * AC_SLOT_DURATION_MS;
         now = ac_now_ms();

@@ -1,11 +1,11 @@
 /* AgentChain Engine — CLI entry point.
  *
  * Defaults aim to make the common path one-liner-short:
- *   - No --rpc           → talk to the mainnet public endpoint over HTTPS.
+ *   - No --rpc           → talk to the mainnet alpha public endpoint over HTTPS.
  *   - No --from-key / --key → use ~/.agentchain/node.key.
  *   - No --data-dir      → use ~/.agentchain.
- *   - No --genesis       → use the mainnet genesis embedded in this binary.
- *   - No --seeds         → use the mainnet bootstrap seed.
+ *   - No --genesis       → use the mainnet alpha genesis embedded in this binary.
+ *   - No --seeds         → use the mainnet alpha bootstrap seeds.
  *
  * Every default is overridable via the obvious flag. Operators running
  * testnets or air-gapped clusters keep the same command surface.
@@ -400,9 +400,9 @@ static int cmd_genesis(int argc, char **argv) {
             "                          [--timestamp-ms N] [--account HEX:BAL:STAKE ...]\n"
             "\n"
             "Write a fresh genesis configuration file. Used to bootstrap testnets\n"
-            "(joining mainnet does not require this — the mainnet genesis is\n"
-            "embedded in the binary and used automatically when no --genesis is\n"
-            "passed to `agentchain node`).\n");
+            "(joining mainnet alpha does not require this — the mainnet alpha\n"
+            "genesis is embedded in the binary and used automatically when no\n"
+            "--genesis is passed to `agentchain node`).\n");
         return 0;
     }
     const char *cid_s = get_opt(argc, argv, "--chain-id");
@@ -787,9 +787,9 @@ static int cmd_node(int argc, char **argv) {
             "                       [--host BIND] [--rpc-host BIND]\n"
             "                       [--external-host H]\n"
             "\n"
-            "Run a node. With no arguments this joins AgentChain mainnet:\n"
+            "Run a node. With no arguments this joins AgentChain mainnet alpha:\n"
             "  data-dir   ~/.agentchain\n"
-            "  genesis    embedded mainnet (chain_id=1)\n"
+            "  genesis    embedded mainnet alpha (chain_id=1)\n"
             "  seeds      %s\n"
             "  port       30303 (p2p)\n"
             "  rpc-port   30304 (loopback only)\n"
@@ -829,7 +829,7 @@ static int cmd_node(int argc, char **argv) {
         if (!ac_file_exists(gen_path)) {
             if (write_embedded_mainnet_genesis(gen_path) < 0) {
                 fprintf(stderr,
-                    "node: failed to materialise embedded mainnet genesis at %s\n", gen_path);
+                    "node: failed to materialise embedded mainnet alpha genesis at %s\n", gen_path);
                 return 1;
             }
         }

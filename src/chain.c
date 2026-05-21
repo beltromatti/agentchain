@@ -23,6 +23,30 @@ typedef struct {
     uint32_t   tx_idx;
 } tx_index_entry_t;
 
+/* Per-address index over the tx history. Lets RPC clients ask
+ * "every tx that touched this account" without rescanning the chain. */
+typedef struct {
+    ac_addr_t  addr;
+    uint64_t   height;
+    uint32_t   tx_idx;
+    uint8_t    role; /* 0 = sender, 1 = recipient */
+} addr_index_entry_t;
+
+/* Per-validator liveness record. last_sign_height is the most recent block
+ * height where this address signed the commit certificate. A validator is
+ * "live" if (current_height - last_sign_height) < AC_LIVENESS_WINDOW, or if
+ * it was bootstrapped at genesis and we are still inside the first window. */
+typedef struct {
+    ac_addr_t  addr;
+    uint64_t   last_sign_height;
+} live_entry_t;
+
+#define AC_LIVENESS_WINDOW 16  /* slots; ~32 s of grace before a quiet
+                                  validator is dropped from the threshold
+                                  denominator. */
+#define AC_MAX_LIVE        256 /* hard upper bound; far above realistic
+                                  active set size for the v1.x envelope. */
+
 struct ac_chain_s {
     pthread_mutex_t mu;
 
@@ -52,6 +76,22 @@ struct ac_chain_s {
     size_t            tx_index_n;
     size_t            tx_index_cap;
     bool              tx_index_sorted;
+
+    /* address → (height, tx_idx, role) index, sorted by address. Lets the
+     * RPC return a per-account tx history without rescanning blocks. */
+    addr_index_entry_t *addr_index;
+    size_t              addr_index_n;
+    size_t              addr_index_cap;
+    bool                addr_index_sorted;
+
+    /* Liveness map: validators that have signed at least one commit cert in
+     * the last AC_LIVENESS_WINDOW blocks. The commit threshold is computed
+     * against the sqrt-stake of THIS set rather than the full bonded set,
+     * so a newly-bonded-but-still-syncing or an offline validator does not
+     * stall the chain. Genesis-bootstrapped validators are pre-populated
+     * with last_sign_height=0 and treated as live for the first window. */
+    live_entry_t  live_map[AC_MAX_LIVE];
+    size_t        live_n;
 };
 
 /* -------------------------------------------------------------------------- */
@@ -197,6 +237,160 @@ int ac_chain_tx_find(ac_chain_t *c, const ac_hash_t *tx_hash,
 /* Walks the on-disk block range [from, c->height] and inserts every
  * transaction hash into the in-memory index. Called from ac_chain_open after
  * the chain has been opened (height + tip known). */
+/* -------------------------------------------------------------------------- */
+/* address-history index — addr → list of (height, tx_idx, sender|recipient). */
+/* -------------------------------------------------------------------------- */
+
+static int addr_index_cmp(const void *a, const void *b) {
+    const addr_index_entry_t *ea = a;
+    const addr_index_entry_t *eb = b;
+    int c = memcmp(ea->addr.b, eb->addr.b, AC_PUBKEY_SIZE);
+    if (c != 0) return c;
+    if (ea->height < eb->height) return -1;
+    if (ea->height > eb->height) return 1;
+    if (ea->tx_idx  < eb->tx_idx ) return -1;
+    if (ea->tx_idx  > eb->tx_idx ) return 1;
+    return 0;
+}
+
+static int addr_index_reserve(ac_chain_t *c, size_t need) {
+    if (c->addr_index_cap >= need) return 0;
+    size_t cap = c->addr_index_cap ? c->addr_index_cap * 2 : 256;
+    while (cap < need) cap *= 2;
+    void *p = realloc(c->addr_index, cap * sizeof(*c->addr_index));
+    if (!p) return -1;
+    c->addr_index = p;
+    c->addr_index_cap = cap;
+    return 0;
+}
+
+static int addr_index_push(ac_chain_t *c, const ac_addr_t *addr,
+                           uint64_t height, uint32_t idx, uint8_t role) {
+    if (addr_index_reserve(c, c->addr_index_n + 1) < 0) return -1;
+    c->addr_index[c->addr_index_n].addr   = *addr;
+    c->addr_index[c->addr_index_n].height = height;
+    c->addr_index[c->addr_index_n].tx_idx = idx;
+    c->addr_index[c->addr_index_n].role   = role;
+    c->addr_index_n++;
+    c->addr_index_sorted = false;
+    return 0;
+}
+
+static void addr_index_record_tx(ac_chain_t *c, const ac_tx_t *tx,
+                                 uint64_t height, uint32_t idx) {
+    addr_index_push(c, &tx->sender, height, idx, /*role=sender*/ 0);
+    if (tx->kind == AC_TX_TRANSFER && tx->body_len >= AC_PUBKEY_SIZE) {
+        ac_addr_t recipient;
+        memcpy(recipient.b, tx->body, AC_PUBKEY_SIZE);
+        if (memcmp(recipient.b, tx->sender.b, AC_PUBKEY_SIZE) != 0) {
+            addr_index_push(c, &recipient, height, idx, /*role=recipient*/ 1);
+        }
+    }
+}
+
+static void addr_index_sort(ac_chain_t *c) {
+    if (c->addr_index_sorted) return;
+    qsort(c->addr_index, c->addr_index_n, sizeof(*c->addr_index), addr_index_cmp);
+    c->addr_index_sorted = true;
+}
+
+/* Public lookup. Writes up to `cap` matching entries (most-recent-first) into
+ * `out`. Returns the count. */
+size_t ac_chain_addr_txs(ac_chain_t *c, const ac_addr_t *addr,
+                         ac_addr_tx_entry_t *out, size_t cap) {
+    if (!c->addr_index_n || cap == 0) return 0;
+    addr_index_sort(c);
+    /* Binary search the lower bound of `addr`. */
+    ssize_t lo = 0, hi = (ssize_t)c->addr_index_n;
+    while (lo < hi) {
+        ssize_t mid = lo + (hi - lo) / 2;
+        if (memcmp(c->addr_index[mid].addr.b, addr->b, AC_PUBKEY_SIZE) < 0) lo = mid + 1;
+        else                                                                  hi = mid;
+    }
+    /* Walk forward until address changes. Collect, then reverse to most-recent-first. */
+    size_t n = 0;
+    ac_addr_tx_entry_t scratch[256];
+    size_t scratch_cap = sizeof(scratch) / sizeof(scratch[0]);
+    while ((size_t)lo < c->addr_index_n &&
+           memcmp(c->addr_index[lo].addr.b, addr->b, AC_PUBKEY_SIZE) == 0 &&
+           n < scratch_cap) {
+        scratch[n].height = c->addr_index[lo].height;
+        scratch[n].tx_idx = c->addr_index[lo].tx_idx;
+        scratch[n].role   = c->addr_index[lo].role;
+        n++;
+        lo++;
+    }
+    /* Reverse + bound by cap. */
+    size_t take = n < cap ? n : cap;
+    for (size_t i = 0; i < take; ++i) {
+        out[i] = scratch[n - 1 - i];
+    }
+    return take;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Liveness map.                                                              */
+/* -------------------------------------------------------------------------- */
+
+static void live_record_signer(ac_chain_t *c, const ac_addr_t *a, uint64_t h) {
+    for (size_t i = 0; i < c->live_n; ++i) {
+        if (memcmp(c->live_map[i].addr.b, a->b, AC_PUBKEY_SIZE) == 0) {
+            if (h > c->live_map[i].last_sign_height) c->live_map[i].last_sign_height = h;
+            return;
+        }
+    }
+    if (c->live_n < AC_MAX_LIVE) {
+        c->live_map[c->live_n].addr = *a;
+        c->live_map[c->live_n].last_sign_height = h;
+        c->live_n++;
+    }
+}
+
+static bool live_is_within_window(const ac_chain_t *c, uint64_t last_sign_height) {
+    /* Genesis bootstrap window: any pre-populated validator (last_sign_height == 0)
+     * is treated as live until the chain has produced LIVENESS_WINDOW blocks. */
+    if (last_sign_height == 0 && c->height < AC_LIVENESS_WINDOW) return true;
+    if (last_sign_height == 0) return false;
+    if (c->height <= last_sign_height) return true;
+    return (c->height - last_sign_height) < AC_LIVENESS_WINDOW;
+}
+
+/* Total sqrt-stake of bonded validators that have signed at least one block
+ * in the recent window. Falls back to the full bonded set when no signers
+ * are known (very young chain). Used by try_commit + validate_commit as the
+ * denominator of the 2/3 threshold. */
+uint64_t ac_chain_live_sqrt_stake(ac_chain_t *c) {
+    uint64_t sum = 0;
+    size_t   counted = 0;
+    for (size_t i = 0; i < c->live_n; ++i) {
+        if (!live_is_within_window(c, c->live_map[i].last_sign_height)) continue;
+        ac_account_t a;
+        if (!ac_state_get(c->state, &c->live_map[i].addr, &a)) continue;
+        if (a.stake < AC_MIN_STAKE_UCRD) continue;
+        sum += ac_isqrt_u64(a.stake);
+        counted++;
+    }
+    if (counted == 0) {
+        /* Fallback: chain too young or every live entry expired. Use the full
+         * bonded set so the chain can still progress. */
+        return ac_chain_total_sqrt_stake(c);
+    }
+    return sum;
+}
+
+size_t ac_chain_live_count(ac_chain_t *c) {
+    size_t n = 0;
+    for (size_t i = 0; i < c->live_n; ++i) {
+        if (!live_is_within_window(c, c->live_map[i].last_sign_height)) continue;
+        ac_account_t a;
+        if (!ac_state_get(c->state, &c->live_map[i].addr, &a)) continue;
+        if (a.stake >= AC_MIN_STAKE_UCRD) n++;
+    }
+    return n;
+}
+
+/* -------------------------------------------------------------------------- */
+
 static void tx_index_rebuild(ac_chain_t *c) {
     if (c->height == 0) return;
     for (uint64_t h = 1; h <= c->height; ++h) {
@@ -206,10 +400,20 @@ static void tx_index_rebuild(ac_chain_t *c) {
             ac_hash_t th;
             ac_tx_hash(&th, &b.txs[i]);
             tx_index_add(c, &th, h, i);
+            addr_index_record_tx(c, &b.txs[i], h, i);
+        }
+        /* Live history: replay signers from the last LIVENESS_WINDOW blocks
+         * so a node restored from disk picks up the threshold denominator
+         * the rest of the network has been using. */
+        if (b.header.height + AC_LIVENESS_WINDOW > c->height) {
+            for (uint32_t i = 0; i < b.nsigners; ++i) {
+                live_record_signer(c, &b.signers[i].signer, b.header.height);
+            }
         }
         ac_block_free(&b);
     }
     tx_index_sort(c);
+    addr_index_sort(c);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -249,6 +453,14 @@ static int chain_apply_genesis(ac_chain_t *c, const ac_genesis_t *g) {
         a.balance = ga->balance;
         a.stake   = ga->stake;
         ac_state_set(c->state, &a);
+        /* Bootstrap the liveness map: every genesis-bonded validator is
+         * treated as live for the first AC_LIVENESS_WINDOW blocks, so the
+         * chain can commit even before anyone has signed yet. */
+        if (a.stake >= AC_MIN_STAKE_UCRD && c->live_n < AC_MAX_LIVE) {
+            c->live_map[c->live_n].addr = a.addr;
+            c->live_map[c->live_n].last_sign_height = 0;
+            c->live_n++;
+        }
     }
 
     /* Build the genesis block. */
@@ -338,6 +550,7 @@ void ac_chain_close(ac_chain_t *c) {
     if (!c) return;
     if (c->state) ac_state_free(c->state);
     free(c->tx_index);
+    free(c->addr_index);
     pthread_mutex_destroy(&c->mu);
     free(c);
 }
@@ -732,9 +945,16 @@ static int validate_commit(ac_chain_t *c, const ac_block_t *b, const ac_hash_t *
         signed_sqrt += sqrt_st;
     }
 
-    /* The 2/3 threshold: cumulative signed sqrt-stake must strictly exceed
-     * two-thirds of the network's pre-block sqrt-stake. */
-    if (signed_sqrt * 3 < pre_total_sqrt * 2) return -1;
+    /* The 2/3 threshold is computed against the *live* sqrt-stake — the
+     * subset of bonded validators that signed at least one block in the
+     * recent AC_LIVENESS_WINDOW slots. This keeps the chain progressing
+     * when a freshly-bonded or temporarily-offline validator would otherwise
+     * raise the denominator past what the rest of the network can satisfy.
+     * Committee eligibility above still uses pre_total_sqrt so sortition
+     * probabilities stay correctly calibrated against the full active set. */
+    uint64_t live_sqrt = ac_chain_live_sqrt_stake(c);
+    if (live_sqrt == 0) live_sqrt = pre_total_sqrt;
+    if (signed_sqrt * 3 < live_sqrt * 2) return -1;
     return 0;
 }
 
@@ -892,7 +1112,19 @@ ac_accept_t ac_chain_accept_block(ac_chain_t *c, const ac_block_t *b) {
     c->base_fee = b->header.base_fee;
     if (meta_save(c) < 0)                             return AC_ACCEPT_INTERNAL;
 
-    /* Update the tx-hash index for any transactions in this block. */
+    /* Update liveness map: every signer of this block's commit cert is
+     * recorded as alive at this height. The threshold denominator will count
+     * them for the next AC_LIVENESS_WINDOW slots; if they go quiet they
+     * fall off and the denominator shrinks. */
+    for (uint32_t i = 0; i < b->nsigners; ++i) {
+        live_record_signer(c, &b->signers[i].signer, b->header.height);
+    }
+
+    /* Update the tx-hash index + address-history index for any transactions
+     * in this block. */
+    for (uint32_t i = 0; i < b->tx_count; ++i) {
+        addr_index_record_tx(c, &b->txs[i], b->header.height, i);
+    }
     for (uint32_t i = 0; i < b->tx_count; ++i) {
         ac_hash_t th;
         ac_tx_hash(&th, &b->txs[i]);

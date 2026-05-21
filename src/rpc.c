@@ -427,6 +427,70 @@ static void handle_accounts_top(ac_rpc_t *r, int fd, const char *id, const char 
     free(arr);
 }
 
+/* address_txs — recent transactions involving a given address, most-recent
+ * first. Each entry includes the tx hash, the containing block height +
+ * index, role (0=sender, 1=recipient), timestamp and a short summary so
+ * the website explorer can render the history without a second round-trip.
+ */
+static void handle_address_txs(ac_rpc_t *r, int fd, const char *id, const char *params) {
+    char addr_hex[256] = {0};
+    if (!json_string(params, "address", addr_hex, sizeof(addr_hex))) {
+        send_rpc_error(fd, id, -32602, "missing address");
+        return;
+    }
+    ac_addr_t a;
+    if (ac_hex_decode(a.b, AC_PUBKEY_SIZE, addr_hex) != 0) {
+        send_rpc_error(fd, id, -32602, "bad address hex");
+        return;
+    }
+    uint64_t limit_u = 0;
+    json_uint64(params, "limit", &limit_u);
+    if (limit_u == 0) limit_u = 100;
+    if (limit_u > 1000) limit_u = 1000;
+    size_t cap = (size_t)limit_u;
+
+    ac_addr_tx_entry_t *entries = (ac_addr_tx_entry_t *)malloc(cap * sizeof(*entries));
+    if (!entries) { send_rpc_error(fd, id, -32603, "oom"); return; }
+
+    ac_chain_lock(r->cfg.chain);
+    size_t n = ac_chain_addr_txs(r->cfg.chain, &a, entries, cap);
+
+    size_t need = 256 + n * 320;
+    char *out = (char *)malloc(need);
+    if (!out) {
+        ac_chain_unlock(r->cfg.chain);
+        free(entries);
+        send_rpc_error(fd, id, -32603, "oom");
+        return;
+    }
+    int pos = snprintf(out, need, "{\"count\":%zu,\"txs\":[", n);
+
+    for (size_t i = 0; i < n && pos > 0 && (size_t)pos + 320 < need; ++i) {
+        ac_block_t b;
+        if (ac_chain_get_block_by_height(r->cfg.chain, entries[i].height, &b) < 0) {
+            continue;
+        }
+        if (entries[i].tx_idx >= b.tx_count) { ac_block_free(&b); continue; }
+        const ac_tx_t *t = &b.txs[entries[i].tx_idx];
+        ac_hash_t th; ac_tx_hash(&th, t);
+        char hh[2 * AC_HASH_SIZE + 1]; ac_hex_encode(hh, th.b, AC_HASH_SIZE);
+        char sh[2 * AC_PUBKEY_SIZE + 1]; ac_hex_encode(sh, t->sender.b, AC_PUBKEY_SIZE);
+        pos += snprintf(out + pos, need - pos,
+            "%s{\"hash\":\"%s\",\"height\":%" PRIu64 ",\"tx_index\":%u,\"role\":%u,"
+            "\"timestamp_ms\":%" PRIu64 ",\"kind\":%u,\"sender\":\"%s\",\"nonce\":%" PRIu64 "}",
+            i ? "," : "", hh, entries[i].height, entries[i].tx_idx,
+            (unsigned)entries[i].role, b.header.timestamp_ms,
+            (unsigned)t->kind, sh, t->nonce);
+        ac_block_free(&b);
+    }
+    if (pos > 0 && (size_t)pos + 2 < need) snprintf(out + pos, need - pos, "]}");
+    ac_chain_unlock(r->cfg.chain);
+
+    send_rpc_result(fd, id, out);
+    free(out);
+    free(entries);
+}
+
 typedef struct {
     char  *out;
     size_t cap;
@@ -561,6 +625,7 @@ static void handle_client(ac_rpc_t *r, int fd) {
     else if (strcmp(method, "validators_list") == 0) handle_validators_list(r, fd, id_lit, params);
     else if (strcmp(method, "accounts_top")    == 0) handle_accounts_top(r, fd, id_lit, params);
     else if (strcmp(method, "peers_list")      == 0) handle_peers_list  (r, fd, id_lit);
+    else if (strcmp(method, "address_txs")     == 0) handle_address_txs (r, fd, id_lit, params);
     else send_rpc_error(fd, id_lit, -32601, "method not found");
 }
 

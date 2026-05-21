@@ -73,6 +73,26 @@ int        ac_chain_get_block_hash      (const ac_chain_t *c, uint64_t height, a
 int        ac_chain_tx_find(ac_chain_t *c, const ac_hash_t *tx_hash,
                             uint64_t *out_height, uint32_t *out_tx_index);
 
+/* Per-address tx history entry. `role` is 0 (sender) or 1 (recipient). */
+typedef struct {
+    uint64_t height;
+    uint32_t tx_idx;
+    uint8_t  role;
+} ac_addr_tx_entry_t;
+
+/* Return up to `cap` transactions involving `addr`, most-recent first.
+ * Backed by the chain's in-memory address-history index, populated on
+ * accept_block and rebuilt at open. */
+size_t     ac_chain_addr_txs(ac_chain_t *c, const ac_addr_t *addr,
+                             ac_addr_tx_entry_t *out, size_t cap);
+
+/* Live-set helpers used by consensus to compute the 2/3 commit threshold
+ * against validators that have actually signed recently — not the full
+ * bonded set. This keeps the chain progressing when a freshly-bonded
+ * validator is still syncing or a previously-active validator drops off. */
+uint64_t   ac_chain_live_sqrt_stake(ac_chain_t *c);
+size_t     ac_chain_live_count     (ac_chain_t *c);
+
 /* Snapshot the top accounts by the given field, ordered descending. Returns
  * the number written into `out` (<= cap). Validators excludes accounts below
  * AC_MIN_STAKE_UCRD. */
