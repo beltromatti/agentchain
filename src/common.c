@@ -208,12 +208,26 @@ int ac_memeq(const void *a, const void *b, size_t n) {
 }
 
 uint64_t ac_isqrt_u64(uint64_t x) {
+    /* Newton's method, converging from above so we never multiply two
+     * values whose product would overflow uint64. Compares always use the
+     * overflow-safe form `r > x / r`.
+     *
+     * Pre-v1.0.15 versions initialised r = 1<<32 and compared `r*r > x`,
+     * which silently wrapped at 2^64 and returned 2^32 for every input —
+     * collapsing the protocol's sqrt-stake weighting to 1-validator-1-vote.
+     * See SECURITY-AUDIT § F-16. */
     if (x == 0) return 0;
-    uint64_t r = 1ULL << 32;
-    while (r * r > x) r = (r + x / r) / 2;
-    /* One more Newton step to be safe. */
-    while ((r + 1) * (r + 1) <= x) ++r;
-    while (r * r > x) --r;
+    if (x == 1) return 1;
+    const uint64_t SQRT_MAX = (1ULL << 32) - 1;
+    uint64_t r = x > SQRT_MAX ? SQRT_MAX : x;
+    while (1) {
+        uint64_t nr = (r + x / r) / 2;
+        if (nr >= r) break;
+        r = nr;
+    }
+    /* Final correction for one-step rounding either way. */
+    while (r > 0 && r > x / r) --r;
+    while (r < SQRT_MAX && (r + 1) <= x / (r + 1)) ++r;
     return r;
 }
 

@@ -1,6 +1,7 @@
 /* Tests for state mutations and root determinism. */
 #include "state.h"
 #include "crypto.h"
+#include "common.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -96,11 +97,32 @@ static void test_serialize_roundtrip(void) {
     ac_state_free(t);
 }
 
+/* Regression for the v1.0.15 integer-square-root fix. Pre-fix the function
+ * silently overflowed and returned 2^32 for every input, collapsing the
+ * sqrt-stake weighting the protocol relies on. */
+static void test_isqrt(void) {
+    assert(ac_isqrt_u64(0)            == 0);
+    assert(ac_isqrt_u64(1)            == 1);
+    assert(ac_isqrt_u64(2)            == 1);
+    assert(ac_isqrt_u64(3)            == 1);
+    assert(ac_isqrt_u64(4)            == 2);
+    assert(ac_isqrt_u64(9)            == 3);
+    assert(ac_isqrt_u64(99)           == 9);
+    assert(ac_isqrt_u64(100)          == 10);
+    assert(ac_isqrt_u64(101)          == 10);
+    /* sqrt(200_000_000) = 14142.13… */
+    assert(ac_isqrt_u64(200000000ULL) == 14142);
+    assert(ac_isqrt_u64(1000000000ULL) == 31622); /* sqrt(1e9) = 31622.77 */
+    /* Boundary near the max representable square root. */
+    assert(ac_isqrt_u64(0xFFFFFFFFFFFFFFFFULL) == 4294967295ULL);
+}
+
 int main(void) {
     if (ac_crypto_init() != 0) { fprintf(stderr, "crypto init failed\n"); return 1; }
     test_basic_set_get();
     test_root_determinism();
     test_serialize_roundtrip();
+    test_isqrt();
     printf("test_state OK\n");
     return 0;
 }
