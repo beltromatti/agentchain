@@ -383,10 +383,18 @@ static void try_commit_inner(ac_consensus_t *cs, pending_t *p, bool force_seal) 
     if (sum_sqrt * 3 < live_sqrt * 2) { ac_chain_unlock(cs->chain); return; }
 
     /* Threshold reached. Wait the grace window for late votes before sealing,
-     * unless the seal_phase has explicitly forced us to flush. */
+     * unless the seal_phase has explicitly forced us to flush. The grace is
+     * for live consensus — when this node was up at slot start and might
+     * still receive a late COMMIT_VOTE worth waiting for. During sync the
+     * incoming block is already past, no further votes will arrive, and
+     * waiting just throttles the catch-up rate (one block per slot tick).
+     * Detect that case by comparing the block's slot against the wall slot:
+     * if the block is more than one slot in the past, seal immediately. */
     uint64_t now = ac_now_ms();
+    uint64_t wall_slot = ac_chain_current_slot(cs->chain);
+    bool catching_up = wall_slot > p->slot + 1;
     if (p->threshold_reached_ms == 0) p->threshold_reached_ms = now;
-    if (!force_seal && now - p->threshold_reached_ms < AC_SEAL_GRACE_MS) {
+    if (!force_seal && !catching_up && now - p->threshold_reached_ms < AC_SEAL_GRACE_MS) {
         ac_chain_unlock(cs->chain);
         return;
     }
