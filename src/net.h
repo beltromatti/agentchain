@@ -71,6 +71,12 @@ int  ac_net_send_to(ac_net_t *n, const ac_addr_t *peer_id,
 /* Number of currently-connected peers. */
 size_t ac_net_peer_count(ac_net_t *n);
 
+/* This node's own identity + advertised endpoint. `host` is the external host
+ * if one was configured, else the listen host. Lets callers report the full
+ * network (self + peers), not just the peers this node happens to dial. */
+void ac_net_self_info(ac_net_t *n, ac_addr_t *out_id,
+                      char *host, size_t host_cap, uint16_t *out_port);
+
 /* Walk over peers (id+host+port). fn returning non-zero stops iteration. */
 typedef int (*ac_net_peer_fn)(const ac_addr_t *id, const char *host, uint16_t port,
                               bool inbound, void *ctx);

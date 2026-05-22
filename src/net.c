@@ -307,6 +307,17 @@ void ac_net_each_peer(ac_net_t *n, ac_net_peer_fn fn, void *ctx) {
     pthread_mutex_unlock(&n->peers_mu);
 }
 
+void ac_net_self_info(ac_net_t *n, ac_addr_t *out_id,
+                      char *host, size_t host_cap, uint16_t *out_port) {
+    if (out_id) memcpy(out_id->b, n->cfg.keypair.pk, AC_PUBKEY_SIZE);
+    if (host && host_cap > 0) {
+        const char *h = n->cfg.external_host[0] ? n->cfg.external_host
+                                                : n->cfg.listen_host;
+        snprintf(host, host_cap, "%s", h && h[0] ? h : "0.0.0.0");
+    }
+    if (out_port) *out_port = n->cfg.listen_port;
+}
+
 /* -------------------------------------------------------------------------- */
 /* HELLO.                                                                     */
 /* -------------------------------------------------------------------------- */

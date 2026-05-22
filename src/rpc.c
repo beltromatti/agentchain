@@ -513,12 +513,28 @@ static int peer_acc_cb(const ac_addr_t *id, const char *host, uint16_t port,
 
 /* peers_list — connected peers seen by the local net module. */
 static void handle_peers_list(ac_rpc_t *r, int fd, const char *id) {
-    if (!r->cfg.net) { send_rpc_result(fd, id, "{\"connected\":0,\"peers\":[]}"); return; }
+    if (!r->cfg.net) { send_rpc_result(fd, id, "{\"connected\":0,\"node\":null,\"peers\":[]}"); return; }
     size_t cap = 8192;
     char *out = (char *)malloc(cap);
     if (!out) { send_rpc_error(fd, id, -32603, "oom"); return; }
-    size_t pos = (size_t)snprintf(out, cap, "{\"connected\":%zu,\"peers\":[",
-                                  ac_net_peer_count(r->cfg.net));
+
+    /* Report the responding node itself alongside its connected peers, so the
+     * view reflects the whole network this node participates in (self + peers),
+     * not just the links it happens to have dialled. `connected` stays the
+     * count of peer links; `node` is this node; the network size is node + the
+     * peers array. */
+    ac_addr_t self_id;
+    char self_host[128];
+    uint16_t self_port = 0;
+    ac_net_self_info(r->cfg.net, &self_id, self_host, sizeof(self_host), &self_port);
+    char self_hex[2 * AC_PUBKEY_SIZE + 1];
+    ac_hex_encode(self_hex, self_id.b, AC_PUBKEY_SIZE);
+
+    size_t pos = (size_t)snprintf(out, cap,
+        "{\"connected\":%zu,"
+        "\"node\":{\"pubkey\":\"%s\",\"host\":\"%s\",\"port\":%u,\"self\":true},"
+        "\"peers\":[",
+        ac_net_peer_count(r->cfg.net), self_hex, self_host, (unsigned)self_port);
     peer_acc_t a = { .out = out, .cap = cap, .pos = pos, .count = 0 };
     ac_net_each_peer(r->cfg.net, peer_acc_cb, &a);
     if (a.pos + 2 < a.cap) snprintf(a.out + a.pos, a.cap - a.pos, "]}");
