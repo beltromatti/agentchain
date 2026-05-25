@@ -370,7 +370,8 @@ static void try_commit_inner(ac_consensus_t *cs, pending_t *p, bool force_seal) 
 
     ac_chain_lock(cs->chain);
     uint64_t live_sqrt = ac_chain_live_sqrt_stake(cs->chain);
-    if (live_sqrt == 0) live_sqrt = ac_chain_total_sqrt_stake(cs->chain);
+    uint64_t total_sqrt = ac_chain_total_sqrt_stake(cs->chain);
+    if (live_sqrt == 0) live_sqrt = total_sqrt;
     if (live_sqrt == 0) { ac_chain_unlock(cs->chain); return; }
 
     uint64_t sum_sqrt = 0;
@@ -380,7 +381,14 @@ static void try_commit_inner(ac_consensus_t *cs, pending_t *p, bool force_seal) 
         if (a.stake >= AC_MIN_STAKE_UCRD) sum_sqrt += ac_isqrt_u64(a.stake);
     }
 
+    /* Liveness: ≥ 2/3 of the live set. Safety floor: > 1/2 of the *total*
+     * bonded set, so two disjoint quorums can never both finalise (quorum
+     * intersection) — prevents the split-brain fork a partition could
+     * otherwise produce. Mirrors validate_commit in chain.c; both gates must
+     * pass on every node or a block one node seals would be rejected by the
+     * others. */
     if (sum_sqrt * 3 < live_sqrt * 2) { ac_chain_unlock(cs->chain); return; }
+    if (total_sqrt > 0 && sum_sqrt * 2 <= total_sqrt) { ac_chain_unlock(cs->chain); return; }
 
     /* Threshold reached. Wait the grace window for late votes before sealing,
      * unless the seal_phase has explicitly forced us to flush. The grace is

@@ -1,6 +1,6 @@
-# AgentChain Security Audit — v1.1.3
+# AgentChain Security Audit — v1.1.5
 
-**Audited release:** AgentChain Engine v1.1.3 (pending tag)
+**Audited release:** AgentChain Engine v1.1.5 (commit pending)
 **Audit date:** 2026-05-22
 **Auditor:** Noesis AI — internal review
 **Scope:** Reference C client + AgentChain Protocol v1, including the live mainnet alpha (`chain_id=1`) network operated by Noesis AI on three regional hosts (GCP Iowa, AWS Frankfurt, AWS Stockholm).
@@ -10,6 +10,8 @@
 >
 > **v1.1.1 / v1.1.3 delta (liveness, not safety).** Two follow-up fixes to the validator catch-up path, both discovered operating the three-region network. **v1.1.1:** the seal-grace window was throttling `HEADERS_REQ`-driven sync to ~one block per slot tick, so a node that fell behind never converged; the grace is now skipped for blocks whose slot is already in the past (they carry a quorum cert — there are no late votes to wait for). **v1.1.3:** the duplicate-`peer_id` guard kept the stale connection and dropped the fresh one, so a restarted validator reconnected but received no blocks until the dead slot timed out (≤30 s) — frequently leaving the network running two-of-three with the third validator stranded behind the head and earning nothing. Now the newest connection wins and the stale slot is evicted on sight. Neither change alters consensus safety: the 2/3 live-sqrt-stake commit rule, VRF sortition, and equivocation handling are unchanged. Both are liveness/availability fixes for the validator-restart and fall-behind cases.
 
+> **v1.1.5 delta (consensus safety — fork fix).** The v1.1.0 live-set commit threshold optimised for liveness by computing the 2/3 denominator from only the recently-active validators. A transient network partition exposed the cost: each side's live set collapsed to what it could still see, both cleared their local 2/3, and the network finalised two different blocks at the same height (split-brain), wedging the chain at `h=82033`. v1.1.5 adds a safety floor — signers must also exceed **1/2 of the total bonded sqrt-stake** — so quorum intersection makes two conflicting finalisations impossible while keeping the no-freeze property for honest connected quorums. This is a genuine safety strengthening over the v1.1.0–v1.1.4 line; all validators must run ≥ v1.1.5 (the rule is consensus-critical). See `TECHNICAL-IMPLEMENTATION.md § 9.6 (v1.1.5)`.
+>
 > **Disclaimer.** This is a first-party audit. We make no claim that it substitutes for an independent third-party review. Every statement below is backed by either a cryptographic guarantee from an audited dependency, an external standards document, or a reproducible test in this repository. Where we have not been able to confirm a property we say so explicitly.
 
 ---
@@ -281,7 +283,7 @@ Release artefacts ship with reproducible SHA-256 sums published alongside each t
 
 ## 10. Conclusion
 
-AgentChain Engine **v1.1.3** is judged **safe for mainnet alpha operation** subject to the open items in `§ 8` and the operator-trust caveats in `§ 6`. The cryptographic core rests on a single audited dependency (`libsodium`) and a small surface of domain-tagged compositions. The implementation has no known memory-safety, integer-overflow, or threading-deadlock bugs at the time of writing.
+AgentChain Engine **v1.1.5** is judged **safe for mainnet alpha operation** subject to the open items in `§ 8` and the operator-trust caveats in `§ 6`. The cryptographic core rests on a single audited dependency (`libsodium`) and a small surface of domain-tagged compositions. The implementation has no known memory-safety, integer-overflow, or threading-deadlock bugs at the time of writing.
 
 Two structural defects discovered post-launch are now closed: the post-apply validator-set bug (F-14, v1.0.10) and the simultaneously-eligible-leader fork window (F-15, v1.0.11). Both required protocol-level reasoning rather than spot fixes; both were verified against real-WAN mainnet traffic on 2026-05-19. The chain has since produced an uninterrupted single-tip history under v1.0.11 and the v1.0.12 + v1.0.13 CLI-UX revisions that built on it.
 

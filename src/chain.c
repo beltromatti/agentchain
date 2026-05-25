@@ -945,16 +945,28 @@ static int validate_commit(ac_chain_t *c, const ac_block_t *b, const ac_hash_t *
         signed_sqrt += sqrt_st;
     }
 
-    /* The 2/3 threshold is computed against the *live* sqrt-stake — the
-     * subset of bonded validators that signed at least one block in the
-     * recent AC_LIVENESS_WINDOW slots. This keeps the chain progressing
-     * when a freshly-bonded or temporarily-offline validator would otherwise
-     * raise the denominator past what the rest of the network can satisfy.
+    /* Liveness condition: ≥ 2/3 of the *live* sqrt-stake — the subset of
+     * bonded validators that signed at least one block in the recent
+     * AC_LIVENESS_WINDOW slots. This keeps the chain progressing when a
+     * freshly-bonded or temporarily-offline validator would otherwise raise
+     * the denominator past what the rest of the network can satisfy.
      * Committee eligibility above still uses pre_total_sqrt so sortition
      * probabilities stay correctly calibrated against the full active set. */
     uint64_t live_sqrt = ac_chain_live_sqrt_stake(c);
     if (live_sqrt == 0) live_sqrt = pre_total_sqrt;
     if (signed_sqrt * 3 < live_sqrt * 2) return -1;
+
+    /* Safety floor: the signers must also exceed 1/2 of the *total* bonded
+     * sqrt-stake. Two disjoint signer sets cannot both exceed half the total
+     * (quorum intersection), so this guarantees at most one block can finalise
+     * per height even under a network partition. Without it, the live-set
+     * denominator can shrink independently on each side of a split and let a
+     * minority finalise conflicting blocks — the split-brain fork observed on
+     * mainnet alpha at h=82033, where the seed (alone) and the belimo+droovy
+     * pair each committed a different block. The live-set rule alone optimises
+     * for liveness at the cost of this safety property; the floor restores it
+     * while preserving the no-freeze behaviour for honest, connected quorums. */
+    if (signed_sqrt * 2 <= pre_total_sqrt) return -1;
     return 0;
 }
 
