@@ -71,6 +71,18 @@ struct ac_consensus_s {
      * than the receiver can drain. */
     uint64_t              last_hdrs_req_ms;
     uint64_t              last_hdrs_req_target;
+
+    /* Per-height vote lock. The height of our most recent commit vote and the
+     * block hash we voted for there. A validator must never cast a commit
+     * vote for two DIFFERENT blocks at the same height — even across
+     * consecutive slots. Without this, when a block fails to seal within its
+     * slot and the leader proposes a fresh block for the same height in the
+     * next slot, the same quorum votes for both and finalises two conflicting
+     * blocks at one height (the recurring split-tip fork at h=82033/316036/
+     * 335861). vote_height==0 means we have not voted yet (genesis is never
+     * voted on, so 0 is a safe sentinel). */
+    uint64_t              vote_height;
+    ac_hash_t             vote_block;
 };
 
 #define AC_HDRS_REQ_MIN_INTERVAL_MS 4000
@@ -327,8 +339,14 @@ static void our_vote_now(ac_consensus_t *cs, pending_t *p) {
     ac_sig_t sig;
     ac_sign(&sig, vmsg, (size_t)vn, &cs->kp);
 
-    /* Add to local set. */
-    if (p->nsigners < AC_COMMITTEE_MAX) {
+    /* Add to local set — idempotent, so re-broadcasting our vote (vote-lock
+     * path in vote_phase) does not double-count our sqrt-stake toward the
+     * commit threshold. */
+    bool already = false;
+    for (uint32_t i = 0; i < p->nsigners; ++i) {
+        if (ac_addr_eq(&p->signers[i].signer, &cs->my_addr)) { already = true; break; }
+    }
+    if (!already && p->nsigners < AC_COMMITTEE_MAX) {
         ac_commit_signer_t *s = &p->signers[p->nsigners++];
         s->signer = cs->my_addr;
         s->sig    = sig;
@@ -727,7 +745,32 @@ static void vote_phase(ac_consensus_t *cs, uint64_t slot) {
     }
     if (!best) { pthread_mutex_unlock(&cs->mu); return; }
 
+    /* Per-height vote lock. If we have already cast a commit vote for a
+     * DIFFERENT block at this height (in an earlier slot whose block did not
+     * seal in time), we must not vote for this conflicting proposal — doing so
+     * lets the same quorum finalise two blocks at one height. Instead
+     * re-broadcast our original vote so the block we DID back can still reach
+     * the threshold and seal. our_vote_now is idempotent, so this does not
+     * double-count us. */
+    if (cs->vote_height == best->height &&
+        !ac_hash_eq(&cs->vote_block, &best->block_hash)) {
+        for (size_t i = 0; i < AC_PENDING_MAX; ++i) {
+            pending_t *q = &cs->pending[i];
+            if (q->occupied && !q->committed &&
+                q->height == cs->vote_height &&
+                ac_hash_eq(&q->block_hash, &cs->vote_block)) {
+                our_vote_now(cs, q);
+                try_commit(cs, q);
+                break;
+            }
+        }
+        pthread_mutex_unlock(&cs->mu);
+        return;
+    }
+
     our_vote_now(cs, best);
+    cs->vote_height = best->height;
+    cs->vote_block  = best->block_hash;
     try_commit(cs, best);
     pthread_mutex_unlock(&cs->mu);
 }
