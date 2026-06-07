@@ -79,10 +79,15 @@ struct ac_consensus_s {
      * slot and the leader proposes a fresh block for the same height in the
      * next slot, the same quorum votes for both and finalises two conflicting
      * blocks at one height (the recurring split-tip fork at h=82033/316036/
-     * 335861). vote_height==0 means we have not voted yet (genesis is never
-     * voted on, so 0 is a safe sentinel). */
+     * 335861). We converge on the lowest-PRIORITY block for the height across
+     * all slots and only ever move our vote toward a STRICTLY lower priority,
+     * so every honest validator monotonically reaches the same global minimum
+     * — the only block that can gather a quorum (no fork) — and always
+     * eventually backs it (no deadlock). vote_height==0 means we have not
+     * voted yet (genesis is never voted on, so 0 is a safe sentinel). */
     uint64_t              vote_height;
     ac_hash_t             vote_block;
+    uint8_t               vote_priority[16];
 };
 
 #define AC_HDRS_REQ_MIN_INTERVAL_MS 4000
@@ -737,29 +742,40 @@ static void vote_phase(ac_consensus_t *cs, uint64_t slot) {
     slot_vote_t *sv = slot_vote_for(cs, slot);
     if (sv->voted) { pthread_mutex_unlock(&cs->mu); return; }
 
+    /* Converge on the lowest-priority proposal at the height we are trying to
+     * commit next (tip + 1), across ALL slots — not just the current slot.
+     * Competing proposals for one height can arrive over several slots when a
+     * block fails to seal in time; selecting the per-slot minimum let two
+     * validators latch onto different blocks and finalise both (fork). The
+     * global minimum at the height is a deterministic choice every validator
+     * agrees on. */
+    ac_chain_lock(cs->chain);
+    uint64_t target_h = ac_chain_height(cs->chain) + 1;
+    ac_chain_unlock(cs->chain);
+
     pending_t *best = NULL;
     for (size_t i = 0; i < AC_PENDING_MAX; ++i) {
         pending_t *p = &cs->pending[i];
-        if (!p->occupied || p->slot != slot || p->committed) continue;
+        if (!p->occupied || p->committed || p->height != target_h) continue;
         if (!best || priority_cmp(p->priority, best->priority) < 0) best = p;
     }
     if (!best) { pthread_mutex_unlock(&cs->mu); return; }
 
-    /* Per-height vote lock. If we have already cast a commit vote for a
-     * DIFFERENT block at this height (in an earlier slot whose block did not
-     * seal in time), we must not vote for this conflicting proposal — doing so
-     * lets the same quorum finalise two blocks at one height. Instead
-     * re-broadcast our original vote so the block we DID back can still reach
-     * the threshold and seal. our_vote_now is idempotent, so this does not
-     * double-count us. */
-    if (cs->vote_height == best->height &&
-        !ac_hash_eq(&cs->vote_block, &best->block_hash)) {
+    /* Monotonic vote convergence. If we have already voted at this height,
+     * only move our vote to a STRICTLY lower-priority block; otherwise
+     * re-affirm (re-broadcast) the block we already back so it keeps gathering
+     * votes toward the threshold. Moving only downward means every validator
+     * walks to the same global minimum, which is therefore the only block that
+     * can ever collect a quorum — at most one block finalises per height (no
+     * fork) — while a node that initially backed a higher-priority block still
+     * switches to the winner instead of stalling on it (no deadlock). */
+    if (cs->vote_height == target_h &&
+        priority_cmp(best->priority, cs->vote_priority) >= 0) {
         for (size_t i = 0; i < AC_PENDING_MAX; ++i) {
             pending_t *q = &cs->pending[i];
-            if (q->occupied && !q->committed &&
-                q->height == cs->vote_height &&
+            if (q->occupied && !q->committed && q->height == target_h &&
                 ac_hash_eq(&q->block_hash, &cs->vote_block)) {
-                our_vote_now(cs, q);
+                our_vote_now(cs, q);          /* idempotent: re-broadcast only */
                 try_commit(cs, q);
                 break;
             }
@@ -769,8 +785,9 @@ static void vote_phase(ac_consensus_t *cs, uint64_t slot) {
     }
 
     our_vote_now(cs, best);
-    cs->vote_height = best->height;
+    cs->vote_height = target_h;
     cs->vote_block  = best->block_hash;
+    memcpy(cs->vote_priority, best->priority, 16);
     try_commit(cs, best);
     pthread_mutex_unlock(&cs->mu);
 }
